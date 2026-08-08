@@ -3,20 +3,22 @@ import "./App.css";
 import {
   analyzeQuery,
   fetchAdvisor,
+  fetchCostModel,
   fetchModelStatus,
-  fetchRegret,
   fetchSchema,
   fetchTrend,
   optimizeQuery,
   triggerRetrain,
   triggerRollback,
 } from "./api";
+import CostModelChart from "./components/CostModelChart";
+import CumulativeChart from "./components/CumulativeChart";
+import DecisionQuality from "./components/DecisionQuality";
 import LatencyChart from "./components/LatencyChart";
 import ModelHealth from "./components/ModelHealth";
 import OptimizedQuery from "./components/OptimizedQuery";
 import Recommendations from "./components/Recommendations";
 import ProductionRun from "./components/ProductionRun";
-import RegretChart from "./components/RegretChart";
 import SchemaPanel from "./components/SchemaPanel";
 import PlanComparison from "./components/PlanComparison";
 import QueryForm from "./components/QueryForm";
@@ -32,11 +34,11 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState(null);
   const [modelBusy, setModelBusy] = useState(false);
   const [schema, setSchema] = useState(null);
-  const [regret, setRegret] = useState(null);
   const [production, setProduction] = useState(null);
   const [productionBusy, setProductionBusy] = useState(false);
   const [lastSql, setLastSql] = useState(null);
   const [schemaRecs, setSchemaRecs] = useState(null);
+  const [costModel, setCostModel] = useState(null);
 
   async function loadTrend() {
     try {
@@ -63,16 +65,16 @@ export default function App() {
     try { setSchemaRecs((await fetchAdvisor()).recommendations); } catch { setSchemaRecs(null); }
   }
 
-  async function loadRegret() {
-    try { setRegret(await fetchRegret()); } catch { setRegret(null); }
+  async function loadCostModel() {
+    try { setCostModel(await fetchCostModel()); } catch { setCostModel(null); }
   }
 
   useEffect(() => {
     loadTrend();
     loadModelStatus();
     loadSchema();
-    loadRegret();
     loadAdvisor();
+    loadCostModel();
   }, []);
 
   async function handleProductionRun() {
@@ -80,7 +82,7 @@ export default function App() {
     setProductionBusy(true);
     try {
       setProduction(await optimizeQuery(lastSql));
-      loadRegret();
+      loadTrend();
     } catch (err) {
       setProduction({ reason: `failed: ${err.message}` });
     } finally {
@@ -109,8 +111,10 @@ export default function App() {
       setResult(data);
       setLastSql(sql);
       setProduction(null);
-      loadRegret();
-      loadTrend(); // this run just added rows to plan_execution_log
+      // This run just added rows to plan_execution_log, so every panel that
+      // reads that table is now stale.
+      loadTrend();
+      loadCostModel();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -139,26 +143,31 @@ export default function App() {
             <OptimizedQuery best={result.best_measured} decision={result.decision} />
           </section>
 
+          {/* Plan details and candidate latencies were two cards showing the
+              same run from two angles, repeating the baseline latency in
+              both. One card, one story: what ran, and what else was tried. */}
           <section className="card">
-            <h2>Baseline vs. chosen plan</h2>
+            <h2>Plans considered</h2>
             <PlanComparison
               baseline={result.baseline}
               chosenPlan={result.chosen_plan}
               selectorMode={result.selector_mode}
               decision={result.decision}
             />
-          </section>
-
-          <section className="card">
-            <h2>Candidate latencies</h2>
             {result.candidates?.length ? (
-              <LatencyChart
-                baseline={result.baseline}
-                candidates={result.candidates}
-                chosenIndex={result.chosen_index}
-              />
+              <>
+                <h3 className="subhead">Every candidate, measured</h3>
+                <LatencyChart
+                  baseline={result.baseline}
+                  candidates={result.candidates}
+                  chosenIndex={result.chosen_index}
+                  vetoed={result.decision?.fell_back_to_baseline}
+                />
+              </>
             ) : (
-              <div className="empty-state">No join-order candidates for this query (single table, or unsupported shape).</div>
+              <div className="empty-state">
+                No join-order candidates for this query (single table, or unsupported shape).
+              </div>
             )}
           </section>
         </>
@@ -187,24 +196,39 @@ export default function App() {
       </section>
 
       <section className="card">
-        <h2>Cumulative regret</h2>
-        <RegretChart regret={regret} />
-      </section>
-
-      <section className="card">
-        <h2>Discovered schema</h2>
-        <SchemaPanel schema={schema} />
-      </section>
-
-      <section className="card">
         <h2>Served vs. native &mdash; measured on matched runs</h2>
         {trendError && <div className="error-banner">{trendError}</div>}
         <ServedVsNative trend={trend} />
       </section>
 
       <section className="card">
-        <h2>Over time</h2>
-        <TrendChart byDay={trend?.by_day} />
+        <h2>Decision quality &mdash; was each call the right one?</h2>
+        <DecisionQuality quality={trend?.decision_quality} />
+      </section>
+
+      <section className="card">
+        <h2>Over the run sequence</h2>
+        <CumulativeChart runs={trend?.runs} />
+      </section>
+
+      <section className="card">
+        <h2>Is PostgreSQL&rsquo;s cost model right?</h2>
+        <CostModelChart data={costModel} />
+      </section>
+
+      {/* A per-day rollup needs more than one day to mean anything. Until
+          then the run sequence above is the honest time axis, and a two-point
+          line chart would just be decoration. */}
+      {trend?.by_day?.length > 1 && (
+        <section className="card">
+          <h2>Day by day</h2>
+          <TrendChart byDay={trend.by_day} />
+        </section>
+      )}
+
+      <section className="card">
+        <h2>Discovered schema</h2>
+        <SchemaPanel schema={schema} />
       </section>
     </>
   );

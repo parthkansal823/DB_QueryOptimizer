@@ -1,8 +1,7 @@
 import {
-  Bar,
   CartesianGrid,
-  ComposedChart,
   Line,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -14,16 +13,7 @@ function TrendTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
   const d = payload[0].payload;
   return (
-    <div
-      style={{
-        background: "var(--surface-1)",
-        border: "1px solid var(--border)",
-        borderRadius: 6,
-        padding: "8px 10px",
-        fontSize: 12,
-        color: "var(--text-primary)",
-      }}
-    >
+    <div className="chart-tooltip">
       <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
       <div>Native avg: {d.native != null ? `${d.native.toFixed(2)} ms` : "-"}</div>
       <div>Served avg: {d.served != null ? `${d.served.toFixed(2)} ms` : "-"}</div>
@@ -60,6 +50,27 @@ export default function TrendChart({ byDay }) {
     improvement: d.improvement_pct,
   }));
 
+  // How many runs a day's average rests on is real information -- a point
+  // built on two runs deserves less trust than one built on two hundred --
+  // but it is not milliseconds, and giving it its own y-axis would put two
+  // unrelated scales in one frame and invite reading a crossing as meaning
+  // something. Encoding it as dot area keeps it on the same axis: position
+  // is latency, size is weight.
+  const maxRuns = Math.max(...data.map((d) => d.runs), 1);
+  const radiusFor = (runs) => 3 + Math.round(Math.sqrt(runs / maxRuns) * 4);
+
+  const WeightedDot = ({ cx, cy, payload, stroke }) =>
+    cx == null || cy == null ? null : (
+      <circle
+        cx={cx}
+        cy={cy}
+        r={radiusFor(payload.runs)}
+        fill={stroke}
+        stroke={colors.surface}
+        strokeWidth={2}
+      />
+    );
+
   return (
     <div>
       <div className="legend-row">
@@ -71,13 +82,9 @@ export default function TrendChart({ byDay }) {
           <span className="legend-swatch" style={{ background: colors.chosen }} />
           Served plan (avg per run)
         </span>
-        <span className="legend-item">
-          <span className="legend-swatch" style={{ background: colors.candidate }} />
-          Matched runs that day
-        </span>
       </div>
       <ResponsiveContainer width="100%" height={240}>
-        <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 8 }}>
+        <LineChart data={data} margin={{ top: 12, right: 16, left: 0, bottom: 8 }}>
           <CartesianGrid stroke={colors.grid} vertical={false} />
           <XAxis
             dataKey="day"
@@ -85,50 +92,37 @@ export default function TrendChart({ byDay }) {
             axisLine={{ stroke: colors.grid }}
             tickLine={false}
           />
-          {/* Run count shares the x-axis but not the scale: a day built on two
-              runs and a day built on two hundred look identical otherwise, and
-              the reader has no way to tell how much weight a point carries. */}
           <YAxis
-            yAxisId="runs"
-            orientation="right"
-            tick={{ fontSize: 11, fill: colors.axis }}
-            axisLine={false}
-            tickLine={false}
-            allowDecimals={false}
-            label={{ value: "runs", angle: 90, position: "insideRight", fill: colors.axis, fontSize: 11 }}
-          />
-          <YAxis
-            yAxisId="ms"
             tick={{ fontSize: 11, fill: colors.axis }}
             axisLine={false}
             tickLine={false}
             label={{ value: "ms", angle: -90, position: "insideLeft", fill: colors.axis, fontSize: 11 }}
           />
           <Tooltip content={<TrendTooltip />} cursor={{ stroke: colors.axis, strokeDasharray: "3 3" }} />
-          <Bar yAxisId="runs" dataKey="runs" fill={colors.candidate} maxBarSize={28} radius={[3, 3, 0, 0]} />
           <Line
-            yAxisId="ms"
             type="monotone"
             dataKey="native"
             name="Native Postgres"
             stroke={colors.native}
             strokeWidth={2}
-            dot={{ r: 4 }}
+            dot={<WeightedDot />}
+            isAnimationActive={false}
           />
           <Line
-            yAxisId="ms"
             type="monotone"
             dataKey="served"
             name="Served plan"
             stroke={colors.chosen}
             strokeWidth={2}
-            dot={{ r: 4 }}
+            dot={<WeightedDot />}
+            isAnimationActive={false}
           />
-        </ComposedChart>
+        </LineChart>
       </ResponsiveContainer>
       <p className="decision-caution">
-        Both lines average the <em>same</em> runs, so the gap between them is the optimizer&rsquo;s
-        doing rather than a difference in which queries happened to be run that day. Day-to-day
+        Both lines average the <em>same</em> runs, so the gap between them is the
+        optimizer&rsquo;s doing rather than a difference in which queries happened to be run
+        that day. Larger dots mean more runs behind that day&rsquo;s average. Day-to-day
         movement in the native line is workload mix, not a change in PostgreSQL.
       </p>
     </div>

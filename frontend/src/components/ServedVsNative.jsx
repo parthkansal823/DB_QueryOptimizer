@@ -1,3 +1,5 @@
+import { usePalette } from "../usePalette";
+
 const fmtMs = (v) => (v == null ? "-" : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${v.toFixed(1)} ms`);
 const fmtPct = (v) => (v == null ? "-" : `${v.toFixed(1)}%`);
 
@@ -11,28 +13,52 @@ function Tile({ label, value, sub, color }) {
   );
 }
 
-function QueryRow({ row }) {
+/**
+ * One row per query: the numbers, plus the diverging bar in the same cell.
+ *
+ * The bar used to be a separate list above the table, which meant every query
+ * appeared twice on the page saying the same thing. Putting the bar in the
+ * cell it annotates keeps the "which queries actually produced the total"
+ * reading without repeating the rows.
+ */
+function QueryRow({ row, widest, colors }) {
   // Positive delta = the served plan was slower than native on this query.
-  // Worth its own colour: an aggregate win built on top of a query that got
-  // 3x slower is the failure mode this table exists to expose.
-  const regressed = row.delta_ms > 0.5;
+  // An aggregate win sitting on top of a query that got 3x slower is the
+  // failure mode this table exists to expose, so it gets its own colour.
+  const saved = -row.delta_ms;
+  const share = (Math.abs(saved) / widest) * 50;
+  const isSaving = saved > 0.5;
+  const regressed = saved < -0.5;
+
   return (
     <tr>
       <td className="sql-cell mono" title={row.sql_text}>{row.sql_text}</td>
-      <td className="mono">{row.n_runs}</td>
       <td className="mono">
-        {row.n_deviated}
-        {row.n_deviated === 0 && <span className="cell-note"> kept native</span>}
+        {row.n_deviated}/{row.n_runs}
       </td>
       <td className="mono">{fmtMs(row.native_avg_latency_ms)}</td>
       <td className="mono">{fmtMs(row.served_avg_latency_ms)}</td>
       <td className="mono" style={{ color: "var(--text-muted)" }}>{fmtMs(row.best_avg_latency_ms)}</td>
+      <td>
+        <span className="delta-track" aria-hidden="true">
+          <span className="delta-zero" />
+          <span
+            className="delta-fill"
+            style={{
+              width: `${share}%`,
+              background: regressed ? colors.critical : isSaving ? colors.good : colors.neutral,
+              left: isSaving ? "50%" : `${50 - share}%`,
+              borderRadius: isSaving ? "0 4px 4px 0" : "4px 0 0 4px",
+            }}
+          />
+        </span>
+      </td>
       <td
         className="mono"
         style={{
           color: regressed
             ? "var(--status-critical)"
-            : row.improvement_pct > 0.5
+            : isSaving
               ? "var(--status-good)"
               : "var(--text-muted)",
         }}
@@ -44,6 +70,7 @@ function QueryRow({ row }) {
 }
 
 export default function ServedVsNative({ trend }) {
+  const colors = usePalette();
   const overall = trend?.overall;
   const log = trend?.log;
 
@@ -66,7 +93,10 @@ export default function ServedVsNative({ trend }) {
   }
 
   const improved = overall.improvement_pct > 0;
-  const deviationRate = overall.n_runs ? (overall.n_deviated / overall.n_runs) * 100 : 0;
+  // Symmetric scale for the in-table bars: the same number of milliseconds is
+  // the same bar length whichever side of zero it falls on, or the chart lies
+  // about the balance between wins and regressions.
+  const widest = Math.max(...trend.by_query.map((r) => Math.abs(r.delta_ms)), 1);
 
   return (
     <div>
@@ -88,58 +118,48 @@ export default function ServedVsNative({ trend }) {
           color={improved ? "var(--status-good)" : "var(--status-critical)"}
         />
         <Tile
-          label="Headroom captured"
-          value={overall.headroom_captured_pct == null ? "-" : fmtPct(overall.headroom_captured_pct)}
-          sub={`of ${fmtMs(overall.headroom_ms)} available`}
-        />
-        <Tile
           label="Deviated from native"
           value={`${overall.n_deviated} / ${overall.n_runs}`}
-          sub={`${deviationRate.toFixed(0)}% of runs; ${overall.n_kept_native} kept PostgreSQL's plan`}
+          sub={`${overall.n_kept_native} runs kept PostgreSQL's plan`}
         />
       </div>
 
       <p className="decision-caution" style={{ marginTop: 0 }}>
-        Every number above is a <strong>matched pair</strong>: the native plan and the served
-        plan for the same query, measured moments apart in the same run. Runs where the
-        optimizer declined to deviate are included at zero improvement — leaving them out is
-        what let an earlier version of this panel report a 97% win while every expensive query
-        in the workload was still being served PostgreSQL&rsquo;s own plan.
+        Matched pairs: the native plan and the served plan for the same query, measured moments
+        apart in the same run. Runs where the optimizer declined to deviate count at zero
+        improvement rather than dropping out.
       </p>
 
-      <h3 className="subhead">Per query</h3>
       <div className="table-scroll">
         <table className="data-table">
           <thead>
             <tr>
               <th>Query</th>
-              <th>Runs</th>
               <th>Deviated</th>
               <th>Native avg</th>
               <th>Served avg</th>
               <th>Best seen</th>
+              <th>Time saved / added</th>
               <th>Improvement</th>
             </tr>
           </thead>
           <tbody>
             {trend.by_query.map((row) => (
-              <QueryRow key={row.query_key} row={row} />
+              <QueryRow key={row.query_key} row={row} widest={widest} colors={colors} />
             ))}
           </tbody>
         </table>
       </div>
       <p className="decision-caution">
-        Sorted worst first, so a query the optimizer made <em>slower</em> is the first thing you
-        see rather than something an average hides. &ldquo;Best seen&rdquo; is the fastest plan
-        measured for that query — the ceiling, which is knowable here only because{" "}
-        <code>/query/analyze</code> runs every candidate.
+        Sorted worst first, so a query the optimizer made <em>slower</em> leads rather than
+        hiding inside an average. &ldquo;Best seen&rdquo; is the fastest plan measured for that
+        query, knowable only because <code>/query/analyze</code> runs every candidate.
         {log && (
           <>
             {" "}
-            Excludes {log.n_offline_collection_rows.toLocaleString()} rows from the offline
-            training sweep, which generates labels rather than serving decisions
-            ({log.n_executions_logged.toLocaleString()} executions logged in total across{" "}
-            {log.n_distinct_queries} distinct queries).
+            Excludes {log.n_offline_collection_rows.toLocaleString()} offline training-sweep rows
+            of the {log.n_executions_logged.toLocaleString()} logged — those generate labels, not
+            serving decisions.
           </>
         )}
       </p>

@@ -45,8 +45,8 @@ export function fetchSchema() {
   return request("/schema");
 }
 
-export function fetchRegret() {
-  return request("/stats/regret");
+export function fetchCostModel() {
+  return request("/stats/cost-model");
 }
 
 export function fetchAdvisor() {

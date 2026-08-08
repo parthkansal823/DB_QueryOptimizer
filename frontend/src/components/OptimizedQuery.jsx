@@ -46,17 +46,13 @@ export default function OptimizedQuery({ best, decision }) {
             {best.optimized_ms.toFixed(1)} ms
           </div>
         </div>
+        {/* "2.5x" and "60% faster" are the same fact twice. */}
         <div className="stat-tile">
           <div className="label">Speedup</div>
           <div className="value" style={{ color: "var(--status-good)" }}>
             {best.speedup.toFixed(1)}×
           </div>
-        </div>
-        <div className="stat-tile">
-          <div className="label">Faster by</div>
-          <div className="value" style={{ color: "var(--status-good)" }}>
-            {best.percent_faster.toFixed(1)}%
-          </div>
+          <div className="stat-sub">{best.percent_faster.toFixed(0)}% less time</div>
         </div>
       </div>
 

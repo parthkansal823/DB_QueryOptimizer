@@ -14,9 +14,13 @@ export default function SchemaPanel({ schema }) {
           <div className="label">Join edges</div>
           <div className="value">{schema.n_foreign_keys}</div>
         </div>
+        {/* pg_class.reltuples, not COUNT(*) -- an estimate autovacuum keeps
+            roughly current. Rendering it as a precise figure would claim an
+            accuracy the number does not have. */}
         <div className="stat-tile">
-          <div className="label">Total rows</div>
-          <div className="value">{schema.total_rows?.toLocaleString()}</div>
+          <div className="label">Rows (estimated)</div>
+          <div className="value">~{schema.total_rows?.toLocaleString()}</div>
+          <div className="stat-sub">planner statistics, not a live count</div>
         </div>
         <div className="stat-tile">
           <div className="label">Edges from</div>
@@ -40,7 +44,7 @@ export default function SchemaPanel({ schema }) {
           <thead>
             <tr>
               <th>Table</th>
-              <th>Rows</th>
+              <th>Rows (est.)</th>
               <th>Share</th>
             </tr>
           </thead>

@@ -11,8 +11,12 @@
 
   --series-native: #2a78d6; /* categorical slot 1 - blue */
   --series-chosen: #eb6834; /* categorical slot 2 - orange */
+  --series-oracle: #1baf7a; /* categorical slot 3 - aqua; sub-3:1 on light, so
+                               only used where labels or the table give relief */
   --series-candidate: #b7d3f6; /* sequential step 150 - muted, non-winning candidates */
+  --series-neutral: #898781; /* muted ink - "nothing happened" segments */
   --status-good: #0ca30c;
+  --status-warning: #fab219;
   --status-critical: #d03b3b;
 }
 
@@ -30,8 +34,11 @@
 
     --series-native: #3987e5;
     --series-chosen: #d95926;
+    --series-oracle: #199e70;
     --series-candidate: #2c2c2a;
+    --series-neutral: #898781;
     --status-good: #0ca30c;
+    --status-warning: #fab219;
     --status-critical: #d03b3b;
   }
 }

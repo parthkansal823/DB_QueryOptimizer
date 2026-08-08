@@ -382,3 +382,139 @@ code {
 .rec-head .badge {
   margin-left: 0;
 }
+
+/* A bound rather than a series: dashed neutral, matching the oracle line. */
+.legend-swatch-reference {
+  background: repeating-linear-gradient(
+    90deg,
+    var(--series-neutral) 0 5px,
+    transparent 5px 9px
+  );
+  border-radius: 0;
+  height: 2px;
+  align-self: center;
+}
+
+/* Matches the dashed outline the vetoed bar gets in the chart. */
+.legend-swatch-vetoed {
+  background: var(--series-candidate);
+  border: 2px dashed var(--series-chosen);
+}
+
+.chart-tooltip {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+/* -- diverging delta bar, rendered inside the per-query table ----------- */
+/* Fixed width so every row's bar shares one scale -- a bar sized by its own
+   cell would make the shortest row look like the biggest change. */
+.delta-track {
+  position: relative;
+  display: block;
+  width: 160px;
+  height: 14px;
+}
+
+/* The zero line is what the whole chart is read against, so it gets drawn
+   rather than implied by wherever the bars happen to start. */
+.delta-zero {
+  position: absolute;
+  left: 50%;
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  background: var(--baseline-axis);
+}
+
+.delta-fill {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 2px;
+}
+
+
+/* -- decision quality --------------------------------------------------- */
+
+.dq-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 28px;
+}
+
+.dq-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.85rem;
+  margin-bottom: 6px;
+}
+
+/* gap: 2px leaves a surface-coloured sliver between adjacent segments, so two
+   fills never touch and read as one. */
+.dq-bar {
+  display: flex;
+  gap: 2px;
+  height: 14px;
+  margin-bottom: 10px;
+}
+
+.dq-seg {
+  border-radius: 3px;
+  min-width: 3px;
+}
+
+.dq-legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dq-legend li {
+  display: grid;
+  grid-template-columns: 10px 14px auto;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.78rem;
+  padding: 4px 0;
+  color: var(--text-secondary);
+}
+
+.dq-legend li.is-zero {
+  opacity: 0.45;
+}
+
+.dq-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+/* Icon plus label, always: the status ramp puts warning below 3:1 on the light
+   surface by design, so colour is never the only carrier of meaning here. */
+.dq-icon {
+  font-weight: 700;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.dq-label {
+  color: var(--text-primary);
+}
+
+.dq-count {
+  display: none;
+}
+
+.dq-detail {
+  grid-column: 2 / -1;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}

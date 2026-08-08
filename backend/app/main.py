@@ -236,6 +236,20 @@ def advisor():
         return {"recommendations": missing_fk_indexes(cur)}
 
 
+@app.get("/stats/cost-model")
+def stats_cost_model():
+    """
+    How well PostgreSQL's cost estimates track measured latency.
+
+    The rank correlation this returns is the project's premise stated as a
+    number: the planner chooses by minimising cost, so the gap between that
+    ordering and the real one is the entire space a learned optimizer has to
+    work in.
+    """
+    with get_cursor() as cur:
+        return stats.cost_vs_latency(cur)
+
+
 @app.get("/stats/regret")
 def stats_regret():
     """
