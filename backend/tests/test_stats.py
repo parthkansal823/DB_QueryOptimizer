@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.logging_store import query_fingerprint
-from app.stats import served_vs_native
+from app.stats import _spearman, classify, cost_vs_latency, served_vs_native
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -159,3 +159,110 @@ def test_fingerprint_distinguishes_different_queries():
 def test_fingerprint_is_marked_as_adhoc():
     """The prefix is what keeps dashboard traffic out of training data."""
     assert query_fingerprint("SELECT 1").startswith("adhoc:")
+
+
+# -- decision quality -------------------------------------------------------
+
+
+def _classify(native, served, best, deviated=True):
+    return classify(
+        {"native_ms": native, "served_ms": served, "best_ms": best, "deviated": deviated}
+    )
+
+
+def test_classify_separates_a_correct_hold_from_a_missed_win():
+    """Both score zero improvement; only one of them is a good decision, and
+    an improvement percentage cannot tell them apart."""
+    assert _classify(100.0, 100.0, 99.5, deviated=False) == "held_correct"
+    assert _classify(100.0, 100.0, 40.0, deviated=False) == "held_missed"
+
+
+def test_classify_grades_deviations_by_what_they_achieved():
+    assert _classify(100.0, 40.0, 40.0) == "deviated_win"
+    assert _classify(100.0, 160.0, 90.0) == "deviated_loss"
+
+
+def test_a_gain_inside_the_noise_bar_is_a_wash_not_a_win():
+    # 1 ms off a 100 ms query clears neither the 5% nor the 2 ms threshold.
+    assert _classify(100.0, 99.0, 99.0) == "deviated_wash"
+    # 1 ms off a 3 ms query clears 5% but not the absolute floor.
+    assert _classify(3.0, 2.0, 2.0) == "deviated_wash"
+
+
+def test_decision_quality_attributes_time_to_each_failure_mode():
+    runs = [
+        run(query_key="win", native=100.0, served=40.0, best=40.0),
+        run(query_key="loss", at=T0 + timedelta(seconds=1), native=100.0, served=160.0, best=90.0),
+        run(query_key="missed", at=T0 + timedelta(seconds=2),
+            native=100.0, served=100.0, best=30.0, deviated=False),
+        run(query_key="held", at=T0 + timedelta(seconds=3),
+            native=100.0, served=100.0, best=100.0, deviated=False),
+    ]
+    quality = served_vs_native(_FakeCursor(runs))["decision_quality"]
+
+    assert quality["saved_ms"] == 60.0
+    assert quality["regression_ms"] == 60.0
+    assert quality["missed_ms"] == 70.0
+    assert quality["deviated_win"] == quality["held_correct"] == 1
+
+
+def test_runs_are_returned_in_order_with_their_outcome():
+    runs = [
+        run(query_key="q1", native=100.0, served=40.0, best=40.0),
+        run(query_key="q2", at=T0 + timedelta(seconds=1),
+            native=50.0, served=50.0, best=50.0, deviated=False),
+    ]
+    result = served_vs_native(_FakeCursor(runs))
+    assert [r["outcome"] for r in result["runs"]] == ["deviated_win", "held_correct"]
+    # Distinct queries that produced a matched run, not every query ever logged.
+    assert result["log"]["n_compared_queries"] == 2
+
+
+def test_by_query_flags_ad_hoc_ids():
+    """The dashboard styles workload queries and live traffic differently."""
+    runs = [
+        run(query_key="adhoc:abc"),
+        run(query_key="q1", at=T0 + timedelta(seconds=1)),
+    ]
+    by_query = served_vs_native(_FakeCursor(runs))["by_query"]
+    assert {r["query_key"]: r["is_adhoc"] for r in by_query} == {"adhoc:abc": True, "q1": False}
+
+
+# -- cost model -------------------------------------------------------------
+
+
+def test_spearman_is_one_for_a_perfectly_ordered_pair():
+    assert _spearman([1.0, 2.0, 3.0, 4.0], [10.0, 20.0, 30.0, 40.0]) == 1.0
+
+
+def test_spearman_handles_reversal_and_zero_variance():
+    assert _spearman([1.0, 2.0, 3.0], [30.0, 20.0, 10.0]) == -1.0
+    assert _spearman([1.0, 1.0, 1.0], [1.0, 2.0, 3.0]) is None
+
+
+def test_spearman_needs_enough_points_to_mean_anything():
+    assert _spearman([1.0, 2.0], [1.0, 2.0]) is None
+
+
+class _PlanCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, sql, params=None):
+        pass
+
+    def fetchall(self):
+        return self._rows
+
+
+def test_cost_vs_latency_labels_each_plan_by_where_it_came_from():
+    cur = _PlanCursor([
+        (1000.0, 5.0, True, False),
+        (2000.0, 9.0, False, True),
+        (3000.0, 1.0, False, False),
+    ])
+    result = cost_vs_latency(cur)
+    assert [p["kind"] for p in result["points"]] == ["native", "hinted", "candidate"]
+    assert result["n_points"] == 3
+    # Disabled-plan sentinels are filtered in SQL, and the flag says so.
+    assert result["excludes_disabled_plans"] is True
