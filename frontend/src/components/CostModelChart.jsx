@@ -26,10 +26,14 @@ function CostTooltip({ active, payload }) {
 
 // A log axis spanning three orders of magnitude needs ticks a reader can
 // place; Recharts' automatic ones on a log scale are unhelpfully arbitrary.
+// Only decades that fall inside the data are kept -- the axis stops at the
+// largest value measured, so labelling its end "1000k" when nothing reaches
+// 1000k overstates the range.
 function decadeTicks(min, max) {
   const ticks = [];
   for (let e = Math.floor(Math.log10(min)); e <= Math.ceil(Math.log10(max)); e += 1) {
-    ticks.push(10 ** e);
+    const tick = 10 ** e;
+    if (tick >= min && tick <= max) ticks.push(tick);
   }
   return ticks;
 }

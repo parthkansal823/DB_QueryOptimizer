@@ -6,8 +6,8 @@ export default function OptimizedQuery({ best, decision }) {
   if (!best) {
     return (
       <div className="empty-state">
-        No candidate beat PostgreSQL on this query — its own plan was already the fastest
-        of everything tried. Nothing to hand you here, which is the honest answer.
+        Nothing beat PostgreSQL on this query — its own plan was the fastest of everything we
+        tried. There is nothing to hand you here.
       </div>
     );
   }
@@ -37,7 +37,7 @@ export default function OptimizedQuery({ best, decision }) {
     <div>
       <div className="stat-row" style={{ marginBottom: 14 }}>
         <div className="stat-tile">
-          <div className="label">Original</div>
+          <div className="label">PostgreSQL</div>
           <div className="value">{best.baseline_ms.toFixed(1)} ms</div>
         </div>
         <div className="stat-tile">
@@ -69,34 +69,33 @@ export default function OptimizedQuery({ best, decision }) {
         <a href="https://github.com/ossc-db/pg_hint_plan" target="_blank" rel="noreferrer">
           pg_hint_plan
         </a>{" "}
-        hint. It changes only the execution plan — same rows, same results. Plain PostgreSQL
-        without the extension ignores it as a comment, so it is safe to commit.
+        hint. It changes the plan only — same rows, same results. PostgreSQL without the
+        extension just reads it as a comment, so it is safe to commit.
       </p>
 
       {misestimated && (
         <p className="decision-caution">
-          <strong>Why PostgreSQL got this wrong:</strong> it estimated{" "}
-          <strong>{best.baseline_est_rows.toLocaleString()}</strong> rows and actually got{" "}
+          <strong>Why PostgreSQL got this wrong:</strong> it expected{" "}
+          <strong>{best.baseline_est_rows.toLocaleString()}</strong> rows and got{" "}
           <strong>{best.baseline_actual_rows.toLocaleString()}</strong>. It assumes filters are
-          independent and multiplies their selectivities, which breaks when the columns are
-          correlated — and it plans for the wrong row count.
+          unrelated and multiplies their odds together. When the columns are actually related,
+          that estimate is far off, and the plan gets built for the wrong number of rows.
         </p>
       )}
 
       {costInverted && (
         <p className="decision-caution">
-          Note the optimized plan&rsquo;s <em>estimated</em> cost ({best.optimized_cost.toFixed(0)})
-          is <em>higher</em> than the original&rsquo;s ({best.baseline_cost.toFixed(0)}). That is
-          why PostgreSQL rejected it — and measuring real latency instead of trusting that
-          estimate is the entire premise of this project.
+          PostgreSQL priced the faster plan <em>higher</em> ({best.optimized_cost.toFixed(0)} vs{" "}
+          {best.baseline_cost.toFixed(0)}), which is why it did not pick it. Measuring the real
+          time instead of trusting that estimate is the whole idea here.
         </p>
       )}
 
       {decision?.fell_back_to_baseline && (
         <p className="decision-caution">
-          The model did <em>not</em> select this plan — it wasn&rsquo;t confident enough, so the
-          served query kept PostgreSQL&rsquo;s. This panel reports what the measurements show
-          with hindsight, which is more than the optimizer is willing to bet on live.
+          The model did <em>not</em> pick this plan — it was not confident enough, so
+          PostgreSQL&rsquo;s plan ran. This panel shows what the measurements found afterwards,
+          which is more than the optimizer will bet on live.
         </p>
       )}
     </div>

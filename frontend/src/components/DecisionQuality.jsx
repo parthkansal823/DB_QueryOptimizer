@@ -78,8 +78,9 @@ function Segments({ title, total, parts, colors }) {
           <li key={p.key} className={p.count === 0 ? "is-zero" : undefined}>
             <span className="dq-swatch" style={{ background: colors[p.color] }} aria-hidden="true" />
             <span className="dq-icon" aria-hidden="true">{p.icon}</span>
-            <span className="dq-label">{p.label}</span>
-            <span className="dq-count mono">{p.count}</span>
+            <span className="dq-label">
+              {p.label} <span className="mono dq-count">{p.count}</span>
+            </span>
             <span className="dq-detail">{p.detail}</span>
           </li>
         ))}

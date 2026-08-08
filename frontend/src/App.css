@@ -508,8 +508,11 @@ code {
   color: var(--text-primary);
 }
 
+/* The count belongs next to the label it counts, not in its own column --
+   a column of numbers separated from their names reads as a second table. */
 .dq-count {
-  display: none;
+  color: var(--text-muted);
+  margin-left: 4px;
 }
 
 .dq-detail {

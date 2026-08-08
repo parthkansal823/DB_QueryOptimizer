@@ -42,15 +42,20 @@ function QueryRow({ row, widest, colors }) {
       <td>
         <span className="delta-track" aria-hidden="true">
           <span className="delta-zero" />
-          <span
-            className="delta-fill"
-            style={{
-              width: `${share}%`,
-              background: regressed ? colors.critical : isSaving ? colors.good : colors.neutral,
-              left: isSaving ? "50%" : `${50 - share}%`,
-              borderRadius: isSaving ? "0 4px 4px 0" : "4px 0 0 4px",
-            }}
-          />
+          {/* No fill at all when the change is under half a millisecond: a
+              minimum-width sliver sitting on the zero line reads as a real
+              result, and this is the absence of one. */}
+          {(isSaving || regressed) && (
+            <span
+              className="delta-fill"
+              style={{
+                width: `${share}%`,
+                background: regressed ? colors.critical : colors.good,
+                left: isSaving ? "50%" : `${50 - share}%`,
+                borderRadius: isSaving ? "0 4px 4px 0" : "4px 0 0 4px",
+              }}
+            />
+          )}
         </span>
       </td>
       <td
@@ -102,12 +107,12 @@ export default function ServedVsNative({ trend }) {
     <div>
       <div className="stat-row" style={{ marginBottom: 12 }}>
         <Tile
-          label="Total native time"
+          label="Time with PostgreSQL"
           value={fmtMs(overall.native_total_ms)}
           sub={`across ${overall.n_runs} run${overall.n_runs === 1 ? "" : "s"}`}
         />
         <Tile
-          label="Total served time"
+          label="Time with the optimizer"
           value={fmtMs(overall.served_total_ms)}
           sub="what you actually waited"
         />

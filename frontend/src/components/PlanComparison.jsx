@@ -41,19 +41,19 @@ function DecisionNote({ decision }) {
 
   const vetoMessage = {
     no_confident_gain_over_native:
-      "Kept the native plan — no candidate was confidently faster than PostgreSQL's own choice.",
+      "Kept PostgreSQL's plan — nothing else was clearly faster.",
     predicted_regression_vs_native:
-      "Kept the native plan — the best candidate is costed far above native's, so serving it risks a regression.",
+      "Kept PostgreSQL's plan — the best alternative is priced far higher, so running it was too risky.",
     regression_guard:
-      "Kept the native plan — this query has a measured history of the learned path being slower.",
-    no_candidates: "No join-order alternatives exist for this query.",
+      "Kept PostgreSQL's plan — on this query, the learned path has been slower before.",
+    no_candidates: "There are no alternative join orders for this query.",
   }[decision.reason];
 
   return (
     <div className="decision-note">
       {vetoed && vetoMessage && (
         <p className="decision-veto">
-          <strong>Native kept:</strong> {vetoMessage}
+          <strong>No change:</strong> {vetoMessage}
         </p>
       )}
       <dl className="decision-facts">
@@ -65,7 +65,7 @@ function DecisionNote({ decision }) {
         )}
         {speedup != null && (
           <>
-            <dt>Predicted vs native</dt>
+            <dt>Predicted speed vs PostgreSQL</dt>
             <dd>
               {speedup.toFixed(2)}&times;
               {pessimistic != null && ` (pessimistically ${pessimistic.toFixed(2)}×)`}
@@ -74,7 +74,7 @@ function DecisionNote({ decision }) {
         )}
         {required != null && (
           <>
-            <dt>Needed to deviate</dt>
+            <dt>Needed to switch</dt>
             <dd>&lt; {required.toFixed(2)}&times;</dd>
           </>
         )}
@@ -90,8 +90,8 @@ function DecisionNote({ decision }) {
       </dl>
       {speedup != null && pessimistic != null && pessimistic > speedup * 1.25 && (
         <p className="decision-caution">
-          Wide gap between the predicted and pessimistic speedup &mdash; the ensemble disagrees
-          here, so the model has thin evidence for this query.
+          The model&rsquo;s best guess and its worst case are far apart, so it has little
+          evidence to go on for this query.
         </p>
       )}
     </div>
@@ -102,11 +102,11 @@ export default function PlanComparison({ baseline, chosenPlan, selectorMode, dec
   return (
     <>
       <div className="plan-comparison-grid">
-        <PlanPanel title="Native Postgres" plan={baseline} badge="baseline" badgeClass="badge-native" />
+        <PlanPanel title="PostgreSQL" plan={baseline} badge="baseline" badgeClass="badge-native" />
         <PlanPanel
           title={selectorMode === "learned" ? "Learned pick" : "Heuristic pick"}
           plan={chosenPlan}
-          badge={decision?.fell_back_to_baseline ? "vetoed" : "chosen"}
+          badge={decision?.fell_back_to_baseline ? "blocked" : "chosen"}
           badgeClass={decision?.fell_back_to_baseline ? "badge-vetoed" : "badge-chosen"}
         />
       </div>

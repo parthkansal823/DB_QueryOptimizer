@@ -128,7 +128,7 @@ export default function App() {
     <>
       <header className="app-header">
         <h1>Learned Query Optimizer</h1>
-        <p>Paste a query, compare native Postgres against the {overall?.selector_mode ?? "..."} plan-selection path.</p>
+        <p>Paste a query and see how PostgreSQL&rsquo;s plan compares to the one the {overall?.selector_mode ?? "…"} optimizer picks.</p>
       </header>
 
       <section className="card">
@@ -139,7 +139,7 @@ export default function App() {
       {result && (
         <>
           <section className="card">
-            <h2>Optimized query &mdash; ready to use</h2>
+            <h2>Faster version of your query</h2>
             <OptimizedQuery best={result.best_measured} decision={result.decision} />
           </section>
 
@@ -156,7 +156,7 @@ export default function App() {
             />
             {result.candidates?.length ? (
               <>
-                <h3 className="subhead">Every candidate, measured</h3>
+                <h3 className="subhead">Every plan we tried</h3>
                 <LatencyChart
                   baseline={result.baseline}
                   candidates={result.candidates}
@@ -166,7 +166,8 @@ export default function App() {
               </>
             ) : (
               <div className="empty-state">
-                No join-order candidates for this query (single table, or unsupported shape).
+                No alternative join orders for this query — it uses a single table, or a shape
+                we do not handle yet.
               </div>
             )}
           </section>
@@ -174,7 +175,7 @@ export default function App() {
       )}
 
       <section className="card">
-        <h2>Model health &amp; learning loop</h2>
+        <h2>Model health</h2>
         <ModelHealth
           status={modelStatus}
           busy={modelBusy}
@@ -191,28 +192,28 @@ export default function App() {
       )}
 
       <section className="card">
-        <h2>Database optimizations &mdash; fix the cause, not the symptom</h2>
+        <h2>Database fixes &mdash; treat the cause, not the symptom</h2>
         <Recommendations queryRecs={result?.recommendations} schemaRecs={schemaRecs} />
       </section>
 
       <section className="card">
-        <h2>Served vs. native &mdash; measured on matched runs</h2>
+        <h2>How much time this is saving</h2>
         {trendError && <div className="error-banner">{trendError}</div>}
         <ServedVsNative trend={trend} />
       </section>
 
       <section className="card">
-        <h2>Decision quality &mdash; was each call the right one?</h2>
+        <h2>Were the decisions right?</h2>
         <DecisionQuality quality={trend?.decision_quality} />
       </section>
 
       <section className="card">
-        <h2>Over the run sequence</h2>
+        <h2>Time saved, run by run</h2>
         <CumulativeChart runs={trend?.runs} />
       </section>
 
       <section className="card">
-        <h2>Is PostgreSQL&rsquo;s cost model right?</h2>
+        <h2>Do PostgreSQL&rsquo;s estimates match reality?</h2>
         <CostModelChart data={costModel} />
       </section>
 
@@ -227,7 +228,7 @@ export default function App() {
       )}
 
       <section className="card">
-        <h2>Discovered schema</h2>
+        <h2>What we found in your database</h2>
         <SchemaPanel schema={schema} />
       </section>
     </>

@@ -203,7 +203,7 @@ export default function CumulativeChart({ runs }) {
 
       <p className="decision-caution">
         These are running totals of time spent, so all three only climb. Read the gaps: from
-        native down to served is the time saved; from served down to best possible is the time
+        PostgreSQL down to served is the time saved; from served down to best possible is the time
         still on the table. If the top gap stops widening, the optimizer has stopped finding
         wins. If the bottom gap keeps growing in a straight line, it is not learning.
       </p>

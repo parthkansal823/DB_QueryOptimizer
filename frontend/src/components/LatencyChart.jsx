@@ -41,7 +41,7 @@ export default function LatencyChart({ baseline, candidates, chosenIndex, vetoed
 
   const data = [
     {
-      name: "native",
+      name: "PostgreSQL",
       latency: baseline.actual_total_time_ms,
       kind: "native",
       hint: null,
@@ -56,8 +56,8 @@ export default function LatencyChart({ baseline, candidates, chosenIndex, vetoed
 
   const hasVeto = data.some((d) => d.kind === "vetoed");
 
-  const fillFor = (kind) =>
-    kind === "native" || kind === "served" ? (kind === "native" ? colors.native : colors.chosen) : colors.candidate;
+  const FILLS = { native: colors.native, served: colors.chosen };
+  const fillFor = (kind) => FILLS[kind] ?? colors.candidate;
 
   return (
     <div>

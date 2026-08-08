@@ -24,7 +24,7 @@ function VersionRow({ version }) {
 export default function ModelHealth({ status, onRetrain, onRollback, busy }) {
   const [message, setMessage] = useState(null);
 
-  if (!status) return <div className="empty-state">Model status unavailable.</div>;
+  if (!status) return <div className="empty-state">Could not load model status.</div>;
 
   const blocked = Object.entries(status.regression_guard?.blocked_queries ?? {});
 
@@ -52,7 +52,7 @@ export default function ModelHealth({ status, onRetrain, onRollback, busy }) {
           </div>
         </div>
         <div className="stat-tile">
-          <div className="label">Unlearned feedback</div>
+          <div className="label">New data to learn from</div>
           <div className="value">{status.rows_since_last_training} rows</div>
         </div>
       </div>
@@ -70,22 +70,22 @@ export default function ModelHealth({ status, onRetrain, onRollback, busy }) {
       <h3 className="subhead">Regression guard</h3>
       {blocked.length === 0 ? (
         <p className="empty-state">
-          No queries blocked — the learned path hasn&rsquo;t measurably regressed on anything yet.
+          No queries blocked — the learned path has not been measurably slower on anything yet.
         </p>
       ) : (
         <>
           <p className="decision-caution" style={{ marginTop: 0 }}>
-            {blocked.length} quer{blocked.length === 1 ? "y is" : "ies are"} served the native plan:
-            their learned-path history is slower than native by more than{" "}
-            {(status.regression_guard.tolerance * 100).toFixed(0)}%.
+            {blocked.length} quer{blocked.length === 1 ? "y gets" : "ies get"} PostgreSQL&rsquo;s
+            plan instead: the learned path has been more than{" "}
+            {(status.regression_guard.tolerance * 100).toFixed(0)}% slower on them.
           </p>
           <div className="table-scroll">
             <table className="data-table">
               <thead>
                 <tr>
                   <th>Query</th>
-                  <th>Native avg</th>
-                  <th>Learned avg</th>
+                  <th>PostgreSQL avg</th>
+                  <th>Learned path avg</th>
                   <th>Ratio</th>
                   <th>Obs.</th>
                 </tr>
