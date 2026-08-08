@@ -136,6 +136,33 @@ def analyze_query(req: QueryRequest):
                 is_chosen=(i == chosen_index and not decision.get("fell_back_to_baseline")),
             )
 
+    # The best candidate *actually measured* this run, which is what a
+    # developer can copy and use today. This is distinct from `chosen_plan`
+    # (what the model picked) and from `served_plan` (what the gate allowed):
+    # /query/analyze executes everything, so it knows the real answer with
+    # hindsight, and there is no reason to withhold it just because the model
+    # was not confident enough to select it.
+    best_measured = None
+    if candidate_plans:
+        fastest = min(candidate_plans, key=lambda p: p["actual_total_time_ms"])
+        if fastest["actual_total_time_ms"] < baseline_plan["actual_total_time_ms"]:
+            best_measured = {
+                "hint": fastest["hint"],
+                "optimized_sql": apply_hint(req.sql, fastest["hint"]),
+                "baseline_ms": baseline_plan["actual_total_time_ms"],
+                "optimized_ms": fastest["actual_total_time_ms"],
+                "speedup": baseline_plan["actual_total_time_ms"] / fastest["actual_total_time_ms"],
+                "percent_faster": (
+                    1 - fastest["actual_total_time_ms"] / baseline_plan["actual_total_time_ms"]
+                ) * 100,
+                # Postgres often costs the faster plan *higher* -- that gap is
+                # exactly why it rejected it, and the whole premise here.
+                "baseline_cost": baseline_plan["total_cost"],
+                "optimized_cost": fastest["total_cost"],
+                "baseline_est_rows": baseline_plan["raw_plan"].get("Plan Rows"),
+                "baseline_actual_rows": baseline_plan["raw_plan"].get("Actual Rows"),
+            }
+
     return {
         "baseline": baseline_plan,
         "candidates": candidate_plans,
@@ -146,6 +173,7 @@ def analyze_query(req: QueryRequest):
         # Why this plan: policy, predicted latency, ensemble uncertainty, and
         # whether the safety net vetoed the model's pick.
         "decision": decision,
+        "best_measured": best_measured,
     }
 
 

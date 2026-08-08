@@ -631,6 +631,118 @@ Postgres's planner. Doing the latter properly means intercepting cardinality
 estimation inside the planner (pg_hint_plan's `Rows` hint is the hook);
 that is a substantially larger change and is named as future work.
 
+## 2.9 The benchmark was the bottleneck
+
+The most persistent complaint about this system was that it did not reduce
+query cost. Investigating it properly produced the most important result in
+the project, and it was not about the model at all.
+
+### Measuring the ceiling
+
+For every query in the v1 workload, execute *every* candidate plan and
+record the fastest. That gives the **oracle ceiling** -- the best any
+selector could possibly do:
+
+| | v1 synthetic | TPC-H | JOB/IMDB |
+|---|---|---|---|
+| Tables | 4 | 8 | 21 |
+| Mean best-possible gain | **6.5%** | ~23% | **~75%** |
+| Queries with >5% available | **7 / 25** | -- | 3 / 4 |
+| Best model's top-1 accuracy | **0%** | -- | 25% |
+
+On v1, PostgreSQL was already choosing the best plan for 18 of 25 queries.
+Six model classes were compared (LightGBM, random forest, extremely
+randomised trees, gradient boosting, ridge, and an MLP) and **not one picked
+the fastest plan even once**. That is not six model failures; it is the
+absence of a signal to learn. Where signal existed -- JOB -- extremely
+randomised trees reached 25% top-1 and captured 73% of headroom.
+
+**A benchmark on which the baseline is already optimal cannot measure an
+improvement.** Every earlier attempt to fix "cost isn't reducing" by
+adjusting thresholds, targets and model classes was working on the wrong
+variable.
+
+### Rebuilding the dataset to be hard
+
+So `data/schema.sql` was rewritten against the specific mechanism Leis et
+al. identified: PostgreSQL's **independence assumption**. Given
+`WHERE a = x AND b = y` it estimates sel(a) x sel(b), which is correct only
+when the columns are unrelated. v2 makes them related on purpose:
+
+    city    -> country      (Mumbai implies IN)
+    brand   -> category     (Voltix implies electronics)
+    price_band ~ category   (electronics skew premium)
+    channel ~ status        (cancellations cluster in one channel)
+
+Filtering on both halves of a dependency therefore produces a row estimate
+several times too small, and that error compounds through joins into a
+genuinely wrong join order. Two more tables widen the graph to six, so the
+workload reaches 5- and 6-way joins where ordering matters far more than at
+two or three. `workload.py` was rewritten to exercise each trap, with
+uncorrelated **control** queries alongside so the contrast is visible rather
+than assumed.
+
+Deliberately absent: any `CREATE STATISTICS` object. Multi-column statistics
+are exactly how a DBA would *fix* these correlations, so leaving them off is
+what preserves the errors the benchmark exists to exploit. Adding them is
+the natural controlled experiment -- headroom should collapse.
+
+### Result
+
+| | v1 | **v2** |
+|---|---|---|
+| Mean best-possible gain | 6.5% | **22.2%** |
+| Queries with >5% available | 7 / 25 | **14 / 23** |
+
+with the largest gains landing exactly on the designed traps:
+
+| Query | Trap | Headroom |
+|---|---|---|
+| `corr_brand_category` | brand -> category | **95.4%** |
+| `corr_brand_band` | brand -> category + band | **95.2%** |
+| `corr_6w_everything` | both, over 6 tables | **93.6%** |
+| `corr_city_country` | city -> country | **63.1%** |
+
+The mechanism predicted the outcome, which is the strongest evidence
+available that the diagnosis was right rather than merely convenient.
+
+### A regression this exposed
+
+Expanding the action space (§2.10) without re-collecting training data
+caused **17 of 25 queries to hit the safety veto**: the model was being
+asked to score `Set(enable_*)` plans it had never seen during training, so
+its predictions were extrapolation and the confidence gate correctly refused
+them. Classic train/serve skew. The fix is not a code change -- it is
+re-running `app.collect_data` whenever the action space changes, which is
+now noted in the README.
+
+## 2.10 Widening the action space
+
+`Leading()` join-order hints alone turned out to be nearly useless on small
+queries. For a two-table join there are only two orderings and PostgreSQL
+already picks the better one, so every "candidate" came back as the
+*identical plan with the identical cost* -- visible in the dashboard as
+native and chosen both reading 4673.9. The optimizer appeared to run while
+having nothing to choose between.
+
+`hints.py` now also emits Bao's actual action space: **operator toggles**
+(`Set(enable_nestloop off)`, `Set(enable_indexscan off)`, and combinations).
+Disabling a class of operator makes the planner re-plan under that
+restriction, which produces genuinely different plans. `plan_fingerprint`
+deduplicates candidates that come back structurally identical, so the
+candidate count reflects the real size of the action space instead of
+counting copies.
+
+On JOB this immediately found wins join-order hints could not reach:
+
+| Query | Native | Best | Gain | Winning hint |
+|---|---|---|---|---|
+| `auto_2w_01` | 525.0 ms | 108.6 ms | **79.3%** | `Set(enable_indexscan off)` |
+| `auto_3w_03` | 320.9 ms | 180.2 ms | **43.8%** | `Set(enable_indexscan off)` |
+
+Note the winning hint in both cases is a scan-method toggle, not a join
+order -- an action the previous design could not express at all.
+
 ## 3. Stretch goals
 
 **Join-method selection.** `generate_join_method_candidates`

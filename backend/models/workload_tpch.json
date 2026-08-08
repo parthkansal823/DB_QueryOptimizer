@@ -1,0 +1,128 @@
+[
+  {
+    "id": "auto_2w_00_o_o_shippriority_eq",
+    "sql": "SELECT o.\"o_orderkey\", c.\"c_custkey\"\nFROM \"orders\" o\nJOIN \"customer\" c ON o.\"o_custkey\" = c.\"c_custkey\"\nWHERE o.\"o_shippriority\" = 0.0 AND c.\"c_phone\" = '25-708-097     '",
+    "description": "auto-generated 2-way join over orders, customer",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_01_c_c_acctbal_lt",
+    "sql": "SELECT c.\"c_custkey\", n.\"n_nationkey\"\nFROM \"customer\" c\nJOIN \"nation\" n ON c.\"c_nationkey\" = n.\"n_nationkey\"\nWHERE c.\"c_acctbal\" < 6481.88 AND n.\"n_comment\" = 'nation 8'",
+    "description": "auto-generated 2-way join over customer, nation",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_02_s_s_acctbal_gt",
+    "sql": "SELECT s.\"s_suppkey\", n.\"n_nationkey\"\nFROM \"supplier\" s\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nWHERE s.\"s_acctbal\" > 1334.02 AND n.\"n_comment\" = 'nation 3'",
+    "description": "auto-generated 2-way join over supplier, nation",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_03_p_ps_availqty_lt",
+    "sql": "SELECT p.\"ps_partkey\", s.\"s_suppkey\"\nFROM \"partsupp\" p\nJOIN \"supplier\" s ON p.\"ps_suppkey\" = s.\"s_suppkey\"\nWHERE p.\"ps_availqty\" < 7529.0 AND s.\"s_phone\" = '10-050-416     '",
+    "description": "auto-generated 2-way join over partsupp, supplier",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_04_n_n_comment_eq",
+    "sql": "SELECT n.\"n_nationkey\", r.\"r_regionkey\"\nFROM \"nation\" n\nJOIN \"region\" r ON n.\"n_regionkey\" = r.\"r_regionkey\"\nWHERE n.\"n_comment\" = 'nation 22' AND r.\"r_name\" = 'ASIA                     '",
+    "description": "auto-generated 2-way join over nation, region",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_05_l_l_tax_lt",
+    "sql": "SELECT l.\"l_orderkey\", o.\"o_orderkey\"\nFROM \"lineitem\" l\nJOIN \"orders\" o ON l.\"l_orderkey\" = o.\"o_orderkey\"\nWHERE l.\"l_tax\" < 0.06 AND o.\"o_shippriority\" = 0.0",
+    "description": "auto-generated 2-way join over lineitem, orders",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_06_c_c_name_eq",
+    "sql": "SELECT c.\"c_custkey\", n.\"n_nationkey\", r.\"r_regionkey\"\nFROM \"customer\" c\nJOIN \"nation\" n ON c.\"c_nationkey\" = n.\"n_nationkey\"\nJOIN \"region\" r ON n.\"n_regionkey\" = r.\"r_regionkey\"\nWHERE c.\"c_name\" = 'Customer#000000303' AND n.\"n_comment\" = 'nation 22'",
+    "description": "auto-generated 3-way join over customer, nation, region",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_07_p_ps_supplycost_gt",
+    "sql": "SELECT p.\"ps_partkey\", s.\"s_suppkey\", n.\"n_nationkey\"\nFROM \"partsupp\" p\nJOIN \"supplier\" s ON p.\"ps_suppkey\" = s.\"s_suppkey\"\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nWHERE p.\"ps_supplycost\" > 250.56 AND s.\"s_name\" = 'Supplier#000000691       '",
+    "description": "auto-generated 3-way join over partsupp, supplier, nation",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_08_l_l_returnflag_eq",
+    "sql": "SELECT l.\"l_orderkey\", o.\"o_orderkey\", s.\"s_suppkey\"\nFROM \"lineitem\" l\nJOIN \"orders\" o ON l.\"l_orderkey\" = o.\"o_orderkey\"\nJOIN \"supplier\" s ON l.\"l_suppkey\" = s.\"s_suppkey\"\nWHERE l.\"l_returnflag\" = 'N' AND o.\"o_totalprice\" < 374681.75",
+    "description": "auto-generated 3-way join over lineitem, supplier, orders",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_09_o_o_totalprice_gt",
+    "sql": "SELECT o.\"o_orderkey\", c.\"c_custkey\", n.\"n_nationkey\"\nFROM \"orders\" o\nJOIN \"customer\" c ON o.\"o_custkey\" = c.\"c_custkey\"\nJOIN \"nation\" n ON c.\"c_nationkey\" = n.\"n_nationkey\"\nWHERE o.\"o_totalprice\" > 125984.2 AND c.\"c_address\" = 'address 6271'",
+    "description": "auto-generated 3-way join over orders, customer, nation",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_10_p_ps_availqty_lt",
+    "sql": "SELECT p.\"ps_partkey\", p2.\"p_partkey\", s.\"s_suppkey\"\nFROM \"partsupp\" p\nJOIN \"part\" p2 ON p.\"ps_partkey\" = p2.\"p_partkey\"\nJOIN \"supplier\" s ON p.\"ps_suppkey\" = s.\"s_suppkey\"\nWHERE p.\"ps_availqty\" < 7529.0 AND p2.\"p_name\" = 'part 13380'",
+    "description": "auto-generated 3-way join over partsupp, supplier, part",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_11_s_s_address_eq",
+    "sql": "SELECT s.\"s_suppkey\", n.\"n_nationkey\", r.\"r_regionkey\"\nFROM \"supplier\" s\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nJOIN \"region\" r ON n.\"n_regionkey\" = r.\"r_regionkey\"\nWHERE s.\"s_address\" = 'address 871' AND n.\"n_name\" = 'NATION_23                '",
+    "description": "auto-generated 3-way join over supplier, nation, region",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_12_l_l_shipinstruct_eq",
+    "sql": "SELECT l.\"l_orderkey\", s.\"s_suppkey\", n.\"n_nationkey\"\nFROM \"lineitem\" l\nJOIN \"supplier\" s ON l.\"l_suppkey\" = s.\"s_suppkey\"\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nJOIN \"partsupp\" p ON p.\"ps_suppkey\" = s.\"s_suppkey\"\nWHERE l.\"l_shipinstruct\" = 'NONE                     ' AND s.\"s_acctbal\" > 1334.02",
+    "description": "auto-generated 4-way join over lineitem, supplier, nation, partsupp",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_13_l_l_comment_eq",
+    "sql": "SELECT l.\"l_orderkey\", o.\"o_orderkey\", p.\"p_partkey\"\nFROM \"lineitem\" l\nJOIN \"orders\" o ON l.\"l_orderkey\" = o.\"o_orderkey\"\nJOIN \"part\" p ON l.\"l_partkey\" = p.\"p_partkey\"\nJOIN \"supplier\" s ON l.\"l_suppkey\" = s.\"s_suppkey\"\nWHERE l.\"l_comment\" = 'lineitem comment' AND o.\"o_orderpriority\" = '3-MEDIUM       '",
+    "description": "auto-generated 4-way join over lineitem, supplier, part, orders",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_14_p_ps_availqty_gt",
+    "sql": "SELECT p.\"ps_partkey\", s.\"s_suppkey\", n.\"n_nationkey\"\nFROM \"partsupp\" p\nJOIN \"supplier\" s ON p.\"ps_suppkey\" = s.\"s_suppkey\"\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nJOIN \"customer\" c ON c.\"c_nationkey\" = n.\"n_nationkey\"\nWHERE p.\"ps_availqty\" > 2515.0 AND s.\"s_phone\" = '10-127-132     '",
+    "description": "auto-generated 4-way join over partsupp, supplier, nation, customer",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_15_l_l_extendedprice_lt",
+    "sql": "SELECT l.\"l_orderkey\", s.\"s_suppkey\", n.\"n_nationkey\"\nFROM \"lineitem\" l\nJOIN \"supplier\" s ON l.\"l_suppkey\" = s.\"s_suppkey\"\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nJOIN \"customer\" c ON c.\"c_nationkey\" = n.\"n_nationkey\"\nWHERE l.\"l_extendedprice\" < 74986.26 AND s.\"s_name\" = 'Supplier#000000985       '",
+    "description": "auto-generated 4-way join over lineitem, supplier, nation, customer",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_16_o_o_comment_eq",
+    "sql": "SELECT o.\"o_orderkey\", c.\"c_custkey\", n.\"n_nationkey\"\nFROM \"orders\" o\nJOIN \"customer\" c ON o.\"o_custkey\" = c.\"c_custkey\"\nJOIN \"nation\" n ON c.\"c_nationkey\" = n.\"n_nationkey\"\nJOIN \"supplier\" s ON s.\"s_nationkey\" = n.\"n_nationkey\"\nWHERE o.\"o_comment\" = 'order comment 100' AND c.\"c_address\" = 'address 13070'",
+    "description": "auto-generated 4-way join over orders, customer, nation, supplier",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_17_l_l_shipmode_eq",
+    "sql": "SELECT l.\"l_orderkey\", s.\"s_suppkey\", n.\"n_nationkey\"\nFROM \"lineitem\" l\nJOIN \"supplier\" s ON l.\"l_suppkey\" = s.\"s_suppkey\"\nJOIN \"nation\" n ON s.\"s_nationkey\" = n.\"n_nationkey\"\nJOIN \"region\" r ON n.\"n_regionkey\" = r.\"r_regionkey\"\nWHERE l.\"l_shipmode\" = 'REG AIR   ' AND s.\"s_phone\" = '10-127-132     '",
+    "description": "auto-generated 4-way join over lineitem, supplier, nation, region",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  }
+]

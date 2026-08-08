@@ -12,6 +12,48 @@ stretch goals: join-*method* selection and a real Join Order Benchmark
 (JOB/IMDB) import. See `docs/WRITEUP.md` for the literature review, results,
 and an honest limitations section.
 
+## The benchmark is the bottleneck (read this first)
+
+The single most important measurement here: for every query, execute *every*
+candidate plan and record the fastest. That gives the **oracle ceiling** —
+the best any selector could possibly do.
+
+| | v1 synthetic | TPC-H | JOB/IMDB |
+|---|---|---|---|
+| Mean best-possible gain | **6.5%** | ~23% | **~75%** |
+| Queries with >5% available | 7 / 25 | — | 3 / 4 |
+| Best model's top-1 accuracy | **0%** | — | 25% |
+
+On v1, PostgreSQL was already optimal for 18 of 25 queries, and **none of six
+model classes** (LightGBM, random forest, extra trees, gradient boosting,
+ridge, MLP) picked the fastest plan even once. That is not six model failures
+— there was no signal to learn. Every earlier attempt to fix "cost isn't
+reducing" by tuning thresholds and swapping models was working on the wrong
+variable.
+
+So `data/schema.sql` was rebuilt to be *hard*, targeting PostgreSQL's
+independence assumption (`WHERE a=x AND b=y` is estimated as sel(a)×sel(b),
+correct only when the columns are unrelated):
+
+```
+city -> country          brand -> category
+price_band ~ category    channel ~ status
+```
+
+| | v1 | **v2** |
+|---|---|---|
+| Mean best-possible gain | 6.5% | **22.2%** |
+| Queries with >5% available | 7/25 | **14/23** |
+
+The biggest gains land exactly on the designed traps — `brand→category`
+**95.4%**, `city→country` **63.1%**, 6-way with both **93.6%**. The mechanism
+predicted the outcome, which is the real evidence the diagnosis was right.
+Full analysis in `docs/WRITEUP.md` §2.9.
+
+> **If you change the action space, re-run `app.collect_data`.** Expanding it
+> without retraining made 17/25 queries hit the safety veto — the model was
+> scoring plan types it had never seen. Train/serve skew, not a bug.
+
 ## Point it at *any* PostgreSQL database
 
 One command onboards a database it has never seen — it discovers the schema,

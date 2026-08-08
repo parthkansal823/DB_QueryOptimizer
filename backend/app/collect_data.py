@@ -95,11 +95,23 @@ def collect(
                     )
                     total_rows += 1
 
+            # Commit after every query, not once at the end.
+            #
+            # A full sweep here is 20+ minutes (24 queries x ~30 candidates x
+            # reps, including slow 6-way joins). Holding it all in one
+            # transaction meant any interruption -- a container restart, a
+            # cancelled shell -- rolled back the entire run and left the log
+            # empty. That happened twice, losing ~90% of a completed sweep
+            # both times. Per-query commits make progress durable, and reruns
+            # append rather than starting over.
+            cur.connection.commit()
+
             elapsed = time.time() - start
             print(
                 f"[{qi + 1}/{len(workload)}] {query_id}: "
                 f"{len(hints)} candidates x {reps} rep(s), {total_rows} rows so far "
-                f"({elapsed:.1f}s elapsed)"
+                f"({elapsed:.1f}s elapsed)",
+                flush=True,  # so progress is visible when piped
             )
 
     print(f"Done. Logged {total_rows} rows in {time.time() - start:.1f}s.")

@@ -1,0 +1,36 @@
+{
+  "model_backend": "bootstrapped-ensemble[8x lightgbm]",
+  "pairwise_ranker": "trained",
+  "n_rows_raw": 642,
+  "reps_aggregated_to_median": true,
+  "n_rows_total": 330,
+  "n_rows_train": 254,
+  "n_rows_test": 76,
+  "n_features": 57,
+  "test_mae_log_ratio": 0.6416571447286532,
+  "test_typical_multiplicative_error": 1.8996262280263154,
+  "test_mean_uncertainty_log_ratio": 0.3339976059304776,
+  "n_tables_in_schema": 8,
+  "n_held_out_queries": 4,
+  "avg_latency_ms": {
+    "native": 381.2245,
+    "heuristic": 381.01012499999996,
+    "oracle_best_possible": 294.168625,
+    "learned_greedy": 464.3907499999999,
+    "learned_thompson": 464.3907499999999,
+    "learned_risk_averse": 464.3907499999999,
+    "learned_pairwise_rank": 394.68887500000005
+  },
+  "headroom_captured_vs_oracle": {
+    "learned_greedy": -0.9553203617791445,
+    "learned_thompson": -0.9553203617791445,
+    "learned_risk_averse": -0.9553203617791445,
+    "learned_pairwise_rank": -0.15466359967090196
+  },
+  "beats_or_ties_heuristic_rate": {
+    "learned_greedy": 0.5,
+    "learned_thompson": 0.5,
+    "learned_risk_averse": 0.5,
+    "learned_pairwise_rank": 0.5
+  }
+}

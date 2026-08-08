@@ -3,12 +3,19 @@ import "./App.css";
 import {
   analyzeQuery,
   fetchModelStatus,
+  fetchRegret,
+  fetchSchema,
   fetchTrend,
+  optimizeQuery,
   triggerRetrain,
   triggerRollback,
 } from "./api";
 import LatencyChart from "./components/LatencyChart";
 import ModelHealth from "./components/ModelHealth";
+import OptimizedQuery from "./components/OptimizedQuery";
+import ProductionRun from "./components/ProductionRun";
+import RegretChart from "./components/RegretChart";
+import SchemaPanel from "./components/SchemaPanel";
 import PlanComparison from "./components/PlanComparison";
 import QueryForm from "./components/QueryForm";
 import TrendChart from "./components/TrendChart";
@@ -21,6 +28,11 @@ export default function App() {
   const [trendError, setTrendError] = useState(null);
   const [modelStatus, setModelStatus] = useState(null);
   const [modelBusy, setModelBusy] = useState(false);
+  const [schema, setSchema] = useState(null);
+  const [regret, setRegret] = useState(null);
+  const [production, setProduction] = useState(null);
+  const [productionBusy, setProductionBusy] = useState(false);
+  const [lastSql, setLastSql] = useState(null);
 
   async function loadTrend() {
     try {
@@ -39,10 +51,33 @@ export default function App() {
     }
   }
 
+  async function loadSchema() {
+    try { setSchema(await fetchSchema()); } catch { setSchema(null); }
+  }
+
+  async function loadRegret() {
+    try { setRegret(await fetchRegret()); } catch { setRegret(null); }
+  }
+
   useEffect(() => {
     loadTrend();
     loadModelStatus();
+    loadSchema();
+    loadRegret();
   }, []);
+
+  async function handleProductionRun() {
+    if (!lastSql) return;
+    setProductionBusy(true);
+    try {
+      setProduction(await optimizeQuery(lastSql));
+      loadRegret();
+    } catch (err) {
+      setProduction({ reason: `failed: ${err.message}` });
+    } finally {
+      setProductionBusy(false);
+    }
+  }
 
   async function runModelAction(fn) {
     setModelBusy(true);
@@ -63,6 +98,9 @@ export default function App() {
     try {
       const data = await analyzeQuery(sql);
       setResult(data);
+      setLastSql(sql);
+      setProduction(null);
+      loadRegret();
       loadTrend(); // this run just added rows to plan_execution_log
     } catch (err) {
       setError(err.message);
@@ -91,6 +129,11 @@ export default function App() {
 
       {result && (
         <>
+          <section className="card">
+            <h2>Optimized query &mdash; ready to use</h2>
+            <OptimizedQuery best={result.best_measured} decision={result.decision} />
+          </section>
+
           <section className="card">
             <h2>Baseline vs. chosen plan</h2>
             <PlanComparison
@@ -124,6 +167,23 @@ export default function App() {
           onRetrain={() => runModelAction(triggerRetrain)}
           onRollback={() => runModelAction(triggerRollback)}
         />
+      </section>
+
+      {result && (
+        <section className="card">
+          <h2>Production path</h2>
+          <ProductionRun result={production} onRun={handleProductionRun} busy={productionBusy} />
+        </section>
+      )}
+
+      <section className="card">
+        <h2>Cumulative regret</h2>
+        <RegretChart regret={regret} />
+      </section>
+
+      <section className="card">
+        <h2>Discovered schema</h2>
+        <SchemaPanel schema={schema} />
       </section>
 
       <section className="card">
