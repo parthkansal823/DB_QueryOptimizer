@@ -68,6 +68,45 @@ defense) rather than treating them as fixed durations.
 - `docs/WRITEUP.md`: literature review + comparison table (this project vs.
   Neo vs. Bao vs. native Postgres), results, and a limitations section
 
+## Beyond the original scope [done]
+
+Additions past Phases 0-5, each motivated by a measurement rather than a
+feature list -- see `docs/WRITEUP.md` §2.4 for evidence:
+
+- **Self-learning loop** (`app/retrain.py`) -- retrains on accumulated
+  feedback and promotes a new model **only if it clearly beats the
+  incumbent** on a shared held-out set (champion/challenger). The margin
+  exists because offline scores here are noisy enough that promoting on any
+  improvement would random-walk the model.
+- **Versioned models with rollback** (`app/model_store.py`) -- unattended
+  retraining is only safe if a bad promotion can be undone.
+- **Per-query regression guard** (`app/optimizer/regression_guard.py`) --
+  blocks the learned path for queries with a measured history of being
+  slower than native. Targets the per-query instability that recent
+  literature identifies as the barrier to deploying learned optimizers.
+- **Pairwise learning-to-rank** (`app/optimizer/ranker.py`) -- Lero-style;
+  predicting *which plan is faster* is a far easier problem than predicting
+  latency, which matters when prediction error rivals the spread between
+  candidates.
+- **Plan-tree structural encoding** (`app/optimizer/plan_tree.py`) -- a
+  cheap stand-in for the tree convolution Neo and Bao use.
+- **Model health API + dashboard panel** -- deployed version, unlearned
+  feedback volume, blocked queries, retrain/rollback controls.
+- **Works on any PostgreSQL database** (`app/onboard.py`,
+  `app/schema_graph.py`, `app/workload_generator.py`) -- discovers the
+  schema, infers join edges from naming when no foreign keys are declared,
+  and generates a workload with predicates sampled from the real data.
+  Verified with the same command on the synthetic schema and on the
+  21-table / 74M-row JOB/IMDB benchmark.
+- **Production inference path** (`app/optimizer/planner.py`) -- plans every
+  candidate with `EXPLAIN` (nothing executed) and runs only the winner:
+  ~2.7% overhead, versus the demo path's N executions per query.
+- **Cumulative regret** (`app/optimizer/regret.py`) -- 0.80x native over 500
+  logged decisions; the trajectory, not just an average.
+- **Learned cardinality correction** (`app/optimizer/cardinality.py`) --
+  learns Postgres's own q-error from `Plan Rows` vs `Actual Rows`, the root
+  cause Leis et al. identified.
+
 ## Stretch goals
 - **Join method selection [done]** -- `generate_join_method_candidates`
   (`backend/app/optimizer/hints.py`) extends beyond join order to forced

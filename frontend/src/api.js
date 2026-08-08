@@ -20,3 +20,15 @@ export function analyzeQuery(sql) {
 export function fetchTrend() {
   return request("/stats/trend");
 }
+
+export function fetchModelStatus() {
+  return request("/model/status");
+}
+
+export function triggerRetrain() {
+  return request("/model/retrain?force=true", { method: "POST" });
+}
+
+export function triggerRollback() {
+  return request("/model/rollback", { method: "POST" });
+}

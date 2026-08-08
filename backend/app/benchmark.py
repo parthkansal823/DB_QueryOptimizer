@@ -24,20 +24,27 @@ from app.logging_store import log_execution
 from app.optimizer.bandit import POLICIES
 from app.optimizer.hints import apply_hint, generate_join_order_candidates
 from app.optimizer.learned import LearnedOptimizer
+from app.optimizer.regression_guard import RegressionGuard
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 
 
-def run(policy: str = "greedy", risk_lambda: float = 1.0) -> None:
+def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True) -> None:
     optimizer = LearnedOptimizer(policy=policy, risk_lambda=risk_lambda, seed=0)
     selector_mode = "learned" if optimizer.model is not None else "heuristic"
     print(f"selector mode: {selector_mode}" + (f" (policy: {policy})" if selector_mode == "learned" else ""))
-    print()
 
     native_total = served_total = oracle_total = 0.0
     n_vetoed = 0
+    n_guarded = 0
 
     with get_cursor() as cur:
+        guard = RegressionGuard()
+        if use_guard:
+            blocked = guard.refresh(cur)
+            print(f"regression guard: {len(blocked)} queries blocked from the learned path")
+        print()
+
         for item in WORKLOAD:
             query_id, sql = item["id"], item["sql"]
             baseline = get_plan(cur, sql)
@@ -54,11 +61,18 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0) -> None:
                 plan["hint"] = hint
                 candidates.append(plan)
 
-            served_plan = optimizer.select_plan(candidates, baseline_plan=baseline)
-            decision = optimizer.last_decision
-            chosen_index = decision.get("chosen_index")
-            vetoed = decision.get("fell_back_to_baseline", False)
-            n_vetoed += bool(vetoed and candidates)
+            if use_guard and guard.is_blocked(query_id):
+                # This query has a measured history of the learned path being
+                # slower than native. Don't gamble on it again.
+                served_plan, decision, vetoed = baseline, {"reason": "regression_guard"}, False
+                chosen_index = None
+                n_guarded += 1
+            else:
+                served_plan = optimizer.select_plan(candidates, baseline_plan=baseline)
+                decision = optimizer.last_decision
+                chosen_index = decision.get("chosen_index")
+                vetoed = decision.get("fell_back_to_baseline", False)
+                n_vetoed += bool(vetoed and candidates)
 
             for i, plan in enumerate(candidates):
                 log_execution(
@@ -80,7 +94,9 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0) -> None:
             print(f"--- {query_id} ({len(candidates)} candidates) ---")
             print(f"baseline (native Postgres): {baseline['actual_total_time_ms']:.2f} ms")
             print(f"served   ({selector_mode} path):    {served_plan['actual_total_time_ms']:.2f} ms")
-            if vetoed:
+            if decision.get("reason") == "regression_guard":
+                print("regression guard: query has a history of regressing, kept native plan")
+            elif vetoed:
                 print("safety veto: learned pick discarded, kept native plan")
             elif served_plan.get("hint"):
                 print(f"hint used: {served_plan['hint']}")
@@ -100,12 +116,13 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0) -> None:
     print(f"oracle total (best): {oracle_total:.2f} ms")
     if captured is not None:
         print(f"captured {captured:.1f}% of the {headroom:.0f} ms available headroom")
-    print(f"safety vetoes: {n_vetoed}/{len(WORKLOAD)}")
+    print(f"safety vetoes: {n_vetoed}/{len(WORKLOAD)}   guard-blocked: {n_guarded}/{len(WORKLOAD)}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", choices=list(POLICIES) + ["pairwise_rank"], default="greedy")
     parser.add_argument("--risk-lambda", type=float, default=1.0)
+    parser.add_argument("--no-guard", action="store_true", help="disable the per-query regression guard")
     args = parser.parse_args()
-    run(policy=args.policy, risk_lambda=args.risk_lambda)
+    run(policy=args.policy, risk_lambda=args.risk_lambda, use_guard=not args.no_guard)

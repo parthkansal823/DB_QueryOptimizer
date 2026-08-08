@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 import "./App.css";
-import { analyzeQuery, fetchTrend } from "./api";
+import {
+  analyzeQuery,
+  fetchModelStatus,
+  fetchTrend,
+  triggerRetrain,
+  triggerRollback,
+} from "./api";
 import LatencyChart from "./components/LatencyChart";
+import ModelHealth from "./components/ModelHealth";
 import PlanComparison from "./components/PlanComparison";
 import QueryForm from "./components/QueryForm";
 import TrendChart from "./components/TrendChart";
@@ -12,6 +19,8 @@ export default function App() {
   const [error, setError] = useState(null);
   const [trend, setTrend] = useState(null);
   const [trendError, setTrendError] = useState(null);
+  const [modelStatus, setModelStatus] = useState(null);
+  const [modelBusy, setModelBusy] = useState(false);
 
   async function loadTrend() {
     try {
@@ -22,9 +31,31 @@ export default function App() {
     }
   }
 
+  async function loadModelStatus() {
+    try {
+      setModelStatus(await fetchModelStatus());
+    } catch {
+      setModelStatus(null);
+    }
+  }
+
   useEffect(() => {
     loadTrend();
+    loadModelStatus();
   }, []);
+
+  async function runModelAction(fn) {
+    setModelBusy(true);
+    try {
+      const result = await fn();
+      await loadModelStatus();
+      return result;
+    } catch (err) {
+      return { action: "failed", reason: err.message };
+    } finally {
+      setModelBusy(false);
+    }
+  }
 
   async function handleAnalyze(sql) {
     setLoading(true);
@@ -84,6 +115,16 @@ export default function App() {
           </section>
         </>
       )}
+
+      <section className="card">
+        <h2>Model health &amp; learning loop</h2>
+        <ModelHealth
+          status={modelStatus}
+          busy={modelBusy}
+          onRetrain={() => runModelAction(triggerRetrain)}
+          onRollback={() => runModelAction(triggerRollback)}
+        />
+      </section>
 
       <section className="card">
         <h2>Historical accuracy</h2>

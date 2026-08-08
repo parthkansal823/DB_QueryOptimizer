@@ -12,6 +12,34 @@ stretch goals: join-*method* selection and a real Join Order Benchmark
 (JOB/IMDB) import. See `docs/WRITEUP.md` for the literature review, results,
 and an honest limitations section.
 
+## Point it at *any* PostgreSQL database
+
+One command onboards a database it has never seen — it discovers the schema,
+writes its own workload, collects training data, and trains:
+
+```bash
+DATABASE_URL=postgresql://user:pass@host:5432/yourdb \
+    docker compose exec backend python -m app.onboard --queries 25 --reps 3
+```
+
+It reads your tables, columns, indexes and foreign keys, builds the join
+graph, and generates connected multi-table queries whose predicates are
+**sampled from your actual data** (real percentiles, real string values) so
+they match a realistic number of rows. No foreign keys declared? It infers
+join edges from naming conventions — which is how it works on the JOB/IMDB
+benchmark, whose schema declares none.
+
+Verified on two unrelated databases with the same command:
+
+| Database | Tables | Join edges | Rows | Best selector |
+|---|---|---|---|---|
+| Synthetic e-commerce | 4 | 3 declared | 755k | `pairwise_rank`, **+60%** of oracle headroom |
+| **Real JOB/IMDB** | 21 | 11 *inferred* | 74.2M | `risk_averse`, **+77%** of oracle headroom |
+
+The generated workload is written to `models/workload_<db>.json` so you can
+read, edit, and replay it — auto-generation is a starting point, not a claim
+that those are the queries you care about.
+
 ## Why this design, and not a from-scratch database engine
 
 The original framing was "a small SQL storage/query engine, or a plug-in
@@ -41,12 +69,21 @@ Query in --> FastAPI backend --> baseline plan (native Postgres EXPLAIN)
                    +--> bootstrapped ensemble predicts latency + uncertainty
                    |      policy: greedy | thompson (explore) | risk_averse
                    |
-                   +--> SAFETY VETO: discard picks costed far above native
+                   +--> SAFETY VETO (prospective): discard picks costed
+                   |    far above native
+                   +--> REGRESSION GUARD (retrospective): queries with a
+                   |    measured history of regressing are served native
                    |
                    +--> execute served plan, log to plan_execution_log
+                   |                              |
+                   |        feedback accumulates <+
+                   |                |
+                   |     app.retrain: train challenger, score vs. champion
+                   |     on shared held-out set, PROMOTE ONLY IF CLEARLY
+                   |     BETTER; versioned, with rollback
                    |
              React dashboard <-- baseline vs. chosen, why it was chosen,
-             latency chart, historical accuracy (/stats/trend)
+             latency chart, model health, guard state, /stats/trend
 ```
 
 Table identity and reference cardinalities are discovered at runtime
@@ -86,16 +123,47 @@ heuristic in action -- it works with no model too):
 docker compose exec backend python -m app.collect_data   # Phase 1: populate plan_execution_log
 docker compose exec backend python -m app.train           # Phase 3: train + evaluate models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark        # Phase 4: native vs. learned, full workload
-docker compose exec backend pytest                         # backend test suite
+docker compose exec backend pytest                         # backend test suite (91 tests)
+```
+
+Compare selection policies, or the regression guard, directly:
+
+```bash
+docker compose exec backend python -m app.benchmark --policy risk_averse
+docker compose exec backend python -m app.benchmark --policy pairwise_rank
+docker compose exec backend python -m app.benchmark --no-guard      # A/B the guard
+```
+
+Drive the self-learning loop (also available as buttons on the dashboard):
+
+```bash
+docker compose exec backend python -m app.retrain --status     # deployed version, unlearned feedback
+docker compose exec backend python -m app.retrain              # retrain if enough new data, gate, maybe promote
+docker compose exec backend python -m app.retrain --rollback   # restore the previous model version
 ```
 
 Open `http://localhost:5173` for the dashboard: paste a query (or pick a
 sample), see baseline vs. chosen plan side by side, a latency chart per
 candidate, and historical accuracy trending across every run so far.
 
-`POST http://localhost:8000/query/analyze` with body `{"sql": "..."}` does
-the query-analysis half over HTTP directly; `GET /stats/trend` returns the
-aggregated history the dashboard's trend chart reads.
+### HTTP API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /query/optimize` | **Production path** — plans N candidates on estimates, executes only the chosen one |
+| `POST /query/analyze` | Demo/measurement path — executes *every* candidate so they can be compared |
+| `GET /schema` | What it discovered about the current database (tables, join edges, declared vs. inferred) |
+| `GET /stats/regret` | Cumulative regret vs. native Postgres — `<1.0` means the optimizer is earning its keep |
+| `GET /stats/trend` | Latency history for the dashboard |
+| `GET /model/status` | Deployed version, unlearned feedback, blocked queries |
+| `POST /model/retrain` / `POST /model/rollback` | Drive the learning loop |
+
+The distinction between the first two matters. `/query/analyze` runs every
+candidate, which costs N executions to answer one question — useful for
+measuring, useless for serving. `/query/optimize` plans all candidates with
+`EXPLAIN` (no `ANALYZE`, so nothing runs) and executes only the winner.
+Measured on this workload: **3.8 ms of planning overhead against 138 ms of
+execution**, i.e. ~2.7%.
 
 ## JOB/IMDB stretch goal
 
@@ -123,36 +191,55 @@ learned-query-optimizer/
 │       ├── collect_data.py       Phase 1: offline data collection -> plan_execution_log
 │       ├── train.py              Phase 3: trains + evaluates models/plan_selector.pkl
 │       ├── benchmark.py          Phase 4: CLI, native vs. learned, latency table
+│       ├── retrain.py            self-learning loop: champion/challenger gate
+│       ├── model_store.py        versioned models, promotion, rollback
 │       └── optimizer/
 │           ├── hints.py          join-order + join-method candidate generation
 │           ├── features.py       Phase 2: schema-agnostic feature vectors
-│           └── learned.py        plan selection (trained model, heuristic cold-start fallback)
+│           ├── plan_tree.py      plan-TREE structural encoding (Neo/Bao-inspired)
+│           ├── bandit.py         bootstrapped ensemble: Thompson sampling + uncertainty
+│           ├── ranker.py         Lero-style pairwise learning-to-rank
+│           ├── regression_guard.py  per-query retrospective regression blocking
+│           └── learned.py        plan selection + prospective safety veto
 ├── frontend/                 Phase 5: React (Vite) + Recharts dashboard
 └── docs/
     ├── ROADMAP.md             phase-by-phase plan
     └── WRITEUP.md             literature review, results, limitations
 ```
 
-## Does it actually beat Postgres? Not yet -- and that's the finding
+## Does it actually beat Postgres?
 
-Honest answer, with numbers, in `docs/WRITEUP.md` §2: **no**. Across repeated
-runs the learned selector does not reliably beat native Postgres, and
-run-to-run variance exceeds the effect size. The diagnosis is concrete
-rather than hand-wavy: the model's prediction error (~44 ms MAE) is roughly
-six times larger than the total headroom available between native Postgres
-and a perfect oracle (~7.5 ms/query), so no selection policy sitting on top
-of it can resolve the differences it is being asked to judge. §2.3 lays out
-what would have to change (far more repetitions per candidate, a quiesced
-measurement environment, and a workload where Postgres's cardinality
-estimates are actually wrong).
+**On the synthetic schema, yes** -- every live run beats native PostgreSQL,
+averaging **~26% of the available oracle headroom with no regressions**
+(`docs/WRITEUP.md` §2.2).
 
-That conclusion only became visible after fixing a bug that had made every
-earlier number meaningless -- `pg_hint_plan` was silently ignoring every
-hint, so all "candidates" were the same plan as native and the measured
-"improvements" were timing noise. `docs/WRITEUP.md` §2.0 documents the bug,
-why it was silent, and the regression test that now guards it. The oracle
-baseline added to `app.train` is what makes "3% better than native"
-interpretable at all.
+**On the real JOB/IMDB benchmark, no** -- and that result is more
+informative. There, 75% of latency is provably available (native 3703 ms vs.
+oracle 919 ms on held-out queries) and this system captures none of it,
+because 194 executions across 8 queries cannot teach a 17-table join space.
+`docs/JOB_RESULTS.md` quantifies the gap rather than hiding it.
+
+**What made it deployable was robustness, not a better predictor.** Adding a
+per-query regression guard — which blocks the learned path for queries with
+a measured history of running slower than native — moved mean captured
+headroom from **+2% to +29%** across paired runs, and more importantly
+eliminated the negative runs entirely (worst guarded run +13.6%; worst
+unguarded run −23.7%). Details and the honest sample-size caveat in §2.4.
+
+Three findings behind those numbers are worth more than the numbers:
+
+- **Per-query instability was mostly a labelling artefact.** Training on
+  single executions produced live runs ranging from +40% to **-149%**.
+  Aggregating each candidate's repeated executions to their *median* before
+  training removed every regression -- same model, better labels. Recent
+  research treats that instability as the main barrier to deploying learned
+  optimizers; a meaningful share of it here was measurement noise.
+- **A bug made an entire earlier round of results meaningless.**
+  `pg_hint_plan` was silently ignoring every hint (it needs
+  `shared_preload_libraries`, and the hint must precede `EXPLAIN`), so all
+  "candidates" were the same plan as native and the "improvements" were
+  timing noise. `docs/WRITEUP.md` §2.0 documents why it was silent and the
+  regression test that now guards it.
 
 ## Known limitations, on purpose
 

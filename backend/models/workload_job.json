@@ -1,0 +1,44 @@
+[
+  {
+    "id": "auto_2w_00_mk_id_lt",
+    "sql": "SELECT mk.\"id\", k.\"id\"\nFROM \"movie_keyword\" mk\nJOIN \"keyword\" k ON mk.\"keyword_id\" = k.\"id\"\nWHERE mk.\"id\" < 3392948.0 AND k.\"keyword\" = 'reference-to-diomedes'",
+    "description": "auto-generated 2-way join over movie_keyword, keyword",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_01_pi_note_eq",
+    "sql": "SELECT pi.\"id\", an.\"id\"\nFROM \"person_info\" pi\nJOIN \"aka_name\" an ON an.\"person_id\" = pi.\"id\"\nWHERE pi.\"note\" = '\".\"' AND an.\"id\" > 225336.0",
+    "description": "auto-generated 2-way join over person_info, aka_name",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_02_pi_info_eq",
+    "sql": "SELECT pi.\"id\", an.\"id\", it.\"id\"\nFROM \"person_info\" pi\nJOIN \"aka_name\" an ON an.\"person_id\" = pi.\"id\"\nJOIN \"info_type\" it ON pi.\"info_type_id\" = it.\"id\"\nWHERE pi.\"info\" = '''?'' (? - ?)' AND an.\"name_pcode_cf\" = 'V6121'",
+    "description": "auto-generated 3-way join over person_info, aka_name, info_type",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_03_t_episode_nr_lt",
+    "sql": "SELECT t.\"id\", kt.\"id\", at.\"id\"\nFROM \"title\" t\nJOIN \"kind_type\" kt ON t.\"kind_id\" = kt.\"id\"\nJOIN \"aka_title\" at ON at.\"kind_id\" = kt.\"id\"\nWHERE t.\"episode_nr\" < 34.0 AND kt.\"kind\" = 'video game'",
+    "description": "auto-generated 3-way join over title, kind_type, aka_title",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_04_ci_nr_order_gt",
+    "sql": "SELECT ci.\"id\", pi.\"id\", it.\"id\"\nFROM \"cast_info\" ci\nJOIN \"person_info\" pi ON ci.\"person_id\" = pi.\"id\"\nJOIN \"info_type\" it ON pi.\"info_type_id\" = it.\"id\"\nJOIN \"movie_info_idx\" mii ON mii.\"info_type_id\" = it.\"id\"\nWHERE ci.\"nr_order\" > 3.0 AND pi.\"note\" = '**'",
+    "description": "auto-generated 4-way join over cast_info, person_info, info_type, movie_info_idx",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_05_ci_note_eq",
+    "sql": "SELECT ci.\"id\", pi.\"id\", it.\"id\"\nFROM \"cast_info\" ci\nJOIN \"person_info\" pi ON ci.\"person_id\" = pi.\"id\"\nJOIN \"info_type\" it ON pi.\"info_type_id\" = it.\"id\"\nJOIN \"movie_info\" mi ON mi.\"info_type_id\" = it.\"id\"\nWHERE ci.\"note\" = '()' AND pi.\"person_id\" > 763352.0",
+    "description": "auto-generated 4-way join over cast_info, person_info, info_type, movie_info",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  }
+]

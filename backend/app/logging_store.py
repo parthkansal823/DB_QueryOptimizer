@@ -9,6 +9,40 @@ from __future__ import annotations
 
 import json
 
+# Mirrors postgres/init/03_logging.sql, which only runs for the container's
+# default database. Pointing the optimizer at a user's own database (see
+# app.onboard) means creating it there too, so keep the two in sync.
+CREATE_LOG_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS plan_execution_log (
+        id BIGSERIAL PRIMARY KEY,
+        query_id TEXT,
+        sql_text TEXT NOT NULL,
+        hint TEXT,
+        is_baseline BOOLEAN NOT NULL DEFAULT FALSE,
+        selector_used TEXT NOT NULL DEFAULT 'native',
+        raw_plan JSONB NOT NULL,
+        total_cost DOUBLE PRECISION,
+        actual_total_time_ms DOUBLE PRECISION,
+        planning_time_ms DOUBLE PRECISION,
+        is_chosen BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+"""
+
+
+def ensure_log_table(cur) -> None:
+    """Create the feedback table if this database doesn't have it yet."""
+    cur.execute(CREATE_LOG_TABLE_SQL)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plan_execution_log_query_id "
+        "ON plan_execution_log (query_id)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plan_execution_log_created_at "
+        "ON plan_execution_log (created_at)"
+    )
+
+
 INSERT_SQL = """
     INSERT INTO plan_execution_log
         (query_id, sql_text, hint, is_baseline, selector_used,

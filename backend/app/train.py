@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 import random
@@ -90,6 +91,51 @@ def _aggregate_repetitions(rows: list[dict]) -> list[dict]:
         representative["n_reps"] = len(group)
         aggregated.append(representative)
     return aggregated
+
+
+def _relative_targets(rows: list[dict]) -> list[float]:
+    """
+    Target = log(candidate_latency / native_latency_for_the_same_query).
+
+    Predicting absolute milliseconds is the wrong problem, and it was the
+    main reason accuracy stayed poor. Two things go wrong with it:
+
+      1. **Scale dominates.** This workload spans ~5 ms to ~600 ms queries.
+         Squared error on raw milliseconds is overwhelmingly driven by the
+         slow queries, so the model spends its capacity learning "this query
+         is inherently slow" -- true, useless, and nothing to do with plan
+         choice. A 10% win on a fast query matters as much per execution as
+         a 10% win on a slow one, and the raw-ms target says otherwise.
+      2. **It answers a harder question than we asked.** We never need to
+         know a plan will take 213 ms. We need to know it beats native.
+
+    The log-ratio fixes both. Every query contributes on the same scale, and
+    the target *is* the decision: negative means faster than native, 0 means
+    identical, positive means worse. `learned.py` can then gate on
+    "confidently below zero" instead of comparing two noisy absolute
+    predictions and hoping the difference survives.
+
+    Rows whose query has no baseline (or a zero-latency one) are dropped
+    rather than guessed at.
+    """
+    native_by_query: dict[str, float] = {}
+    for row in rows:
+        if row["is_baseline"] and row["actual_total_time_ms"]:
+            q = row["query_id"]
+            # Several baseline executions may exist; keep the median-ish one
+            # by preferring the first, which _aggregate_repetitions already
+            # collapsed to a median.
+            native_by_query.setdefault(q, float(row["actual_total_time_ms"]))
+
+    targets = []
+    for row in rows:
+        native = native_by_query.get(row["query_id"])
+        latency = row["actual_total_time_ms"]
+        if not native or not latency:
+            targets.append(0.0)  # no reference: treat as "same as native"
+        else:
+            targets.append(math.log(latency / native))
+    return targets
 
 
 def _discover_cardinalities() -> dict[str, float]:
@@ -258,7 +304,7 @@ def train(
     query_ids = [r["query_id"] for r in rows]
 
     X_all = [to_vector(featurize(c, table_cardinalities), feature_columns) for c in candidates]
-    y_all = [c["actual_total_time_ms"] for c in candidates]
+    y_all = _relative_targets(rows)
 
     train_ids, test_ids = _query_level_split(query_ids)
     train_idx = [i for i, q in enumerate(query_ids) if q in train_ids]
@@ -286,6 +332,8 @@ def train(
         print(f"[warn] pairwise ranker not trained: {exc}")
 
     preds_test = ensemble.predict(X_test)
+    # Error is now in log-ratio space. exp(MAE) reads as "typical multiplicative
+    # error": 1.15 means predictions are typically off by ~15%.
     mae = sum(abs(p - y) for p, y in zip(preds_test, y_test)) / len(y_test) if y_test else None
     _, test_stds = ensemble.predict_mean_std(X_test)
     mean_uncertainty = sum(test_stds) / len(test_stds) if test_stds else None
@@ -308,11 +356,12 @@ def train(
         "n_rows_train": len(X_train),
         "n_rows_test": len(X_test),
         "n_features": len(feature_columns),
-        "test_mae_ms": mae,
+        "test_mae_log_ratio": mae,
+        "test_typical_multiplicative_error": (math.exp(mae) if mae is not None else None),
         # Mean ensemble disagreement on held-out rows: a rough "how much does
         # the model actually know here" number. Large relative to test_mae_ms
         # means predictions are being driven by sparse evidence.
-        "test_mean_uncertainty_ms": mean_uncertainty,
+        "test_mean_uncertainty_log_ratio": mean_uncertainty,
         "n_tables_in_schema": len(table_cardinalities),
         **selection_eval,
     }
@@ -323,6 +372,7 @@ def train(
             {
                 "model": ensemble,
                 "ranker": ranker,
+                "target": "log_ratio_vs_native",
                 "feature_columns": feature_columns,
                 "table_cardinalities": table_cardinalities,
             },

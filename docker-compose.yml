@@ -7,6 +7,11 @@ services:
     # IGNORED -- every Leading() hint returns the planner's default plan and
     # the whole candidate set collapses to one plan. Silent because a hint
     # that can't be applied is a comment, and comments never error.
+    # Postgres puts parallel-query tuples in shared memory, and Docker's 64MB
+    # default /dev/shm is far too small for JOB-scale joins -- without this,
+    # large candidate plans die with "could not resize shared memory segment",
+    # which looks like a query failure but is purely a container limit.
+    shm_size: 1gb
     command:
       - postgres
       - -c

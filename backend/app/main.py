@@ -1,14 +1,22 @@
+import asyncio
+import logging
 import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from app import model_store, retrain
 from app.db import get_cursor
 from app.logging_store import log_execution
 from app.optimizer.hints import apply_hint, generate_join_order_candidates
 from app.optimizer.learned import LearnedOptimizer
+from app.optimizer.planner import optimize_and_execute
+from app.optimizer.regression_guard import RegressionGuard
+from app.optimizer.regret import regret_curve
 from app.plan_extractor import get_plan
+from app.schema_graph import discover_with_inference
+from app.schema_graph import summarize as schema_summary
 
 app = FastAPI(title="Learned Query Optimizer")
 
@@ -23,10 +31,52 @@ app.add_middleware(
 
 optimizer = LearnedOptimizer()
 SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
+guard = RegressionGuard()
+
+log = logging.getLogger("lqo.autolearn")
+
+# The system retrains itself on accumulated feedback on this cadence. Off by
+# default: a background job that silently swaps the served model is exactly
+# the sort of thing that should be opted into, and it makes benchmark runs
+# non-reproducible while it's on. `retrain_if_needed` still gates every
+# promotion on the champion/challenger comparison, so the worst case is a
+# wasted retrain, not a regression.
+AUTO_RETRAIN_SECONDS = int(os.getenv("AUTO_RETRAIN_SECONDS", "0"))
 
 
 class QueryRequest(BaseModel):
     sql: str
+
+
+async def _auto_retrain_loop() -> None:
+    """Periodically fold accumulated feedback back into the served model."""
+    while True:
+        await asyncio.sleep(AUTO_RETRAIN_SECONDS)
+        try:
+            # Training is CPU-bound and synchronous; keep it off the event
+            # loop so query serving isn't blocked while a retrain runs.
+            result = await asyncio.to_thread(retrain.retrain_if_needed)
+            if result.get("action") == "promoted":
+                _reload_optimizer()
+                with get_cursor() as cur:
+                    guard.refresh(cur)
+            log.info("auto-retrain: %s", result.get("action"))
+        except Exception:  # noqa: BLE001 - a failed retrain must never kill the server
+            log.exception("auto-retrain failed; continuing to serve the current model")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    # Prime the guard so the first served query already benefits from history.
+    try:
+        with get_cursor() as cur:
+            guard.refresh(cur)
+    except Exception:  # noqa: BLE001 - an empty/absent log table is fine at boot
+        log.warning("could not prime the regression guard at startup")
+
+    if AUTO_RETRAIN_SECONDS > 0:
+        asyncio.create_task(_auto_retrain_loop())
+        log.info("auto-retrain enabled every %ss", AUTO_RETRAIN_SECONDS)
 
 
 @app.get("/health")
@@ -86,6 +136,116 @@ def analyze_query(req: QueryRequest):
         # whether the safety net vetoed the model's pick.
         "decision": decision,
     }
+
+
+@app.post("/query/optimize")
+def optimize_query(req: QueryRequest):
+    """
+    The **production** path: pick a plan without executing the alternatives.
+
+    Costs N cheap `EXPLAIN`s (planning only, nothing run) plus one real
+    execution, versus `/query/analyze`, which executes every candidate and is
+    therefore a measurement harness rather than an optimizer. The
+    `optimizer_overhead_ms` vs `execution_ms` split in the response is what
+    tells you whether the decision paid for itself.
+    """
+    with get_cursor() as cur:
+        result = optimize_and_execute(cur, req.sql, optimizer, guard=guard)
+        log_execution(
+            cur, query_id=None, sql_text=req.sql, plan=result["executed_plan"],
+            hint=result["hint"], is_baseline=result["hint"] is None,
+            selector_used=SELECTOR_MODE, is_chosen=True,
+        )
+
+    return {
+        "hint": result["hint"],
+        "reason": result["reason"],
+        "execution_ms": result["execution_ms"],
+        "optimizer_overhead_ms": result["optimizer_overhead_ms"],
+        "n_candidates_planned": result["n_candidates_planned"],
+        "executed_plan": result["executed_plan"],
+        "decision": result.get("decision"),
+    }
+
+
+@app.get("/stats/regret")
+def stats_regret():
+    """
+    Cumulative regret over time -- how much slower the served plans were than
+    the best available, against the same figure for native Postgres.
+    A ratio below 1.0 means the learned path has been worth having.
+    """
+    with get_cursor() as cur:
+        return regret_curve(cur)
+
+
+@app.get("/schema")
+def schema():
+    """
+    What this optimizer has discovered about the database it's pointed at.
+
+    Present so "works on any dataset" is inspectable rather than a claim:
+    point `DATABASE_URL` somewhere new and this reports the tables, join
+    edges, and whether those edges were declared or inferred from naming.
+    """
+    with get_cursor() as cur:
+        graph = discover_with_inference(cur)
+    return schema_summary(graph)
+
+
+@app.get("/model/status")
+def model_status():
+    """
+    What's deployed, how stale it is, and which queries the retrospective
+    guard is currently refusing to serve learned plans for.
+    """
+    with get_cursor() as cur:
+        blocked = guard.refresh(cur)
+
+    return {
+        "selector_mode": SELECTOR_MODE,
+        "policy": optimizer.policy,
+        "current_version": model_store.current_version(),
+        "rows_since_last_training": retrain.rows_since_last_training(),
+        "versions": model_store.list_versions()[:10],
+        "regression_guard": {
+            "tolerance": guard.tolerance,
+            "min_observations": guard.min_observations,
+            "blocked_queries": blocked,
+        },
+    }
+
+
+@app.post("/model/retrain")
+def model_retrain(force: bool = False):
+    """
+    Retrain on accumulated feedback and promote only if the challenger
+    clearly beats the incumbent (see app.retrain). Safe to call repeatedly:
+    it no-ops until enough new data has arrived.
+
+    Note this reloads the served model in-process on promotion, so a
+    successful retrain takes effect without a restart.
+    """
+    result = retrain.retrain_if_needed(force=force)
+    if result.get("action") == "promoted":
+        _reload_optimizer()
+    return result
+
+
+@app.post("/model/rollback")
+def model_rollback():
+    """Promote the previous version -- the escape hatch when a promoted
+    model turns out worse in production than it looked offline."""
+    target = model_store.rollback()
+    if target:
+        _reload_optimizer()
+    return {"action": "rollback", "promoted": target}
+
+
+def _reload_optimizer() -> None:
+    global optimizer, SELECTOR_MODE
+    optimizer = LearnedOptimizer(policy=optimizer.policy, risk_lambda=optimizer.risk_lambda)
+    SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
 
 
 TREND_SQL = """

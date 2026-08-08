@@ -1,0 +1,37 @@
+[
+  {
+    "id": "auto_2w_00_oi_id_lt",
+    "sql": "SELECT oi.\"id\", p.\"id\"\nFROM \"order_items\" oi\nJOIN \"products\" p ON oi.\"product_id\" = p.\"id\"\nWHERE oi.\"id\" < 375000.0 AND p.\"category\" = 'books'",
+    "description": "auto-generated 2-way join over order_items, products",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_2w_01_oi_id_lt",
+    "sql": "SELECT oi.\"id\", o.\"id\"\nFROM \"order_items\" oi\nJOIN \"orders\" o ON oi.\"order_id\" = o.\"id\"\nWHERE oi.\"id\" < 375000.0 AND o.\"created_at\" <= '2026-08-08 05:21:07.097836'",
+    "description": "auto-generated 2-way join over order_items, orders",
+    "join_width": 2,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_02_oi_id_gt",
+    "sql": "SELECT oi.\"id\", o.\"id\", p.\"id\"\nFROM \"order_items\" oi\nJOIN \"orders\" o ON oi.\"order_id\" = o.\"id\"\nJOIN \"products\" p ON oi.\"product_id\" = p.\"id\"\nWHERE oi.\"id\" > 125000.0 AND o.\"created_at\" <= '2026-08-08 05:21:07.097836'",
+    "description": "auto-generated 3-way join over order_items, orders, products",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_3w_03_oi_id_lt",
+    "sql": "SELECT oi.\"id\", o.\"id\", u.\"id\"\nFROM \"order_items\" oi\nJOIN \"orders\" o ON oi.\"order_id\" = o.\"id\"\nJOIN \"users\" u ON o.\"user_id\" = u.\"id\"\nWHERE oi.\"id\" < 375000.0 AND o.\"created_at\" <= '2026-08-08 05:21:07.097836'",
+    "description": "auto-generated 3-way join over order_items, orders, users",
+    "join_width": 3,
+    "selectivity_tag": "auto"
+  },
+  {
+    "id": "auto_4w_04_oi_id_lt",
+    "sql": "SELECT oi.\"id\", o.\"id\", p.\"id\"\nFROM \"order_items\" oi\nJOIN \"orders\" o ON oi.\"order_id\" = o.\"id\"\nJOIN \"products\" p ON oi.\"product_id\" = p.\"id\"\nJOIN \"users\" u ON o.\"user_id\" = u.\"id\"\nWHERE oi.\"id\" < 375000.0 AND o.\"created_at\" <= '2026-08-08 05:21:07.097836'",
+    "description": "auto-generated 4-way join over order_items, orders, products, users",
+    "join_width": 4,
+    "selectivity_tag": "auto"
+  }
+]

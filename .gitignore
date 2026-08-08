@@ -11,3 +11,11 @@ dist/
 data/job/imdb.tgz
 data/job/csv/
 data/job/queries/
+
+# Local model runtime state: the version registry and stored versions are
+# per-machine (app.retrain rebuilds them), and _challenger* are scratch files
+# from a retrain that may not have been promoted. Committed eval_results*.json
+# are kept deliberately -- they're the reported numbers.
+backend/models/registry.json
+backend/models/versions/
+backend/models/_challenger*

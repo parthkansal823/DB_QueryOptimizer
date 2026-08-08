@@ -71,7 +71,45 @@ and a finding second.
 Same 8 queries, same pipeline, with `shared_preload_libraries=pg_hint_plan`
 set and the hint hoisted ahead of `EXPLAIN`:
 
-<!-- RESULTS_PLACEHOLDER -->
+```json
+{
+  "n_rows_raw": 194, "n_rows_total": 65, "n_features": 109,
+  "n_tables_in_schema": 21, "n_held_out_queries": 2,
+  "test_mae_ms": 1656.7, "test_mean_uncertainty_ms": 401.2,
+  "avg_latency_ms": {
+    "native": 3702.98, "heuristic": 3702.98, "oracle_best_possible": 918.84,
+    "learned_greedy": 3702.98, "learned_risk_averse": 3702.98,
+    "learned_pairwise_rank": 3702.98
+  }
+}
+```
+
+Two things stand out, and they point in opposite directions.
+
+**The headroom on JOB is enormous.** Native Postgres averages 3703 ms on
+these held-out queries; the best available candidate averages 919 ms. That
+is a **75% latency reduction sitting on the table** -- an order of magnitude
+more opportunity than the synthetic schema's ~8%. This is exactly what Leis
+et al. built JOB to expose: on queries with correlated predicates and many
+joins, PostgreSQL's cardinality estimates degrade badly and its chosen plan
+is far from optimal. The premise of the whole field is visible in one line
+of JSON.
+
+**The model captures none of it.** Every selector returns the native plan,
+and the reason is not the earlier hint bug (hints bind here -- the feature
+vector is 109 wide across 21 discovered tables, and the oracle differs from
+native, which is only possible if candidates differ). It is that a test MAE
+of **1657 ms** on queries averaging 3703 ms means the model has essentially
+no usable signal. 194 raw executions across 8 queries -- 65 after median
+aggregation, 2 held-out queries -- is nowhere near enough to learn a
+17-table join space. Faced with no signal, the selectors default to the
+candidate that also happens to be the native plan, and the safety veto
+would have caught them if they hadn't.
+
+The honest reading: **JOB confirms the opportunity is real and confirms this
+system is far from capturing it.** That is a more useful result than a
+flattering number would have been, and it quantifies the gap -- 75%
+available, 0% captured -- rather than leaving it qualitative.
 
 ## Reading this honestly
 

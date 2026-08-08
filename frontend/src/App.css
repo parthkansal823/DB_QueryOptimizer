@@ -204,6 +204,51 @@
   font-variant-numeric: tabular-nums;
 }
 
+.subhead {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  margin: 20px 0 8px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.data-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 12px 6px 0;
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 6px 12px 6px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.button-secondary {
+  background: transparent !important;
+  color: var(--text-secondary) !important;
+  border: 1px solid var(--border) !important;
+}
+
 .stat-row {
   display: flex;
   gap: 24px;

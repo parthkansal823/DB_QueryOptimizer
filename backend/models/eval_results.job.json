@@ -1,15 +1,35 @@
 {
-  "model_backend": "lightgbm",
-  "n_rows_total": 72,
-  "n_rows_train": 54,
+  "model_backend": "bootstrapped-ensemble[8x lightgbm]",
+  "pairwise_ranker": "trained",
+  "n_rows_raw": 194,
+  "reps_aggregated_to_median": true,
+  "n_rows_total": 70,
+  "n_rows_train": 52,
   "n_rows_test": 18,
-  "test_mae_ms": 53.18778569117361,
+  "n_features": 109,
+  "test_mae_ms": 1656.7121278444797,
+  "test_mean_uncertainty_ms": 401.2382364111579,
   "n_tables_in_schema": 21,
   "n_held_out_queries": 2,
   "avg_latency_ms": {
-    "native": 363.2735,
-    "heuristic": 363.2735,
-    "learned": 363.2735
+    "native": 3702.9765,
+    "heuristic": 3702.9765,
+    "oracle_best_possible": 918.841,
+    "learned_greedy": 3702.9765,
+    "learned_thompson": 3702.9765,
+    "learned_risk_averse": 3702.9765,
+    "learned_pairwise_rank": 3702.9765
   },
-  "model_beats_or_ties_heuristic_rate": 1.0
+  "headroom_captured_vs_oracle": {
+    "learned_greedy": 0.0,
+    "learned_thompson": 0.0,
+    "learned_risk_averse": 0.0,
+    "learned_pairwise_rank": 0.0
+  },
+  "beats_or_ties_heuristic_rate": {
+    "learned_greedy": 1.0,
+    "learned_thompson": 1.0,
+    "learned_risk_averse": 1.0,
+    "learned_pairwise_rank": 1.0
+  }
 }

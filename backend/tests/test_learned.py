@@ -45,14 +45,23 @@ class _FakeModel:
         self._predictions = predictions
 
     def predict(self, X):
-        return self._predictions
+        return self._predictions[: len(X)]
 
 
-def _with_model(predictions, **kwargs):
-    """A LearnedOptimizer whose ensemble members all predict `predictions`."""
+def _with_model(predictions, spread=None, **kwargs):
+    """
+    A LearnedOptimizer whose ensemble predicts `predictions`.
+
+    `select_plan` scores the native plan too, so when testing it the list is
+    [native, candidate0, candidate1, ...]. `spread` gives the members
+    differing opinions, which is how a test creates uncertainty.
+    """
     optimizer = LearnedOptimizer(model_path=NO_MODEL, **kwargs)
     ensemble = BootstrappedEnsemble(build_model=lambda: None, n_models=2)
-    ensemble.models = [_FakeModel(predictions), _FakeModel(predictions)]
+    if spread is None:
+        ensemble.models = [_FakeModel(predictions), _FakeModel(predictions)]
+    else:
+        ensemble.models = [_FakeModel(predictions), _FakeModel(spread)]
     optimizer.model = ensemble
     optimizer.table_cardinalities = CARDINALITIES
     optimizer.feature_columns = build_feature_columns(list(CARDINALITIES))
@@ -97,8 +106,9 @@ def test_last_decision_records_policy_and_prediction():
 # -- safety fallback (Bao's "never much worse than native" property) --------
 
 
-def test_select_plan_returns_chosen_candidate_when_safe():
-    optimizer = _with_model([5.0, 50.0])
+def test_select_plan_takes_a_confident_large_win():
+    # [native=100, cand0=5, cand1=50] -- a 95 ms gain, members agree.
+    optimizer = _with_model([100.0, 5.0, 50.0])
     candidates = [_candidate(100), _candidate(400)]
     baseline = _candidate(100, hint=None)
 
@@ -110,7 +120,7 @@ def test_select_plan_returns_chosen_candidate_when_safe():
 def test_select_plan_vetoes_candidate_far_costlier_than_native():
     # Model loves candidate 0, but its estimated cost is 3x native's --
     # serving it risks a regression Postgres had reason to avoid.
-    optimizer = _with_model([1.0, 999.0])
+    optimizer = _with_model([100.0, 1.0, 999.0])
     candidates = [_candidate(300), _candidate(100)]
     baseline = _candidate(100, hint=None)
 
@@ -125,11 +135,77 @@ def test_safety_margin_is_configurable():
     baseline = _candidate(100, hint=None)
 
     # 14% over native: within a 15% margin, outside a 5% one.
-    lenient = _with_model([1.0, 999.0], safety_margin=0.15)
-    strict = _with_model([1.0, 999.0], safety_margin=0.05)
+    lenient = _with_model([100.0, 1.0, 999.0], safety_margin=0.15)
+    strict = _with_model([100.0, 1.0, 999.0], safety_margin=0.05)
 
     assert lenient.select_plan(candidates, baseline_plan=baseline) is candidates[0]
     assert strict.select_plan(candidates, baseline_plan=baseline) is baseline
+
+
+# -- the confidence gate: don't deviate from native without evidence --------
+
+
+def test_marginal_predicted_gain_keeps_the_native_plan():
+    """Predicting 1 ms better is not a reason to deviate from PostgreSQL."""
+    optimizer = _with_model([100.0, 99.0, 120.0])
+    candidates = [_candidate(100), _candidate(100)]
+    baseline = _candidate(100, hint=None)
+
+    assert optimizer.select_plan(candidates, baseline_plan=baseline) is baseline
+    assert optimizer.last_decision["reason"] == "no_confident_gain_over_native"
+
+
+def test_uncertain_large_gain_keeps_the_native_plan():
+    """
+    The regression that motivated all this: a big predicted win the model
+    isn't actually sure about. Members disagree wildly, so the gain is
+    indistinguishable from noise and native is kept.
+    """
+    optimizer = _with_model([100.0, 20.0], spread=[100.0, 180.0])
+    candidates = [_candidate(100)]
+    baseline = _candidate(100, hint=None)
+
+    assert optimizer.select_plan(candidates, baseline_plan=baseline) is baseline
+    assert optimizer.last_decision["reason"] == "no_confident_gain_over_native"
+
+
+def test_confident_gain_survives_when_members_agree():
+    optimizer = _with_model([100.0, 20.0], spread=[100.0, 21.0])
+    candidates = [_candidate(100)]
+    baseline = _candidate(100, hint=None)
+
+    assert optimizer.select_plan(candidates, baseline_plan=baseline) is candidates[0]
+
+
+def test_confidence_threshold_is_configurable():
+    candidates = [_candidate(100)]
+    baseline = _candidate(100, hint=None)
+    predictions, spread = [100.0, 80.0], [100.0, 100.0]  # 20 ms gain, sigma 10
+
+    cautious = _with_model(predictions, spread=spread, confidence_z=5.0)
+    bold = _with_model(predictions, spread=spread, confidence_z=0.1)
+
+    assert cautious.select_plan(candidates, baseline_plan=baseline) is baseline
+    assert bold.select_plan(candidates, baseline_plan=baseline) is candidates[0]
+
+
+def test_min_gain_floor_blocks_tiny_but_certain_wins():
+    """A dead-certain 0.5 ms win isn't worth the risk of being wrong."""
+    optimizer = _with_model([100.0, 99.5], min_gain_ms=2.0)
+    candidates = [_candidate(100)]
+    baseline = _candidate(100, hint=None)
+
+    assert optimizer.select_plan(candidates, baseline_plan=baseline) is baseline
+
+
+def test_decision_records_the_comparison_against_native():
+    optimizer = _with_model([100.0, 40.0])
+    optimizer.select_plan([_candidate(100)], baseline_plan=_candidate(100, hint=None))
+    d = optimizer.last_decision
+    assert d["predicted_native_ms"] == 100.0
+    assert d["predicted_best_ms"] == 40.0
+    assert d["predicted_gain_ms"] == 60.0
+    assert "required_gain_ms" in d
 
 
 def test_select_plan_without_baseline_never_vetoes():

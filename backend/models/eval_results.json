@@ -1,29 +1,36 @@
 {
   "model_backend": "bootstrapped-ensemble[8x lightgbm]",
-  "n_rows_total": 2525,
-  "n_rows_train": 1848,
-  "n_rows_test": 677,
+  "pairwise_ranker": "trained",
+  "n_rows_raw": 7142,
+  "reps_aggregated_to_median": true,
+  "n_rows_total": 720,
+  "n_rows_train": 549,
+  "n_rows_test": 171,
   "n_features": 41,
-  "test_mae_ms": 25.455276242369912,
-  "test_mean_uncertainty_ms": 10.620683452815452,
+  "test_mae_log_ratio": 0.25243848332326485,
+  "test_typical_multiplicative_error": 1.2871603118944306,
+  "test_mean_uncertainty_log_ratio": 0.11491290013637902,
   "n_tables_in_schema": 4,
-  "n_held_out_queries": 6,
+  "n_held_out_queries": 8,
   "avg_latency_ms": {
-    "native": 108.38483333333333,
-    "heuristic": 107.86283333333331,
-    "oracle_best_possible": 86.34649999999999,
-    "learned_greedy": 98.88650000000001,
-    "learned_thompson": 101.91916666666667,
-    "learned_risk_averse": 92.14233333333334
+    "native": 166.43143750000002,
+    "heuristic": 158.99843750000002,
+    "oracle_best_possible": 110.7494375,
+    "learned_greedy": 162.2491875,
+    "learned_thompson": 167.12925,
+    "learned_risk_averse": 155.16956249999998,
+    "learned_pairwise_rank": 142.37975
   },
   "headroom_captured_vs_oracle": {
-    "learned_greedy": 0.43099145428420105,
-    "learned_thompson": 0.29338274219163557,
-    "learned_risk_averse": 0.7370112682447245
+    "learned_greedy": 0.07510955066269188,
+    "learned_thompson": -0.012532101935993634,
+    "learned_risk_averse": 0.202253421213319,
+    "learned_pairwise_rank": 0.43194726302934533
   },
   "beats_or_ties_heuristic_rate": {
-    "learned_greedy": 1.0,
-    "learned_thompson": 1.0,
-    "learned_risk_averse": 1.0
+    "learned_greedy": 0.75,
+    "learned_thompson": 0.625,
+    "learned_risk_averse": 0.75,
+    "learned_pairwise_rank": 1.0
   }
 }
