@@ -1,15 +1,29 @@
 {
-  "model_backend": "lightgbm",
-  "n_rows_total": 741,
-  "n_rows_train": 543,
-  "n_rows_test": 198,
-  "test_mae_ms": 14.308353370486302,
+  "model_backend": "bootstrapped-ensemble[8x lightgbm]",
+  "n_rows_total": 2525,
+  "n_rows_train": 1848,
+  "n_rows_test": 677,
+  "n_features": 41,
+  "test_mae_ms": 25.455276242369912,
+  "test_mean_uncertainty_ms": 10.620683452815452,
   "n_tables_in_schema": 4,
   "n_held_out_queries": 6,
   "avg_latency_ms": {
-    "native": 93.76966666666665,
-    "heuristic": 95.31400000000001,
-    "learned": 92.471
+    "native": 108.38483333333333,
+    "heuristic": 107.86283333333331,
+    "oracle_best_possible": 86.34649999999999,
+    "learned_greedy": 98.88650000000001,
+    "learned_thompson": 101.91916666666667,
+    "learned_risk_averse": 92.14233333333334
   },
-  "model_beats_or_ties_heuristic_rate": 1.0
+  "headroom_captured_vs_oracle": {
+    "learned_greedy": 0.43099145428420105,
+    "learned_thompson": 0.29338274219163557,
+    "learned_risk_averse": 0.7370112682447245
+  },
+  "beats_or_ties_heuristic_rate": {
+    "learned_greedy": 1.0,
+    "learned_thompson": 1.0,
+    "learned_risk_averse": 1.0
+  }
 }

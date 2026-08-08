@@ -39,15 +39,22 @@ defense) rather than treating them as fixed durations.
 - LightGBM gradient-boosted trees (`backend/app/train.py`) predicting
   candidate latency, falls back to scikit-learn's `GradientBoostingRegressor`
   if the LightGBM native lib isn't available
-- Evaluated against both the Phase 0 heuristic AND native Postgres --
-  results in `docs/WRITEUP.md` Section 2
-- Contextual-bandit stretch goal (Thompson sampling/LinUCB) not attempted --
-  out of scope once the two chosen stretch goals (join-method selection,
-  JOB/IMDB) were prioritized instead; noted as future work in the writeup
+- Evaluated against the Phase 0 heuristic, native Postgres, AND an oracle
+  (best candidate in hindsight) -- the oracle is what makes the other
+  numbers readable; results in `docs/WRITEUP.md` Section 2
+- **Contextual-bandit stretch goal [done]** -- a bootstrapped ensemble
+  (`backend/app/optimizer/bandit.py`) supports Thompson sampling, exactly
+  the mechanism Bao uses, plus a risk-averse policy driven by ensemble
+  uncertainty. LinUCB was not attempted (it assumes a linear reward model;
+  the ensemble gives uncertainty without that assumption)
 
 ## Phase 4 -- Online integration [done]
 - `LearnedOptimizer._select_learned` implemented; `select()`'s interface
-  didn't change
+  didn't change (the policy/safety additions are constructor args and a new
+  `select_plan()`, so existing callers were untouched)
+- Safety veto: a learned pick costed far above the native plan is discarded
+  rather than served -- Bao's "never much worse than the optimizer you
+  replaced" property
 - Every `/query/analyze` call and every `app.benchmark` run logs to
   `plan_execution_log`, tagged with which selector produced it -- `/stats/trend`
   aggregates this for "learned vs. native, over time"

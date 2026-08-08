@@ -62,12 +62,17 @@ def analyze_query(req: QueryRequest):
             plan["hint"] = hint
             candidate_plans.append(plan)
 
-        chosen_index = optimizer.select(candidate_plans) if candidate_plans else None
+        # select_plan applies the safety veto: a candidate the planner costs
+        # far above native never gets served, however much the model likes it.
+        served_plan = optimizer.select_plan(candidate_plans, baseline_plan=baseline_plan)
+        decision = optimizer.last_decision
+        chosen_index = decision.get("chosen_index") if candidate_plans else None
 
         for i, plan in enumerate(candidate_plans):
             log_execution(
                 cur, query_id=None, sql_text=req.sql, plan=plan, hint=plan["hint"],
-                is_baseline=False, selector_used=SELECTOR_MODE, is_chosen=(i == chosen_index),
+                is_baseline=False, selector_used=SELECTOR_MODE,
+                is_chosen=(i == chosen_index and not decision.get("fell_back_to_baseline")),
             )
 
     return {
@@ -75,7 +80,11 @@ def analyze_query(req: QueryRequest):
         "candidates": candidate_plans,
         "chosen_index": chosen_index,
         "chosen_plan": candidate_plans[chosen_index] if chosen_index is not None else None,
+        "served_plan": served_plan,
         "selector_mode": SELECTOR_MODE,
+        # Why this plan: policy, predicted latency, ensemble uncertainty, and
+        # whether the safety net vetoed the model's pick.
+        "decision": decision,
     }
 
 

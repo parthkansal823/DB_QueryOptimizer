@@ -10,6 +10,28 @@ your evaluation section.
 
 from __future__ import annotations
 
+import re
+
+# A leading pg_hint_plan block comment, e.g. "/*+ Leading(a b) */".
+_LEADING_HINT_RE = re.compile(r"\A\s*(/\*\+.*?\*/)\s*", re.DOTALL)
+
+
+def _split_hint(query: str) -> tuple[str, str]:
+    """
+    Peel a leading `/*+ ... */` hint off `query`, returning (hint, rest).
+
+    pg_hint_plan only reads hints at the very START of the statement. Since
+    `get_plan` wraps the query in `EXPLAIN (...)`, a hint left attached to
+    the query would end up *after* the EXPLAIN keyword, where it is parsed
+    as an ordinary comment and silently ignored -- yielding the default plan
+    for every candidate. Hoisting it back to the front is what makes the
+    hint actually bind.
+    """
+    match = _LEADING_HINT_RE.match(query)
+    if not match:
+        return "", query
+    return match.group(1), query[match.end():]
+
 
 def get_plan(cursor, query: str, analyze: bool = True) -> dict:
     """Run EXPLAIN on `query` and return a structured summary of the plan."""
@@ -17,7 +39,10 @@ def get_plan(cursor, query: str, analyze: bool = True) -> dict:
     if analyze:
         options += ", ANALYZE, BUFFERS"
 
-    cursor.execute(f"EXPLAIN ({options}) {query}")
+    hint, bare_query = _split_hint(query)
+    prefix = f"{hint}\n" if hint else ""
+
+    cursor.execute(f"{prefix}EXPLAIN ({options}) {bare_query}")
     result = cursor.fetchone()[0]
     top = result[0]
     plan = top["Plan"]

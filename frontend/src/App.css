@@ -161,6 +161,49 @@
   color: var(--series-native);
 }
 
+.badge-vetoed {
+  background: color-mix(in srgb, var(--status-critical) 18%, transparent);
+  color: var(--status-critical);
+}
+
+.decision-note {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+
+.decision-veto {
+  color: var(--status-critical);
+  margin: 0 0 10px;
+}
+
+.decision-caution {
+  color: var(--text-secondary);
+  margin: 8px 0 0;
+}
+
+.decision-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 24px;
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.decision-facts dt {
+  color: var(--text-muted);
+}
+
+.decision-facts dt::after {
+  content: ":";
+}
+
+.decision-facts dd {
+  margin: 0 0 0 -18px;
+  font-variant-numeric: tabular-nums;
+}
+
 .stat-row {
   display: flex;
   gap: 24px;

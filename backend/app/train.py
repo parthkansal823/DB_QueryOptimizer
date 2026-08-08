@@ -27,7 +27,9 @@ import pickle
 import random
 
 from app.db import get_cursor
+from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
 from app.optimizer.features import build_feature_columns, featurize, to_vector
+from app.optimizer.ranker import PairwisePlanRanker
 from app.plan_extractor import _extract_join_types, _extract_scan_relations, _extract_tables
 from app.schema_introspection import discover_table_cardinalities
 
@@ -58,6 +60,38 @@ def _row_to_candidate(row: dict) -> dict:
     }
 
 
+def _aggregate_repetitions(rows: list[dict]) -> list[dict]:
+    """
+    Collapse repeated executions of the same (query, hint) into one row
+    carrying the **median** latency.
+
+    Why median and not mean: latency has a heavy right tail (a candidate
+    occasionally collides with autovacuum, a checkpoint, or another process
+    on the machine). The mean chases those outliers; the median ignores
+    them. Since the label *is* the thing being learned, this directly
+    attacks the noise that docs/WRITEUP.md §2.3 identifies as the binding
+    constraint on the whole system.
+    """
+    buckets: dict[tuple, list[dict]] = {}
+    for row in rows:
+        buckets.setdefault((row["query_id"], row["hint"]), []).append(row)
+
+    aggregated = []
+    for group in buckets.values():
+        latencies = sorted(r["actual_total_time_ms"] for r in group)
+        mid = len(latencies) // 2
+        median = (
+            latencies[mid]
+            if len(latencies) % 2
+            else (latencies[mid - 1] + latencies[mid]) / 2
+        )
+        representative = dict(group[0])
+        representative["actual_total_time_ms"] = median
+        representative["n_reps"] = len(group)
+        aggregated.append(representative)
+    return aggregated
+
+
 def _discover_cardinalities() -> dict[str, float]:
     """ANALYZE first so `pg_class.reltuples` reflects what was just loaded/collected,
     then read it -- fast even on JOB-scale tables (see schema_introspection)."""
@@ -74,6 +108,7 @@ def _load_rows() -> list[dict]:
 
 
 def _build_model():
+    """A single regressor + the name of the backend that provided it."""
     try:
         import lightgbm as lgb
 
@@ -84,6 +119,31 @@ def _build_model():
         from sklearn.ensemble import GradientBoostingRegressor
 
         return GradientBoostingRegressor(n_estimators=200, max_depth=3, random_state=42), "sklearn-gbrt"
+
+
+def make_classifier():
+    """Binary classifier for the pairwise ranker ('is A faster than B?')."""
+    try:
+        import lightgbm as lgb
+
+        return lgb.LGBMClassifier(
+            n_estimators=200, max_depth=5, learning_rate=0.05, random_state=42, verbosity=-1
+        )
+    except (ImportError, OSError):
+        from sklearn.ensemble import GradientBoostingClassifier
+
+        return GradientBoostingClassifier(n_estimators=200, max_depth=3, random_state=42)
+
+
+def make_regressor():
+    """
+    Zero-arg factory for `BootstrappedEnsemble` (see optimizer/bandit.py).
+
+    Module-level (not a lambda/closure) on purpose: the ensemble holds a
+    reference to this factory and the whole ensemble gets pickled, and
+    pickle can only serialise functions it can find by qualified name.
+    """
+    return _build_model()[0]
 
 
 def _query_level_split(query_ids: list[str], test_fraction: float = 0.25, seed: int = 42):
@@ -97,50 +157,99 @@ def _query_level_split(query_ids: list[str], test_fraction: float = 0.25, seed: 
 
 
 def _evaluate_selection(
-    rows_by_query: dict[str, list[dict]], model, feature_columns, table_cardinalities
+    rows_by_query: dict[str, list[dict]], ensemble, feature_columns, table_cardinalities, ranker=None
 ) -> dict:
-    """For each held-out query, compare native vs. heuristic vs. model picks."""
-    native_latencies, heuristic_latencies, model_latencies = [], [], []
-    model_beats_heuristic = 0
+    """
+    For each held-out query, compare every selector against both baselines
+    the roadmap asks for, plus an oracle.
 
-    for query_id, rows in rows_by_query.items():
+    The **oracle** (always picks the candidate that actually turned out
+    fastest, which requires hindsight and so is not a real strategy) is the
+    ceiling: it says how much latency was available to win at all. Without
+    it, "the model beat native by 3%" is unreadable -- you can't tell a good
+    model on a workload with little headroom from a bad model on a workload
+    with lots. Reporting the gap between a policy and the oracle is the
+    honest version of that claim.
+    """
+    selectors = list(POLICIES) + (["pairwise_rank"] if ranker is not None else [])
+    per_policy: dict[str, list[float]] = {p: [] for p in selectors}
+    native_latencies, heuristic_latencies, oracle_latencies = [], [], []
+    beats_heuristic = {p: 0 for p in selectors}
+    rng = random.Random(7)  # fixed so the thompson column is reproducible
+
+    for _, rows in rows_by_query.items():
         baseline_rows = [r for r in rows if r["is_baseline"]]
         if not baseline_rows:
             continue
-        native_latency = baseline_rows[0]["actual_total_time_ms"]
 
         candidates = [_row_to_candidate(r) for r in rows]
+        latencies = [c["actual_total_time_ms"] for c in candidates]
         costs = [c["total_cost"] or float("inf") for c in candidates]
-        heuristic_idx = costs.index(min(costs))
-        heuristic_latency = candidates[heuristic_idx]["actual_total_time_ms"]
+
+        native_latency = baseline_rows[0]["actual_total_time_ms"]
+        heuristic_latency = latencies[costs.index(min(costs))]
 
         vectors = [to_vector(featurize(c, table_cardinalities), feature_columns) for c in candidates]
-        predictions = model.predict(vectors)
-        model_idx = min(range(len(predictions)), key=lambda i: predictions[i])
-        model_latency = candidates[model_idx]["actual_total_time_ms"]
 
         native_latencies.append(native_latency)
         heuristic_latencies.append(heuristic_latency)
-        model_latencies.append(model_latency)
-        if model_latency <= heuristic_latency:
-            model_beats_heuristic += 1
+        oracle_latencies.append(min(latencies))
+
+        for policy in POLICIES:
+            idx, _ = select_index(ensemble, vectors, policy=policy, rng=rng)
+            per_policy[policy].append(latencies[idx])
+            if latencies[idx] <= heuristic_latency:
+                beats_heuristic[policy] += 1
+
+        if ranker is not None:
+            idx = ranker.select(vectors, tie_break_costs=costs)
+            per_policy["pairwise_rank"].append(latencies[idx])
+            if latencies[idx] <= heuristic_latency:
+                beats_heuristic["pairwise_rank"] += 1
 
     n = len(native_latencies)
+    if not n:
+        return {"n_held_out_queries": 0}
+
+    def avg(xs):
+        return sum(xs) / len(xs)
+
+    avg_latency = {
+        "native": avg(native_latencies),
+        "heuristic": avg(heuristic_latencies),
+        "oracle_best_possible": avg(oracle_latencies),
+    }
+    avg_latency.update({f"learned_{p}": avg(per_policy[p]) for p in selectors})
+
+    # What fraction of the available improvement did each selector capture?
+    # 1.0 == matched the oracle; 0.0 == no better than native; <0 == worse.
+    headroom = avg(native_latencies) - avg(oracle_latencies)
+    captured = {
+        f"learned_{p}": ((avg(native_latencies) - avg(per_policy[p])) / headroom) if headroom > 0 else None
+        for p in selectors
+    }
+
     return {
         "n_held_out_queries": n,
-        "avg_latency_ms": {
-            "native": sum(native_latencies) / n if n else None,
-            "heuristic": sum(heuristic_latencies) / n if n else None,
-            "learned": sum(model_latencies) / n if n else None,
-        },
-        "model_beats_or_ties_heuristic_rate": model_beats_heuristic / n if n else None,
+        "avg_latency_ms": avg_latency,
+        "headroom_captured_vs_oracle": captured,
+        "beats_or_ties_heuristic_rate": {f"learned_{p}": beats_heuristic[p] / n for p in selectors},
     }
 
 
-def train() -> dict:
+def train(
+    model_path: str = MODEL_PATH,
+    eval_path: str = EVAL_PATH,
+    n_models: int = 8,
+    aggregate_reps: bool = True,
+) -> dict:
     rows = _load_rows()
     if not rows:
         raise RuntimeError("plan_execution_log is empty -- run `python -m app.collect_data` first.")
+
+    n_raw_rows = len(rows)
+    if aggregate_reps:
+        rows = _aggregate_repetitions(rows)
 
     table_cardinalities = _discover_cardinalities()
     feature_columns = build_feature_columns(list(table_cardinalities))
@@ -160,43 +269,81 @@ def train() -> dict:
     X_test = [X_all[i] for i in test_idx]
     y_test = [y_all[i] for i in test_idx]
 
-    model, backend_name = _build_model()
-    model.fit(X_train, y_train)
+    _, backend_name = _build_model()
+    ensemble = BootstrappedEnsemble(make_regressor, n_models=n_models).fit(X_train, y_train)
 
-    preds_test = model.predict(X_test)
+    # Pairwise ranker (Lero-style), trained on the same rows. Pairs are
+    # formed within a query only -- see optimizer/ranker.py.
+    train_groups: dict[str, tuple[list, list]] = {}
+    for i in train_idx:
+        vectors, latencies = train_groups.setdefault(query_ids[i], ([], []))
+        vectors.append(X_all[i])
+        latencies.append(y_all[i])
+    ranker = None
+    try:
+        ranker = PairwisePlanRanker(make_classifier).fit(list(train_groups.values()))
+    except ValueError as exc:  # too few distinct latencies to learn an ordering
+        print(f"[warn] pairwise ranker not trained: {exc}")
+
+    preds_test = ensemble.predict(X_test)
     mae = sum(abs(p - y) for p, y in zip(preds_test, y_test)) / len(y_test) if y_test else None
+    _, test_stds = ensemble.predict_mean_std(X_test)
+    mean_uncertainty = sum(test_stds) / len(test_stds) if test_stds else None
 
     rows_by_query: dict[str, list[dict]] = {}
     for row in rows:
         if row["query_id"] in test_ids:
             rows_by_query.setdefault(row["query_id"], []).append(row)
 
-    selection_eval = _evaluate_selection(rows_by_query, model, feature_columns, table_cardinalities)
+    selection_eval = _evaluate_selection(
+        rows_by_query, ensemble, feature_columns, table_cardinalities, ranker=ranker
+    )
 
     results = {
-        "model_backend": backend_name,
+        "model_backend": f"bootstrapped-ensemble[{n_models}x {backend_name}]",
+        "pairwise_ranker": "trained" if ranker is not None else "not trained",
+        "n_rows_raw": n_raw_rows,
+        "reps_aggregated_to_median": aggregate_reps,
         "n_rows_total": len(rows),
         "n_rows_train": len(X_train),
         "n_rows_test": len(X_test),
+        "n_features": len(feature_columns),
         "test_mae_ms": mae,
+        # Mean ensemble disagreement on held-out rows: a rough "how much does
+        # the model actually know here" number. Large relative to test_mae_ms
+        # means predictions are being driven by sparse evidence.
+        "test_mean_uncertainty_ms": mean_uncertainty,
         "n_tables_in_schema": len(table_cardinalities),
         **selection_eval,
     }
 
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    with open(model_path, "wb") as f:
         pickle.dump(
-            {"model": model, "feature_columns": feature_columns, "table_cardinalities": table_cardinalities},
+            {
+                "model": ensemble,
+                "ranker": ranker,
+                "feature_columns": feature_columns,
+                "table_cardinalities": table_cardinalities,
+            },
             f,
         )
 
-    with open(EVAL_PATH, "w") as f:
+    with open(eval_path, "w") as f:
         json.dump(results, f, indent=2)
 
     return results
 
 
 if __name__ == "__main__":
-    results = train()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-out", default=MODEL_PATH, help="where to pickle the trained model bundle")
+    parser.add_argument("--eval-out", default=EVAL_PATH, help="where to write the evaluation JSON")
+    parser.add_argument(
+        "--n-models", type=int, default=8, help="bootstrapped ensemble size (drives uncertainty estimates)"
+    )
+    args = parser.parse_args()
+
+    results = train(model_path=args.model_out, eval_path=args.eval_out, n_models=args.n_models)
     print(json.dumps(results, indent=2))
-    print(f"\nModel written to {MODEL_PATH}")
+    print(f"\nModel written to {args.model_out}")

@@ -66,6 +66,7 @@ export default function App() {
               baseline={result.baseline}
               chosenPlan={result.chosen_plan}
               selectorMode={result.selector_mode}
+              decision={result.decision}
             />
           </section>
 

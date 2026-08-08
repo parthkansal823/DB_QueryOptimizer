@@ -81,6 +81,29 @@ def test_get_plan_extracts_scan_relations_by_alias():
     assert plan["scan_relations"] == {"o": "orders", "oi": "order_items", "u": "users"}
 
 
+def test_hint_is_hoisted_ahead_of_the_explain_keyword():
+    """
+    Regression guard. pg_hint_plan only reads a hint at the very start of the
+    statement, so `EXPLAIN (...) /*+ Leading(a b) */ SELECT` leaves the hint
+    parsed as a plain comment -- every candidate silently comes back as the
+    planner's default plan and the whole experiment measures nothing. This
+    shipped broken once; the assertion below is what catches it recurring.
+    """
+    cur = _FakeCursor(SAMPLE_EXPLAIN_JSON)
+    get_plan(cur, "/*+ Leading(o u) */\nSELECT 1", analyze=False)
+
+    assert cur.last_query.startswith("/*+ Leading(o u) */")
+    assert cur.last_query.index("/*+") < cur.last_query.index("EXPLAIN")
+    # ...and the hint must not also survive in its original position.
+    assert cur.last_query.count("/*+") == 1
+
+
+def test_query_without_hint_is_unchanged():
+    cur = _FakeCursor(SAMPLE_EXPLAIN_JSON)
+    get_plan(cur, "SELECT 1", analyze=False)
+    assert cur.last_query.startswith("EXPLAIN")
+
+
 def test_analyze_flag_controls_explain_options():
     cur = _FakeCursor(SAMPLE_EXPLAIN_JSON)
     get_plan(cur, "SELECT 1", analyze=False)

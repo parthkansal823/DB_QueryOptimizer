@@ -27,16 +27,61 @@ function PlanPanel({ title, plan, badge, badgeClass }) {
   );
 }
 
-export default function PlanComparison({ baseline, chosenPlan, selectorMode }) {
+function DecisionNote({ decision }) {
+  if (!decision) return null;
+
+  const vetoed = decision.fell_back_to_baseline;
+  const predicted = decision.predicted_latency_ms;
+  const uncertainty = decision.predicted_uncertainty_ms;
+
   return (
-    <div className="plan-comparison-grid">
-      <PlanPanel title="Native Postgres" plan={baseline} badge="baseline" badgeClass="badge-native" />
-      <PlanPanel
-        title={selectorMode === "learned" ? "Learned pick" : "Heuristic pick"}
-        plan={chosenPlan}
-        badge="chosen"
-        badgeClass="badge-chosen"
-      />
+    <div className="decision-note">
+      {vetoed && (
+        <p className="decision-veto">
+          <strong>Safety veto:</strong> the learned pick was discarded and the native plan kept
+          &mdash; its estimated cost sits too far above native&rsquo;s to risk serving.
+        </p>
+      )}
+      <dl className="decision-facts">
+        {decision.policy && (
+          <>
+            <dt>Policy</dt>
+            <dd>{decision.policy}</dd>
+          </>
+        )}
+        {predicted != null && (
+          <>
+            <dt>Model predicted</dt>
+            <dd>
+              {predicted.toFixed(1)} ms
+              {uncertainty != null && ` ± ${uncertainty.toFixed(1)} ms`}
+            </dd>
+          </>
+        )}
+      </dl>
+      {uncertainty != null && predicted != null && uncertainty > predicted * 0.25 && (
+        <p className="decision-caution">
+          High ensemble disagreement relative to the prediction &mdash; the model has thin
+          evidence here, so treat this pick as a guess.
+        </p>
+      )}
     </div>
+  );
+}
+
+export default function PlanComparison({ baseline, chosenPlan, selectorMode, decision }) {
+  return (
+    <>
+      <div className="plan-comparison-grid">
+        <PlanPanel title="Native Postgres" plan={baseline} badge="baseline" badgeClass="badge-native" />
+        <PlanPanel
+          title={selectorMode === "learned" ? "Learned pick" : "Heuristic pick"}
+          plan={chosenPlan}
+          badge={decision?.fell_back_to_baseline ? "vetoed" : "chosen"}
+          badgeClass={decision?.fell_back_to_baseline ? "badge-vetoed" : "badge-chosen"}
+        />
+      </div>
+      <DecisionNote decision={decision} />
+    </>
   );
 }

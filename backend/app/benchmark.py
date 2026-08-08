@@ -17,20 +17,25 @@ Usage (from backend/, with the stack running via docker compose):
 
 from __future__ import annotations
 
+import argparse
+
 from app.db import get_cursor
 from app.logging_store import log_execution
+from app.optimizer.bandit import POLICIES
 from app.optimizer.hints import apply_hint, generate_join_order_candidates
 from app.optimizer.learned import LearnedOptimizer
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 
 
-def run() -> None:
-    optimizer = LearnedOptimizer()
+def run(policy: str = "greedy", risk_lambda: float = 1.0) -> None:
+    optimizer = LearnedOptimizer(policy=policy, risk_lambda=risk_lambda, seed=0)
     selector_mode = "learned" if optimizer.model is not None else "heuristic"
-    print(f"selector mode: {selector_mode}\n")
+    print(f"selector mode: {selector_mode}" + (f" (policy: {policy})" if selector_mode == "learned" else ""))
+    print()
 
-    native_total = chosen_total = 0.0
+    native_total = served_total = oracle_total = 0.0
+    n_vetoed = 0
 
     with get_cursor() as cur:
         for item in WORKLOAD:
@@ -49,29 +54,58 @@ def run() -> None:
                 plan["hint"] = hint
                 candidates.append(plan)
 
-            chosen_index = optimizer.select(candidates) if candidates else None
-            chosen_plan = candidates[chosen_index] if chosen_index is not None else baseline
+            served_plan = optimizer.select_plan(candidates, baseline_plan=baseline)
+            decision = optimizer.last_decision
+            chosen_index = decision.get("chosen_index")
+            vetoed = decision.get("fell_back_to_baseline", False)
+            n_vetoed += bool(vetoed and candidates)
 
             for i, plan in enumerate(candidates):
                 log_execution(
                     cur, query_id=query_id, sql_text=sql, plan=plan, hint=plan["hint"],
-                    is_baseline=False, selector_used=selector_mode, is_chosen=(i == chosen_index),
+                    is_baseline=False, selector_used=selector_mode,
+                    is_chosen=(i == chosen_index and not vetoed),
                 )
 
             native_total += baseline["actual_total_time_ms"]
-            chosen_total += chosen_plan["actual_total_time_ms"]
+            served_total += served_plan["actual_total_time_ms"]
+            # The best any selector could have done -- the ceiling this run
+            # was measured against (see docs/WRITEUP.md on why the oracle
+            # matters for reading these numbers).
+            oracle_total += min(
+                [baseline["actual_total_time_ms"]]
+                + [c["actual_total_time_ms"] for c in candidates]
+            )
 
             print(f"--- {query_id} ({len(candidates)} candidates) ---")
             print(f"baseline (native Postgres): {baseline['actual_total_time_ms']:.2f} ms")
-            print(f"chosen   ({selector_mode} path):    {chosen_plan['actual_total_time_ms']:.2f} ms")
-            if chosen_plan is not baseline:
-                print(f"hint used: {chosen_plan['hint']}")
+            print(f"served   ({selector_mode} path):    {served_plan['actual_total_time_ms']:.2f} ms")
+            if vetoed:
+                print("safety veto: learned pick discarded, kept native plan")
+            elif served_plan.get("hint"):
+                print(f"hint used: {served_plan['hint']}")
+            if decision.get("predicted_latency_ms") is not None:
+                print(
+                    f"model predicted {decision['predicted_latency_ms']:.1f} ms "
+                    f"(+/- {decision['predicted_uncertainty_ms']:.1f} ms ensemble spread)"
+                )
             print()
 
+    headroom = native_total - oracle_total
+    captured = ((native_total - served_total) / headroom * 100) if headroom > 0 else None
+
     print(f"=== totals across {len(WORKLOAD)} queries ===")
-    print(f"native total: {native_total:.2f} ms")
-    print(f"chosen total: {chosen_total:.2f} ms")
+    print(f"native total:        {native_total:.2f} ms")
+    print(f"served total:        {served_total:.2f} ms")
+    print(f"oracle total (best): {oracle_total:.2f} ms")
+    if captured is not None:
+        print(f"captured {captured:.1f}% of the {headroom:.0f} ms available headroom")
+    print(f"safety vetoes: {n_vetoed}/{len(WORKLOAD)}")
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--policy", choices=list(POLICIES) + ["pairwise_rank"], default="greedy")
+    parser.add_argument("--risk-lambda", type=float, default=1.0)
+    args = parser.parse_args()
+    run(policy=args.policy, risk_lambda=args.risk_lambda)

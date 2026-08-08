@@ -36,13 +36,17 @@ Query in --> FastAPI backend --> baseline plan (native Postgres EXPLAIN)
                    |
                    +--> candidate join orders + join methods (pg_hint_plan hints)
                    |
-                   +--> LearnedOptimizer picks one (trained model, or
-                   |    heuristic fallback before one exists)
+                   +--> featurize: per-table slots + plan-TREE structure
                    |
-                   +--> execute chosen plan, log to plan_execution_log
+                   +--> bootstrapped ensemble predicts latency + uncertainty
+                   |      policy: greedy | thompson (explore) | risk_averse
                    |
-             React dashboard <-- compare baseline vs. chosen, latency
-             chart, historical accuracy over time (/stats/trend)
+                   +--> SAFETY VETO: discard picks costed far above native
+                   |
+                   +--> execute served plan, log to plan_execution_log
+                   |
+             React dashboard <-- baseline vs. chosen, why it was chosen,
+             latency chart, historical accuracy (/stats/trend)
 ```
 
 Table identity and reference cardinalities are discovered at runtime
@@ -57,9 +61,11 @@ the same pipeline code adapts with no changes.
   `postgres/Dockerfile`)
 - **Backend**: FastAPI + psycopg2 + LightGBM (falls back to scikit-learn's
   `GradientBoostingRegressor` if the LightGBM native lib is unavailable)
-- **Learned component**: `backend/app/optimizer/learned.py` -- trained
-  model when `models/plan_selector.pkl` exists, Phase 0 cost heuristic
-  otherwise (cold start)
+- **Learned component**: `backend/app/optimizer/learned.py` -- a bootstrapped
+  ensemble (`bandit.py`) giving latency predictions *with uncertainty*, three
+  selection policies (`greedy` / `thompson` for exploration / `risk_averse`),
+  and a safety veto against serving regressions. Falls back to the Phase 0
+  cost heuristic when no model exists (cold start)
 - **Frontend**: React (Vite) + Recharts, `frontend/`
 
 ## Quickstart
@@ -127,10 +133,31 @@ learned-query-optimizer/
     └── WRITEUP.md             literature review, results, limitations
 ```
 
+## Does it actually beat Postgres? Not yet -- and that's the finding
+
+Honest answer, with numbers, in `docs/WRITEUP.md` §2: **no**. Across repeated
+runs the learned selector does not reliably beat native Postgres, and
+run-to-run variance exceeds the effect size. The diagnosis is concrete
+rather than hand-wavy: the model's prediction error (~44 ms MAE) is roughly
+six times larger than the total headroom available between native Postgres
+and a perfect oracle (~7.5 ms/query), so no selection policy sitting on top
+of it can resolve the differences it is being asked to judge. §2.3 lays out
+what would have to change (far more repetitions per candidate, a quiesced
+measurement environment, and a workload where Postgres's cardinality
+estimates are actually wrong).
+
+That conclusion only became visible after fixing a bug that had made every
+earlier number meaningless -- `pg_hint_plan` was silently ignoring every
+hint, so all "candidates" were the same plan as native and the measured
+"improvements" were timing noise. `docs/WRITEUP.md` §2.0 documents the bug,
+why it was silent, and the regression test that now guards it. The oracle
+baseline added to `app.train` is what makes "3% better than native"
+interpretable at all.
+
 ## Known limitations, on purpose
 
 `docs/WRITEUP.md` has the full list (candidate sampling above 5 tables,
-executing every candidate in the demo endpoint, small training set, no
-online exploration, self-joins collapsing to one feature slot, and more) --
-naming these clearly is worth more in a viva than pretending they don't
-exist.
+executing every candidate in the demo endpoint, prediction error exceeding
+available headroom, a cost-based rather than learned safety veto, no
+automatic retraining, self-joins collapsing to one feature slot) -- naming
+these clearly is worth more in a viva than pretending they don't exist.

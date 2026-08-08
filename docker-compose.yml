@@ -1,6 +1,16 @@
 services:
   postgres:
     build: ./postgres
+    # pg_hint_plan installs planner hooks at library-load time, so it must be
+    # preloaded at server start. `CREATE EXTENSION` alone (postgres/init/
+    # 01_extensions.sql) registers the SQL objects but leaves hints silently
+    # IGNORED -- every Leading() hint returns the planner's default plan and
+    # the whole candidate set collapses to one plan. Silent because a hint
+    # that can't be applied is a comment, and comments never error.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_hint_plan
     environment:
       POSTGRES_DB: lqo
       POSTGRES_USER: postgres

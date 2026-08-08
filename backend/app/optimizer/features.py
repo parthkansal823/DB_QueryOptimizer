@@ -26,6 +26,8 @@ instead would need positional (not identity) slots; out of scope here.
 
 from __future__ import annotations
 
+from app.optimizer.plan_tree import TREE_FEATURES, encode_plan_tree
+
 BASE_FEATURES = [
     "num_tables",
     "num_joins",
@@ -39,9 +41,16 @@ PER_TABLE_SUFFIXES = ("present", "join_position", "selectivity", "index_scan")
 
 
 def build_feature_columns(known_tables: list[str]) -> list[str]:
-    """The ordered column list for a given schema's table set."""
+    """
+    The ordered column list for a given schema's table set.
+
+    Three blocks: scalar aggregates, plan-tree structure (`plan_tree.py` --
+    what the plan *looks like*, the Neo/Bao insight), and per-table slots
+    (what's *in* it). Only the last block is schema-dependent, which is why
+    the same model shape transfers across datasets.
+    """
     per_table = [f"{table}_{suffix}" for table in sorted(known_tables) for suffix in PER_TABLE_SUFFIXES]
-    return BASE_FEATURES + per_table
+    return BASE_FEATURES + TREE_FEATURES + per_table
 
 
 def _scan_info_by_alias(plan: dict) -> dict[str, dict]:
@@ -95,6 +104,8 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
     features["n_nestloop_join"] = float(n_nestloop)
     features["n_merge_join"] = float(n_merge)
     features["has_hint"] = 1.0 if candidate_plan.get("hint") else 0.0
+
+    features.update(encode_plan_tree(raw_plan))
 
     for i, alias in enumerate(tables_scanned):
         table = scan_relations.get(alias)
