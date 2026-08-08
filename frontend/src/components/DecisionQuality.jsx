@@ -12,31 +12,31 @@ const OUTCOMES = {
     icon: "✓",
     label: "Paid off",
     color: "good",
-    detail: "deviated from PostgreSQL and the query got materially faster",
+    detail: "changed the plan, and the query got faster",
   },
   deviated_wash: {
     icon: "=",
     label: "No real change",
     color: "neutral",
-    detail: "deviated, but the difference was inside noise — the risk bought nothing",
+    detail: "changed the plan, but the difference was too small to matter",
   },
   deviated_loss: {
     icon: "✕",
     label: "Backfired",
     color: "critical",
-    detail: "deviated and made the query materially slower than PostgreSQL",
+    detail: "changed the plan, and the query got slower",
   },
   held_correct: {
     icon: "✓",
     label: "Right to hold",
     color: "good",
-    detail: "kept the native plan, and nothing faster existed among the candidates",
+    detail: "kept PostgreSQL's plan, and nothing faster was available",
   },
   held_missed: {
     icon: "!",
     label: "Missed a win",
     color: "warning",
-    detail: "kept the native plan while a materially faster candidate was sitting right there",
+    detail: "kept PostgreSQL's plan when a faster one was right there",
   },
 };
 
@@ -111,26 +111,25 @@ export default function DecisionQuality({ quality }) {
           <div className="value" style={{ color: quality.regression_ms > 0 ? "var(--status-critical)" : undefined }}>
             {fmtMs(quality.regression_ms)}
           </div>
-          <div className="stat-sub">cost of the deviations that backfired</div>
+          <div className="stat-sub">lost to plan changes that backfired</div>
         </div>
         <div className="stat-tile">
           <div className="label">Time left on the table</div>
           <div className="value">{fmtMs(quality.missed_ms)}</div>
-          <div className="stat-sub">wins available on runs it declined to take</div>
+          <div className="stat-sub">wins it passed up</div>
         </div>
       </div>
 
       <div className="dq-groups">
-        <Segments title="When it deviated" total={nDeviated} parts={deviated} colors={colors} />
+        <Segments title="When it changed the plan" total={nDeviated} parts={deviated} colors={colors} />
         <Segments title="When it kept PostgreSQL's plan" total={nHeld} parts={held} colors={colors} />
       </div>
 
       <p className="decision-caution">
-        A single improvement percentage cannot separate these. Holding the native plan because
-        nothing better existed and holding it while a faster plan sat unused both score exactly
-        zero improvement, and only one of them is a good decision. &ldquo;Materially&rdquo; means
-        at least 5% and 2 ms — the same bar the optimizer applies before it will deviate, so it
-        is graded by the rules it plays by.
+        One percentage can&rsquo;t tell these apart. Keeping PostgreSQL&rsquo;s plan because
+        nothing better existed, and keeping it while a faster plan sat unused, both score 0% —
+        but only one is a good call. &ldquo;Faster&rdquo; here means at least 5% and 2 ms, the
+        same bar the optimizer uses before it will switch, so it is judged by its own rules.
       </p>
     </div>
   );

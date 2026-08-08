@@ -20,7 +20,7 @@ export default function SchemaPanel({ schema }) {
         <div className="stat-tile">
           <div className="label">Rows (estimated)</div>
           <div className="value">~{schema.total_rows?.toLocaleString()}</div>
-          <div className="stat-sub">planner statistics, not a live count</div>
+          <div className="stat-sub">from planner statistics, not a live count</div>
         </div>
         <div className="stat-tile">
           <div className="label">Edges from</div>
@@ -32,9 +32,8 @@ export default function SchemaPanel({ schema }) {
 
       {inferred && (
         <p className="decision-caution" style={{ marginTop: 0 }}>
-          This database declares no foreign keys, so join edges were inferred from column
-          naming (<code>x_id → x.id</code>). Inferred edges are guesses — a wrong one costs a
-          slow query, never a wrong answer.
+          This database has no foreign keys declared, so the join links were guessed from column
+          names (<code>x_id → x.id</code>). A wrong guess costs speed, never correctness.
         </p>
       )}
 

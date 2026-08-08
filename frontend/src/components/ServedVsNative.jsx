@@ -77,15 +77,15 @@ export default function ServedVsNative({ trend }) {
   if (!overall || !overall.n_runs) {
     return (
       <div className="empty-state">
-        No matched runs yet. A run counts here once both the native plan and the plan actually
-        served were measured for the same query — analyze a query above, or run{" "}
+        Nothing to compare yet. A run counts here once we have measured both PostgreSQL's plan
+        and the plan that actually ran, for the same query — analyze a query above, or run{" "}
         <code>python -m app.benchmark</code>.
         {log?.n_executions_logged > 0 && (
           <>
             {" "}
-            ({log.n_executions_logged.toLocaleString()} executions are logged, but{" "}
-            {log.n_offline_collection_rows.toLocaleString()} of them are from the offline
-            training sweep, which never served anything.)
+            ({log.n_executions_logged.toLocaleString()} plans are logged, but{" "}
+            {log.n_offline_collection_rows.toLocaleString()} come from the training sweep, which
+            never served a query.)
           </>
         )}
       </div>
@@ -104,30 +104,29 @@ export default function ServedVsNative({ trend }) {
         <Tile
           label="Total native time"
           value={fmtMs(overall.native_total_ms)}
-          sub={`over ${overall.n_runs} matched run${overall.n_runs === 1 ? "" : "s"}`}
+          sub={`across ${overall.n_runs} run${overall.n_runs === 1 ? "" : "s"}`}
         />
         <Tile
           label="Total served time"
           value={fmtMs(overall.served_total_ms)}
-          sub="what users actually waited"
+          sub="what you actually waited"
         />
         <Tile
           label="Improvement"
           value={fmtPct(overall.improvement_pct)}
-          sub="same queries, same runs"
+          sub="less time than PostgreSQL took"
           color={improved ? "var(--status-good)" : "var(--status-critical)"}
         />
         <Tile
-          label="Deviated from native"
+          label="Changed the plan"
           value={`${overall.n_deviated} / ${overall.n_runs}`}
           sub={`${overall.n_kept_native} runs kept PostgreSQL's plan`}
         />
       </div>
 
       <p className="decision-caution" style={{ marginTop: 0 }}>
-        Matched pairs: the native plan and the served plan for the same query, measured moments
-        apart in the same run. Runs where the optimizer declined to deviate count at zero
-        improvement rather than dropping out.
+        Every run measures both plans for the same query, seconds apart. Runs where the optimizer
+        stayed with PostgreSQL count as 0%, instead of being left out.
       </p>
 
       <div className="table-scroll">
@@ -135,11 +134,11 @@ export default function ServedVsNative({ trend }) {
           <thead>
             <tr>
               <th>Query</th>
-              <th>Deviated</th>
-              <th>Native avg</th>
-              <th>Served avg</th>
-              <th>Best seen</th>
-              <th>Time saved / added</th>
+              <th>Changed</th>
+              <th>PostgreSQL</th>
+              <th>Served</th>
+              <th>Fastest seen</th>
+              <th>Time saved / lost</th>
               <th>Improvement</th>
             </tr>
           </thead>
@@ -151,15 +150,15 @@ export default function ServedVsNative({ trend }) {
         </table>
       </div>
       <p className="decision-caution">
-        Sorted worst first, so a query the optimizer made <em>slower</em> leads rather than
-        hiding inside an average. &ldquo;Best seen&rdquo; is the fastest plan measured for that
-        query, knowable only because <code>/query/analyze</code> runs every candidate.
+        Worst first, so a query that got <em>slower</em> sits at the top instead of hiding in an
+        average. &ldquo;Fastest seen&rdquo; is the quickest plan we measured for that query; we
+        only know it because <code>/query/analyze</code> runs every candidate.
         {log && (
           <>
             {" "}
-            Excludes {log.n_offline_collection_rows.toLocaleString()} offline training-sweep rows
-            of the {log.n_executions_logged.toLocaleString()} logged — those generate labels, not
-            serving decisions.
+            Leaves out {log.n_offline_collection_rows.toLocaleString()} of the{" "}
+            {log.n_executions_logged.toLocaleString()} logged plans: those come from the training
+            sweep, which collects data rather than serving queries.
           </>
         )}
       </p>

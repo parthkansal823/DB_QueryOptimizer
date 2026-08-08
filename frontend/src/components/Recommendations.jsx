@@ -51,8 +51,8 @@ export default function Recommendations({ queryRecs, schemaRecs }) {
   if (!all.length) {
     return (
       <div className="empty-state">
-        No schema-level problems detected — PostgreSQL&rsquo;s estimates were close enough and
-        no scan was wasting significant work.
+        Nothing to fix at the schema level — PostgreSQL&rsquo;s estimates were close enough, and
+        no scan was throwing away much work.
       </div>
     );
   }
@@ -60,9 +60,9 @@ export default function Recommendations({ queryRecs, schemaRecs }) {
   return (
     <div>
       <p className="decision-caution" style={{ marginTop: 0 }}>
-        A hint fixes one query. These fix the <em>reason</em> the hint was needed, so every
-        query touching these columns benefits. Review before running — <code>CREATE INDEX</code>{" "}
-        takes locks and disk, so nothing here is applied automatically.
+        A hint fixes one query. These fix <em>why</em> the hint was needed, so every query using
+        these columns gets faster. Check them before you run them: <code>CREATE INDEX</code> takes
+        locks and disk space, so nothing here runs on its own.
       </p>
       {all.map((rec, i) => (
         <Recommendation key={`${rec.kind}-${rec.table}-${i}`} rec={rec} />

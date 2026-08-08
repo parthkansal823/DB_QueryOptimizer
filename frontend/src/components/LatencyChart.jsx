@@ -11,10 +11,10 @@ import {
 import { usePalette } from "../usePalette";
 
 const ROLE_LABEL = {
-  native: "PostgreSQL's own plan — served",
-  served: "Served (the optimizer deviated)",
-  vetoed: "The model's pick — vetoed, never served",
-  candidate: "Measured, not selected",
+  native: "PostgreSQL's own plan — this is what ran",
+  served: "This is what ran — the optimizer switched to it",
+  vetoed: "The model wanted this one, but it was blocked",
+  candidate: "Measured, but not used",
 };
 
 function LatencyTooltip({ active, payload, colors }) {
@@ -64,18 +64,18 @@ export default function LatencyChart({ baseline, candidates, chosenIndex, vetoed
       <div className="legend-row">
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: colors.native }} />
-          {vetoed ? "Native Postgres — served" : "Native Postgres"}
+          {vetoed ? "PostgreSQL (this ran)" : "PostgreSQL"}
         </span>
         {!vetoed && (
           <span className="legend-item">
             <span className="legend-swatch" style={{ background: colors.chosen }} />
-            Served candidate
+            The plan that ran
           </span>
         )}
         {hasVeto && (
           <span className="legend-item">
             <span className="legend-swatch legend-swatch-vetoed" />
-            Model&rsquo;s pick (vetoed)
+            Model&rsquo;s pick (blocked)
           </span>
         )}
         <span className="legend-item">
@@ -113,9 +113,9 @@ export default function LatencyChart({ baseline, candidates, chosenIndex, vetoed
       </ResponsiveContainer>
       {hasVeto && (
         <p className="decision-caution">
-          The dashed bar is the plan the model preferred. The safety net rejected it, so the
-          query was served PostgreSQL&rsquo;s plan instead — whether that call was right is
-          visible in the bar heights.
+          The dashed bar is the plan the model wanted. A safety check blocked it, so
+          PostgreSQL&rsquo;s plan ran instead. Compare the bar heights to see whether that was
+          the right call.
         </p>
       )}
     </div>

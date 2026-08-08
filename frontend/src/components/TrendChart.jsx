@@ -15,10 +15,10 @@ function TrendTooltip({ active, payload, label }) {
   return (
     <div className="chart-tooltip">
       <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
-      <div>Native avg: {d.native != null ? `${d.native.toFixed(2)} ms` : "-"}</div>
-      <div>Served avg: {d.served != null ? `${d.served.toFixed(2)} ms` : "-"}</div>
+      <div>PostgreSQL: {d.native != null ? `${d.native.toFixed(2)} ms` : "-"}</div>
+      <div>Served: {d.served != null ? `${d.served.toFixed(2)} ms` : "-"}</div>
       <div style={{ marginTop: 4, color: "var(--text-muted)" }}>
-        {d.runs} matched run{d.runs === 1 ? "" : "s"}, {d.deviated} deviated
+        {d.runs} run{d.runs === 1 ? "" : "s"}, {d.deviated} with a changed plan
       </div>
       <div style={{ color: "var(--text-muted)" }}>
         {d.improvement != null ? `${d.improvement.toFixed(1)}% faster` : "no comparison"}
@@ -76,11 +76,11 @@ export default function TrendChart({ byDay }) {
       <div className="legend-row">
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: colors.native }} />
-          Native Postgres (avg per run)
+          PostgreSQL (average per run)
         </span>
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: colors.chosen }} />
-          Served plan (avg per run)
+          Plan that ran (average per run)
         </span>
       </div>
       <ResponsiveContainer width="100%" height={240}>
@@ -121,9 +121,9 @@ export default function TrendChart({ byDay }) {
       </ResponsiveContainer>
       <p className="decision-caution">
         Both lines average the <em>same</em> runs, so the gap between them is the
-        optimizer&rsquo;s doing rather than a difference in which queries happened to be run
-        that day. Larger dots mean more runs behind that day&rsquo;s average. Day-to-day
-        movement in the native line is workload mix, not a change in PostgreSQL.
+        optimizer&rsquo;s doing, not a difference in which queries happened to run that day.
+        Bigger dots mean more runs behind that day. Movement in the PostgreSQL line reflects the
+        mix of queries, not PostgreSQL changing.
       </p>
     </div>
   );

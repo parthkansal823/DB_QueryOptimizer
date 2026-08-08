@@ -18,14 +18,14 @@ function CumulativeTooltip({ active, payload }) {
   return (
     <div className="chart-tooltip">
       <div style={{ fontWeight: 600, marginBottom: 4 }}>Decision {d.i}</div>
-      <div>Native so far: {fmtMs(d.native)}</div>
+      <div>PostgreSQL so far: {fmtMs(d.native)}</div>
       <div>Served so far: {fmtMs(d.served)}</div>
       <div>Best possible: {fmtMs(d.best)}</div>
       <div style={{ marginTop: 4 }}>
         Saved <strong>{fmtMs(d.saved)}</strong>, regret {fmtMs(d.regret)}
       </div>
       <div style={{ color: "var(--text-muted)", marginTop: 4 }}>
-        this run: {fmtMs(d.runNative)} → {fmtMs(d.runServed)} ({d.deviated ? "deviated" : "kept native"})
+        this run: {fmtMs(d.runNative)} → {fmtMs(d.runServed)} ({d.deviated ? "changed plan" : "kept PostgreSQL"})
       </div>
     </div>
   );
@@ -84,33 +84,33 @@ export default function CumulativeChart({ runs }) {
     <div>
       <div className="stat-row" style={{ marginBottom: 12 }}>
         <div className="stat-tile">
-          <div className="label">Time saved vs native</div>
+          <div className="label">Time saved</div>
           <div className="value" style={{ color: last.saved > 0 ? "var(--status-good)" : undefined }}>
             {fmtMs(last.saved)}
           </div>
-          <div className="stat-sub">over {data.length} decisions</div>
+          <div className="stat-sub">across {data.length} decisions</div>
         </div>
         <div className="stat-tile">
-          <div className="label">Regret vs best possible</div>
+          <div className="label">Time still on the table</div>
           <div className="value">{fmtMs(last.regret)}</div>
-          <div className="stat-sub">time a perfect selector would have avoided</div>
+          <div className="stat-sub">time a perfect picker would have saved</div>
         </div>
         <div className="stat-tile">
-          <div className="label">Regret ratio</div>
+          <div className="label">Regret vs PostgreSQL</div>
           <div
             className="value"
             style={{ color: ratio != null && ratio < 1 ? "var(--status-good)" : "var(--status-critical)" }}
           >
             {ratio == null ? "-" : `${ratio.toFixed(2)}×`}
           </div>
-          <div className="stat-sub">below 1.00 beats always trusting PostgreSQL</div>
+          <div className="stat-sub">under 1.00 beats always trusting PostgreSQL</div>
         </div>
       </div>
 
       <div className="legend-row">
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: colors.native }} />
-          Native Postgres
+          PostgreSQL
         </span>
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: colors.chosen }} />
@@ -202,10 +202,10 @@ export default function CumulativeChart({ runs }) {
       </ResponsiveContainer>
 
       <p className="decision-caution">
-        All three curves are running totals of time spent, so they only rise. Read the two gaps:
-        native to served is what the optimizer saved, served to best possible is what it still
-        left behind. A saving gap that stops widening means it has stopped finding wins; a
-        regret gap that keeps growing in a straight line means it is not learning.
+        These are running totals of time spent, so all three only climb. Read the gaps: from
+        native down to served is the time saved; from served down to best possible is the time
+        still on the table. If the top gap stops widening, the optimizer has stopped finding
+        wins. If the bottom gap keeps growing in a straight line, it is not learning.
       </p>
     </div>
   );

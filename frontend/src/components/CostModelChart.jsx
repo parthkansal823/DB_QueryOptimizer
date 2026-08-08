@@ -16,10 +16,10 @@ function CostTooltip({ active, payload }) {
   return (
     <div className="chart-tooltip">
       <div style={{ fontWeight: 600, marginBottom: 4 }}>
-        {d.kind === "native" ? "PostgreSQL's own plan" : "Hinted alternative"}
+        {d.kind === "native" ? "PostgreSQL's own plan" : "Alternative plan"}
       </div>
-      <div>Estimated cost: {d.cost.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-      <div>Measured latency: {d.latency_ms.toFixed(2)} ms</div>
+      <div>PostgreSQL&rsquo;s estimate: {d.cost.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+      <div>Actually took: {d.latency_ms.toFixed(2)} ms</div>
     </div>
   );
 }
@@ -41,7 +41,7 @@ export default function CostModelChart({ data }) {
   const colors = usePalette();
 
   if (!data?.points?.length) {
-    return <div className="empty-state">No costed executions logged yet.</div>;
+    return <div className="empty-state">No plans measured yet.</div>;
   }
 
   const native = data.points.filter((p) => p.kind === "native");
@@ -56,12 +56,12 @@ export default function CostModelChart({ data }) {
         <div className="stat-tile">
           <div className="label">Rank correlation</div>
           <div className="value">{r == null ? "-" : r.toFixed(2)}</div>
-          <div className="stat-sub">cost order vs. real latency order (1.00 = perfect)</div>
+          <div className="stat-sub">how well cost predicts speed (1.00 = perfect)</div>
         </div>
         <div className="stat-tile">
           <div className="label">Plans measured</div>
           <div className="value">{data.n_points.toLocaleString()}</div>
-          <div className="stat-sub">{native.length} native, {alternatives.length} hinted</div>
+          <div className="stat-sub">{native.length} from PostgreSQL, {alternatives.length} alternatives</div>
         </div>
       </div>
 
@@ -72,7 +72,7 @@ export default function CostModelChart({ data }) {
         </span>
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: colors.chosen }} />
-          Hinted alternative
+          Alternative plan
         </span>
       </div>
 
@@ -133,18 +133,16 @@ export default function CostModelChart({ data }) {
       </ResponsiveContainer>
 
       <p className="decision-caution">
-        Both axes are logarithmic — cost and latency each span three orders of magnitude here, and
-        a linear axis would collapse everything but the largest queries into the corner. If
-        PostgreSQL&rsquo;s cost model were right, this would be a tight diagonal line and there
-        would be nothing for a learned optimizer to learn. The vertical spread is the gap it
-        exploits: plans the planner costs identically differ by an order of magnitude in
-        practice.
+        Both axes are logarithmic, because cost and time each span a thousandfold range here. If
+        PostgreSQL&rsquo;s estimates were accurate, these dots would form a tight diagonal line and
+        there would be nothing to learn. The vertical spread is the opening: plans PostgreSQL
+        prices the same can run ten times apart.
         {data.excludes_disabled_plans && (
           <>
             {" "}
-            Plans disabled by an operator hint are excluded — PostgreSQL costs those at a 10<sup>10</sup>{" "}
-            sentinel rather than an estimate, so they are not predictions and say nothing about
-            prediction quality.
+            Plans switched off by a hint are left out: PostgreSQL gives those a placeholder cost
+            of 10<sup>10</sup> instead of a real estimate, so they say nothing about how good its
+            estimates are.
           </>
         )}
       </p>
