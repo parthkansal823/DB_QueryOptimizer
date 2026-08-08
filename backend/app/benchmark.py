@@ -48,10 +48,6 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
         for item in WORKLOAD:
             query_id, sql = item["id"], item["sql"]
             baseline = get_plan(cur, sql)
-            log_execution(
-                cur, query_id=query_id, sql_text=sql, plan=baseline,
-                is_baseline=True, selector_used="native",
-            )
             tables = baseline["tables_scanned"]
 
             candidates = []
@@ -84,11 +80,21 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
                 vetoed = decision.get("fell_back_to_baseline", False)
                 n_vetoed += bool(vetoed and candidates)
 
+            # Logged after the decision so the baseline row can record whether
+            # it was also the plan that got served. A run that keeps native is
+            # still a served decision, and dropping it from the served history
+            # is what made the dashboard's comparison unpaired (see app.stats).
+            kept_native = vetoed or chosen_index is None
+            log_execution(
+                cur, query_id=query_id, sql_text=sql, plan=baseline,
+                is_baseline=True, selector_used="native", is_chosen=kept_native,
+            )
+
             for i, plan in enumerate(candidates):
                 log_execution(
                     cur, query_id=query_id, sql_text=sql, plan=plan, hint=plan["hint"],
                     is_baseline=False, selector_used=selector_mode,
-                    is_chosen=(i == chosen_index and not vetoed),
+                    is_chosen=(i == chosen_index and not kept_native),
                 )
 
             native_total += baseline["actual_total_time_ms"]

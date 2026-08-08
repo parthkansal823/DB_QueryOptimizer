@@ -220,7 +220,7 @@ WORKLOAD = [
     {
         "id": "corr_5w_supplier_chain",
         "sql": """
-            SELECT o.id, u.name, p.name, s.name
+            SELECT o.id, u.name, p.name, ps.lead_days
             FROM orders o
             JOIN users u ON o.user_id = u.id
             JOIN order_items oi ON oi.order_id = o.id

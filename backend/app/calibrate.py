@@ -90,7 +90,19 @@ def evaluate_setting(
         vectors = [to_vector(featurize(c, cardinalities), feature_columns) for c in candidates]
 
         means, stds = model.predict_mean_std(vectors)
-        best_i, _ = select_index(model, vectors, policy=policy)
+
+        # `pairwise_rank` lives on the ranker, not the ensemble, so it isn't
+        # one of bandit.POLICIES. The confidence gate still reads the
+        # ensemble's prediction for whichever candidate was put forward --
+        # selection and authorisation are separate steps (see learned.py).
+        if policy == "pairwise_rank":
+            ranker = bundle.get("ranker")
+            if ranker is None:
+                continue
+            costs = [c["total_cost"] or float("inf") for c in candidates]
+            best_i = ranker.select(vectors, tie_break_costs=costs)
+        else:
+            best_i, _ = select_index(model, vectors, policy=policy)
 
         if ratio_target:
             pessimistic = math.exp(means[best_i] + confidence_z * stds[best_i])
@@ -180,7 +192,8 @@ def load_gate(path: str = GATE_PATH) -> dict | None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy", default="greedy")
+    parser.add_argument("--policy", default="greedy",
+                        choices=["greedy", "thompson", "risk_averse", "pairwise_rank"])
     parser.add_argument("--max-regression-rate", type=float, default=0.34)
     parser.add_argument("--apply", action="store_true", help="write the recommendation to models/gate.json")
     args = parser.parse_args()

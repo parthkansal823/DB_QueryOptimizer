@@ -35,6 +35,11 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo
       FRONTEND_ORIGIN: http://localhost:5173
+      # Measured best on this dataset: 87.8% of oracle headroom captured
+      # versus 77.2% for the ensemble policies (docs/WRITEUP.md 2.1).
+      # Which policy wins is dataset-dependent -- re-check with app.model_zoo
+      # after onboarding a new database.
+      SELECTION_POLICY: pairwise_rank
     ports:
       - "8000:8000"
     depends_on:

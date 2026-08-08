@@ -39,6 +39,7 @@ import json
 
 from app import model_store
 from app.db import get_cursor
+from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
 from app.train import _load_rows, _row_to_candidate, train
@@ -53,18 +54,40 @@ DEFAULT_MIN_IMPROVEMENT = 0.02
 
 
 def rows_since_last_training() -> int:
-    """How many executions have been logged since the deployed model trained."""
+    """
+    How many *trainable* executions have been logged since the deployed model
+    trained.
+
+    Counting every row overstated this badly, and not harmlessly: the
+    dashboard presents it as pending feedback, and `DEFAULT_MIN_NEW_ROWS`
+    gates retrains on it. Rows `app.train` filters out would trip that gate
+    and buy a retrain on data the trainer never sees, so the count has to
+    apply the same filter the trainer does.
+    """
     registry_versions = model_store.list_versions()
     current = model_store.current_version()
     entry = next((v for v in registry_versions if v["version_id"] == current), None)
 
+    # `NOT LIKE %s` rather than a literal pattern: psycopg2 treats `%` in the
+    # query string as its own placeholder marker whenever parameters are
+    # passed, so an inline 'adhoc:%' raises IndexError on the parameterised
+    # branch below.
+    trainable = (
+        "actual_total_time_ms IS NOT NULL "
+        "AND query_id IS NOT NULL AND query_id NOT LIKE %s"
+    )
+    adhoc_pattern = f"{ADHOC_PREFIX}%"
+
     with get_cursor() as cur:
         if entry is None:
-            cur.execute("SELECT count(*) FROM plan_execution_log")
+            cur.execute(
+                f"SELECT count(*) FROM plan_execution_log WHERE {trainable}",
+                (adhoc_pattern,),
+            )
             return cur.fetchone()[0]
         cur.execute(
-            "SELECT count(*) FROM plan_execution_log WHERE created_at > %s",
-            (entry["created_at"],),
+            f"SELECT count(*) FROM plan_execution_log WHERE {trainable} AND created_at > %s",
+            (adhoc_pattern, entry["created_at"]),
         )
         return cur.fetchone()[0]
 

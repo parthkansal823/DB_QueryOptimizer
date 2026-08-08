@@ -7,7 +7,48 @@ every execution the system ever runs becomes a row here.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+
+_WHITESPACE = re.compile(r"\s+")
+
+# Prefix for ids derived from the SQL text rather than named by a workload.
+# Kept distinct so the two can be told apart downstream -- `app.train`
+# excludes ad-hoc traffic from training data, and the dashboard reports on it
+# separately from the offline sweeps.
+ADHOC_PREFIX = "adhoc:"
+
+
+def query_fingerprint(sql: str) -> str:
+    """
+    A stable id for a query that no workload gave a name to.
+
+    Every per-query statistic in this system -- cumulative regret, the
+    retrospective regression guard, served-vs-native pairing -- groups rows
+    by `query_id`. Logging dashboard traffic with `query_id = NULL` therefore
+    dropped it out of all three: the regret curve stayed permanently empty no
+    matter how many queries were analyzed, and the guard could never block an
+    ad-hoc query because it had no history to judge it on.
+
+    Hashing the whitespace-normalised text gives those rows an id that is
+    stable across runs (so history accumulates) without pretending the query
+    was part of a curated workload.
+
+    Must stay in sync with `QUERY_KEY_SQL` below, which reproduces this same
+    id in SQL for rows written before ids were assigned.
+    """
+    normalized = _WHITESPACE.sub(" ", sql.strip())
+    return ADHOC_PREFIX + hashlib.md5(normalized.encode()).hexdigest()
+
+
+# The SQL equivalent of `query_fingerprint`, applied as a fallback so rows
+# logged before this existed (query_id IS NULL) group together with newer
+# rows for the same query instead of being discarded.
+QUERY_KEY_SQL = (
+    r"COALESCE(query_id, 'adhoc:' || md5("
+    r"regexp_replace(btrim(sql_text, E' \t\r\n'), '\s+', ' ', 'g')))"
+)
 
 # Mirrors postgres/init/03_logging.sql, which only runs for the container's
 # default database. Pointing the optimizer at a user's own database (see
@@ -62,11 +103,17 @@ def log_execution(
     selector_used: str = "native",
     is_chosen: bool = False,
 ) -> None:
-    """Persist one executed plan (baseline or candidate) as a training row."""
+    """
+    Persist one executed plan (baseline or candidate) as a training row.
+
+    `query_id` may be None for ad-hoc traffic; it is then derived from the
+    SQL text so the row still groups with other executions of the same query
+    (see `query_fingerprint`).
+    """
     cur.execute(
         INSERT_SQL,
         (
-            query_id,
+            query_id if query_id is not None else query_fingerprint(sql_text),
             sql_text,
             hint,
             is_baseline,

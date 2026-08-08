@@ -28,6 +28,7 @@ import pickle
 import random
 
 from app.db import get_cursor
+from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
 from app.optimizer.features import build_feature_columns, featurize, to_vector
 from app.optimizer.ranker import PairwisePlanRanker
@@ -40,12 +41,18 @@ EVAL_PATH = os.getenv("EVAL_OUT_PATH", "models/eval_results.json")
 FETCH_SQL = """
     SELECT query_id, sql_text, hint, is_baseline, raw_plan, total_cost, actual_total_time_ms
     FROM plan_execution_log
-    WHERE actual_total_time_ms IS NOT NULL AND query_id IS NOT NULL
+    WHERE actual_total_time_ms IS NOT NULL
+      AND query_id IS NOT NULL
+      AND query_id NOT LIKE %s
 """
-# query_id IS NULL rows are ad-hoc dashboard queries (Phase 5's /query/analyze
-# with no stable workload id) -- they still feed /stats/trend, but a query-level
-# train/test split needs a real id to group each query's candidates by, so they're
-# excluded from training data rather than silently mis-grouped under one bucket.
+# `adhoc:` rows are dashboard traffic (Phase 5's /query/analyze), which now
+# carries a fingerprint id so it can be grouped for per-query statistics --
+# see `logging_store.query_fingerprint`. They stay out of training regardless:
+# /query/analyze runs one execution per candidate with no repetitions, and the
+# noise that `_aggregate_repetitions` exists to suppress would come straight
+# back in through the labels. Whether to fold live traffic into training is a
+# real design question, not something to change as a side effect of giving
+# those rows an id.
 
 
 def _row_to_candidate(row: dict) -> dict:
@@ -148,7 +155,7 @@ def _discover_cardinalities() -> dict[str, float]:
 
 def _load_rows() -> list[dict]:
     with get_cursor() as cur:
-        cur.execute(FETCH_SQL)
+        cur.execute(FETCH_SQL, (f"{ADHOC_PREFIX}%",))
         columns = [d[0] for d in cur.description]
         return [dict(zip(columns, r)) for r in cur.fetchall()]
 

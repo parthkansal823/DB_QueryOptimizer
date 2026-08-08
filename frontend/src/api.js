@@ -48,3 +48,7 @@ export function fetchSchema() {
 export function fetchRegret() {
   return request("/stats/regret");
 }
+
+export function fetchAdvisor() {
+  return request("/advisor");
+}

@@ -6,9 +6,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app import model_store, retrain
+from app import model_store, retrain, stats
+from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
-from app.logging_store import log_execution
+from app.logging_store import log_execution, query_fingerprint
 from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer.planner import optimize_and_execute
@@ -100,10 +101,6 @@ def analyze_query(req: QueryRequest):
     with get_cursor() as cur:
         baseline_plan = get_plan(cur, req.sql)
         tables = baseline_plan["tables_scanned"]
-        log_execution(
-            cur, query_id=None, sql_text=req.sql, plan=baseline_plan,
-            is_baseline=True, selector_used="native",
-        )
 
         # Full action space: join orders *and* Bao-style operator toggles.
         # Deduplicated, because most hints on a simple query re-produce the
@@ -128,12 +125,24 @@ def analyze_query(req: QueryRequest):
         served_plan = optimizer.select_plan(candidate_plans, baseline_plan=baseline_plan)
         decision = optimizer.last_decision
         chosen_index = decision.get("chosen_index") if candidate_plans else None
+        kept_native = bool(decision.get("fell_back_to_baseline")) or chosen_index is None
+
+        # Log the baseline *after* the decision, because whether it was the
+        # served plan is part of that decision. When the optimizer declines to
+        # deviate, the native plan is what the user got, and marking it chosen
+        # is what keeps the served history complete: leaving those runs with no
+        # chosen row at all was why the dashboard's "chosen average" only ever
+        # covered the queries the model felt brave about.
+        log_execution(
+            cur, query_id=None, sql_text=req.sql, plan=baseline_plan,
+            is_baseline=True, selector_used="native", is_chosen=kept_native,
+        )
 
         for i, plan in enumerate(candidate_plans):
             log_execution(
                 cur, query_id=None, sql_text=req.sql, plan=plan, hint=plan["hint"],
                 is_baseline=False, selector_used=SELECTOR_MODE,
-                is_chosen=(i == chosen_index and not decision.get("fell_back_to_baseline")),
+                is_chosen=(i == chosen_index and not kept_native),
             )
 
     # The best candidate *actually measured* this run, which is what a
@@ -174,6 +183,9 @@ def analyze_query(req: QueryRequest):
         # whether the safety net vetoed the model's pick.
         "decision": decision,
         "best_measured": best_measured,
+        # Database-level fixes: hints repair one query, these repair the
+        # reason a hint was needed (see app/advisor.py).
+        "recommendations": analyze_plan(baseline_plan["raw_plan"]),
     }
 
 
@@ -188,10 +200,16 @@ def optimize_query(req: QueryRequest):
     `optimizer_overhead_ms` vs `execution_ms` split in the response is what
     tells you whether the decision paid for itself.
     """
+    # Without an id the regression guard is inert -- `is_blocked(None)` is
+    # always False -- so every query served through here bypassed the very
+    # safety net /model/status reports on. A fingerprint gives ad-hoc traffic
+    # the stable identity the guard needs to accumulate a history for it.
+    query_id = query_fingerprint(req.sql)
+
     with get_cursor() as cur:
-        result = optimize_and_execute(cur, req.sql, optimizer, guard=guard)
+        result = optimize_and_execute(cur, req.sql, optimizer, query_id=query_id, guard=guard)
         log_execution(
-            cur, query_id=None, sql_text=req.sql, plan=result["executed_plan"],
+            cur, query_id=query_id, sql_text=req.sql, plan=result["executed_plan"],
             hint=result["hint"], is_baseline=result["hint"] is None,
             selector_used=SELECTOR_MODE, is_chosen=True,
         )
@@ -205,6 +223,17 @@ def optimize_query(req: QueryRequest):
         "executed_plan": result["executed_plan"],
         "decision": result.get("decision"),
     }
+
+
+@app.get("/advisor")
+def advisor():
+    """
+    Schema-wide recommendations that don't depend on a specific query --
+    currently unindexed foreign keys, which slow every join through them.
+    Per-query advice comes back on /query/analyze as `recommendations`.
+    """
+    with get_cursor() as cur:
+        return {"recommendations": missing_fk_indexes(cur)}
 
 
 @app.get("/stats/regret")
@@ -287,57 +316,19 @@ def _reload_optimizer() -> None:
     SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
 
 
-TREND_SQL = """
-    SELECT
-        date_trunc('day', created_at) AS day,
-        AVG(actual_total_time_ms) FILTER (WHERE is_baseline) AS native_avg_ms,
-        AVG(actual_total_time_ms) FILTER (WHERE is_chosen) AS chosen_avg_ms,
-        COUNT(*) FILTER (WHERE is_chosen AND selector_used = 'learned') AS n_learned,
-        COUNT(*) FILTER (WHERE is_chosen AND selector_used = 'heuristic') AS n_heuristic
-    FROM plan_execution_log
-    GROUP BY 1
-    ORDER BY 1
-"""
-
-OVERALL_SQL = """
-    SELECT
-        AVG(actual_total_time_ms) FILTER (WHERE is_baseline) AS native_avg_ms,
-        AVG(actual_total_time_ms) FILTER (WHERE is_chosen) AS chosen_avg_ms,
-        COUNT(*) FILTER (WHERE is_baseline) AS n_native,
-        COUNT(*) FILTER (WHERE is_chosen) AS n_chosen
-    FROM plan_execution_log
-"""
-
-
 @app.get("/stats/trend")
 def stats_trend():
     """
-    Aggregated "learned vs. native, over time" history (Phase 4/5) -- the
-    data behind the dashboard's historical-accuracy chart.
+    "Served vs. native, over time" -- the data behind the dashboard's
+    historical-accuracy panel.
+
+    Every figure here is a **matched pair**: the native plan and the served
+    plan for the same query, measured in the same run. See `app.stats` for
+    why the previous version of this endpoint (two averages over unrelated
+    populations) reported improvements that were not real.
     """
     with get_cursor() as cur:
-        cur.execute(OVERALL_SQL)
-        o_native, o_chosen, n_native, n_chosen = cur.fetchone()
+        result = stats.served_vs_native(cur)
 
-        cur.execute(TREND_SQL)
-        rows = cur.fetchall()
-
-    return {
-        "overall": {
-            "native_avg_latency_ms": o_native,
-            "chosen_avg_latency_ms": o_chosen,
-            "n_native": n_native,
-            "n_chosen": n_chosen,
-            "selector_mode": SELECTOR_MODE,
-        },
-        "by_day": [
-            {
-                "day": day.isoformat(),
-                "native_avg_latency_ms": native_avg,
-                "chosen_avg_latency_ms": chosen_avg,
-                "n_learned": n_learned,
-                "n_heuristic": n_heuristic,
-            }
-            for day, native_avg, chosen_avg, n_learned, n_heuristic in rows
-        ],
-    }
+    result["overall"]["selector_mode"] = SELECTOR_MODE
+    return result

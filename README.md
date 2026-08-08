@@ -197,7 +197,7 @@ candidate, and historical accuracy trending across every run so far.
 | `POST /query/analyze` | Demo/measurement path — executes *every* candidate so they can be compared |
 | `GET /schema` | What it discovered about the current database (tables, join edges, declared vs. inferred) |
 | `GET /stats/regret` | Cumulative regret vs. native Postgres — `<1.0` means the optimizer is earning its keep |
-| `GET /stats/trend` | Latency history for the dashboard |
+| `GET /stats/trend` | Served vs. native history, as matched pairs — overall, per day, per query |
 | `GET /model/status` | Deployed version, unlearned feedback, blocked queries |
 | `POST /model/retrain` / `POST /model/rollback` | Drive the learning loop |
 
@@ -227,6 +227,7 @@ learned-query-optimizer/
 │   ├── tests/                 pytest suite (hints, features, learned, plan_extractor, schema_introspection)
 │   └── app/
 │       ├── main.py               FastAPI endpoints (/query/analyze, /stats/trend)
+│       ├── stats.py              paired served-vs-native reporting for the dashboard
 │       ├── db.py                 connection handling
 │       ├── plan_extractor.py     EXPLAIN JSON -> structured metrics (incl. scan_relations)
 │       ├── schema_introspection.py  table cardinalities from pg_class, any schema

@@ -272,6 +272,31 @@
   margin-top: 2px;
 }
 
+/* A headline number is only readable next to what it was measured over --
+   "34.8%" and "34.8% over 17 matched runs" invite very different amounts of
+   trust, and the second one is the honest offer. */
+.stat-sub {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+  max-width: 190px;
+  line-height: 1.35;
+}
+
+/* SQL is the widest thing in any table here; let it truncate rather than
+   push the numbers off-screen. Full text is in the cell's title attribute. */
+.sql-cell {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-primary);
+}
+
+.cell-note {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
 .empty-state {
   color: var(--text-muted);
   font-size: 0.85rem;
@@ -337,4 +362,23 @@ code {
 
 .decision-caution a {
   color: var(--series-native);
+}
+
+.rec-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.rec-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+}
+
+.rec-head .badge {
+  margin-left: 0;
 }

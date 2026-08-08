@@ -24,16 +24,24 @@ would have cost. That makes regret an offline diagnostic, computed from
 
 from __future__ import annotations
 
-REGRET_SQL = """
+from app.logging_store import QUERY_KEY_SQL
+
+# `query_id IS NOT NULL` used to sit in this WHERE clause, which quietly
+# excluded every query run from the dashboard -- those were logged without an
+# id, so the curve stayed empty however much traffic the system served.
+# Falling back to a fingerprint of the SQL text keeps ad-hoc runs in, and
+# groups repeat executions of the same query together the way named workload
+# queries already were.
+REGRET_SQL = f"""
     SELECT
-        query_id,
+        {QUERY_KEY_SQL}                                                  AS query_key,
         created_at,
         MIN(actual_total_time_ms)                                        AS best_ms,
         MIN(actual_total_time_ms) FILTER (WHERE is_chosen)               AS served_ms,
         MIN(actual_total_time_ms) FILTER (WHERE is_baseline)             AS native_ms
     FROM plan_execution_log
-    WHERE actual_total_time_ms IS NOT NULL AND query_id IS NOT NULL
-    GROUP BY query_id, date_trunc('second', created_at), created_at
+    WHERE actual_total_time_ms IS NOT NULL
+    GROUP BY 1, created_at
     HAVING MIN(actual_total_time_ms) FILTER (WHERE is_chosen) IS NOT NULL
     ORDER BY created_at
 """
@@ -55,7 +63,7 @@ def regret_curve(cur, limit: int = 500) -> dict:
     cumulative_learned = 0.0
     cumulative_native = 0.0
 
-    for query_id, created_at, best_ms, served_ms, native_ms in rows:
+    for query_key, created_at, best_ms, served_ms, native_ms in rows:
         if best_ms is None or served_ms is None:
             continue
         learned_regret = max(served_ms - best_ms, 0.0)
@@ -66,7 +74,7 @@ def regret_curve(cur, limit: int = 500) -> dict:
 
         points.append(
             {
-                "query_id": query_id,
+                "query_id": query_key,
                 "at": created_at.isoformat(),
                 "regret_ms": learned_regret,
                 "cumulative_regret_ms": cumulative_learned,

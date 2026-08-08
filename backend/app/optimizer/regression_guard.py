@@ -28,12 +28,21 @@ model improves. Blocking is a brake, not a permanent ban.
 
 from __future__ import annotations
 
+# `is_chosen AND hint IS NOT NULL` -- served executions that actually
+# *deviated* from PostgreSQL. Runs where the optimizer served the native plan
+# are recorded as chosen too (they were the served decision, and every paired
+# statistic needs them), but they are by definition neither faster nor slower
+# than native, so averaging them in here would only dilute the signal this
+# guard exists to detect: that deviating on this query has been making it
+# worse. What is being blocked is the deviation, so the deviations are what
+# get measured.
 REGRESSION_SQL = """
     SELECT
         query_id,
         AVG(actual_total_time_ms) FILTER (WHERE is_baseline)  AS native_avg_ms,
-        AVG(actual_total_time_ms) FILTER (WHERE is_chosen)    AS chosen_avg_ms,
-        COUNT(*)                  FILTER (WHERE is_chosen)    AS n_chosen
+        AVG(actual_total_time_ms) FILTER (WHERE is_chosen AND hint IS NOT NULL)
+                                                              AS chosen_avg_ms,
+        COUNT(*) FILTER (WHERE is_chosen AND hint IS NOT NULL) AS n_chosen
     FROM plan_execution_log
     WHERE query_id IS NOT NULL AND actual_total_time_ms IS NOT NULL
     GROUP BY query_id

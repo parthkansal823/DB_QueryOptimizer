@@ -290,23 +290,35 @@ class LearnedOptimizer:
 
         return scored[best_i]
 
+    # PostgreSQL prices a plan it has been told not to use at `disable_cost`
+    # (1e10) rather than removing it. Anything at that scale is a plan the
+    # planner considers structurally catastrophic -- typically a cartesian
+    # product -- and is worth refusing outright.
+    DISABLE_COST_SCALE = 1e9
+
     def _is_unsafe(self, chosen: dict, baseline_plan: dict) -> bool:
         """
-        Would serving `chosen` risk a meaningful regression vs. native?
+        Would serving `chosen` risk a *catastrophic* regression vs. native?
 
-        Compares on the planner's own estimated cost rather than on measured
-        latency: at decision time in a real deployment you have not run
-        either plan, so `actual_total_time_ms` is not available. Estimated
-        cost is a weak signal -- that's the entire premise of this project --
-        but it is a *shared* weak signal, and a candidate whose cost estimate
-        is far above the native plan's is one Postgres had a specific reason
-        to reject.
+        This originally vetoed any candidate costed more than
+        `safety_margin` above the native plan. That was exactly backwards.
+        The plans this system exists to find are the ones PostgreSQL costs
+        *higher* than its own choice -- that cost gap is the estimation error
+        being exploited. Measured example: a candidate costed 14459 against
+        native's 7925 (1.8x) ran 6x faster. The old rule vetoed it, so the
+        optimizer declined every genuine win it found while the model was
+        predicting a 12x speedup.
+
+        So the veto now only catches `disable_cost`-scale plans (~1e10),
+        where PostgreSQL is not expressing a cost preference but flagging a
+        plan it considers structurally broken. Ordinary cost disagreement is
+        left to the model and the confidence gate, which reason about
+        predicted *latency* -- the thing actually being optimised.
         """
         chosen_cost = chosen.get("total_cost")
-        baseline_cost = baseline_plan.get("total_cost")
-        if not chosen_cost or not baseline_cost:
+        if not chosen_cost:
             return False
-        return chosen_cost > baseline_cost * (1.0 + self.safety_margin)
+        return chosen_cost >= self.DISABLE_COST_SCALE
 
     def _select_heuristic(self, candidate_plans: list[dict]) -> int:
         costs = [p["total_cost"] for p in candidate_plans]

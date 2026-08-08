@@ -49,6 +49,7 @@ class _FakeModel:
 
 
 def _with_model(predictions, spread=None, **kwargs):
+    kwargs.setdefault("policy", "greedy")  # don't inherit SELECTION_POLICY from env
     """
     A LearnedOptimizer whose ensemble predicts `predictions`.
 
@@ -72,7 +73,7 @@ def _with_model(predictions, spread=None, **kwargs):
 
 
 def test_cold_start_falls_back_to_heuristic_when_no_pickle():
-    optimizer = LearnedOptimizer(model_path=NO_MODEL)
+    optimizer = LearnedOptimizer(model_path=NO_MODEL, policy="greedy")
     assert optimizer.model is None
 
     candidates = [_candidate(50), _candidate(10), _candidate(30)]
@@ -80,7 +81,7 @@ def test_cold_start_falls_back_to_heuristic_when_no_pickle():
 
 
 def test_heuristic_picks_minimum_cost():
-    optimizer = LearnedOptimizer(model_path=NO_MODEL)
+    optimizer = LearnedOptimizer(model_path=NO_MODEL, policy="greedy")
     candidates = [_candidate(5), _candidate(2), _candidate(9)]
     assert optimizer._select_heuristic(candidates) == 1
 
@@ -117,29 +118,44 @@ def test_select_plan_takes_a_confident_large_win():
     assert optimizer.last_decision["fell_back_to_baseline"] is False
 
 
-def test_select_plan_vetoes_candidate_far_costlier_than_native():
-    # Model loves candidate 0, but its estimated cost is 3x native's --
-    # serving it risks a regression Postgres had reason to avoid.
+def test_moderately_costlier_candidate_is_still_allowed():
+    """
+    Regression guard for the veto that used to block every real win.
+
+    PostgreSQL costing a plan *higher* than its own choice is the signal this
+    project exploits, not a reason to refuse: a candidate costed 1.8x native
+    was measured 6x faster. Ordinary cost disagreement must reach the model.
+    """
     optimizer = _with_model([100.0, 1.0, 999.0])
-    candidates = [_candidate(300), _candidate(100)]
+    candidates = [_candidate(300), _candidate(100)]  # 3x native's cost
+    baseline = _candidate(100, hint=None)
+
+    assert optimizer.select_plan(candidates, baseline_plan=baseline) is candidates[0]
+
+
+def test_disable_cost_candidate_is_vetoed():
+    """PostgreSQL prices structurally broken plans (cartesian products) at
+    disable_cost ~1e10. Those are still refused outright."""
+    optimizer = _with_model([100.0, 1.0, 999.0])
+    candidates = [_candidate(2e10), _candidate(100)]
     baseline = _candidate(100, hint=None)
 
     chosen = optimizer.select_plan(candidates, baseline_plan=baseline)
     assert chosen is baseline
-    assert optimizer.last_decision["fell_back_to_baseline"] is True
     assert optimizer.last_decision["reason"] == "predicted_regression_vs_native"
 
 
-def test_safety_margin_is_configurable():
-    candidates = [_candidate(114), _candidate(500)]
+def test_the_gate_not_the_cost_veto_is_what_restrains_selection():
+    """With the cost veto narrowed to catastrophes, the confidence gate is
+    the mechanism that keeps the optimizer honest."""
+    candidates = [_candidate(500)]
     baseline = _candidate(100, hint=None)
 
-    # 14% over native: within a 15% margin, outside a 5% one.
-    lenient = _with_model([100.0, 1.0, 999.0], safety_margin=0.15)
-    strict = _with_model([100.0, 1.0, 999.0], safety_margin=0.05)
+    confident = _with_model([100.0, 20.0], spread=[100.0, 21.0])
+    unsure = _with_model([100.0, 20.0], spread=[100.0, 180.0])
 
-    assert lenient.select_plan(candidates, baseline_plan=baseline) is candidates[0]
-    assert strict.select_plan(candidates, baseline_plan=baseline) is baseline
+    assert confident.select_plan(candidates, baseline_plan=baseline) is candidates[0]
+    assert unsure.select_plan(candidates, baseline_plan=baseline) is baseline
 
 
 # -- the confidence gate: don't deviate from native without evidence --------

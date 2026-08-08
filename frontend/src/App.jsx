@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import "./App.css";
 import {
   analyzeQuery,
+  fetchAdvisor,
   fetchModelStatus,
   fetchRegret,
   fetchSchema,
@@ -13,11 +14,13 @@ import {
 import LatencyChart from "./components/LatencyChart";
 import ModelHealth from "./components/ModelHealth";
 import OptimizedQuery from "./components/OptimizedQuery";
+import Recommendations from "./components/Recommendations";
 import ProductionRun from "./components/ProductionRun";
 import RegretChart from "./components/RegretChart";
 import SchemaPanel from "./components/SchemaPanel";
 import PlanComparison from "./components/PlanComparison";
 import QueryForm from "./components/QueryForm";
+import ServedVsNative from "./components/ServedVsNative";
 import TrendChart from "./components/TrendChart";
 
 export default function App() {
@@ -33,6 +36,7 @@ export default function App() {
   const [production, setProduction] = useState(null);
   const [productionBusy, setProductionBusy] = useState(false);
   const [lastSql, setLastSql] = useState(null);
+  const [schemaRecs, setSchemaRecs] = useState(null);
 
   async function loadTrend() {
     try {
@@ -55,6 +59,10 @@ export default function App() {
     try { setSchema(await fetchSchema()); } catch { setSchema(null); }
   }
 
+  async function loadAdvisor() {
+    try { setSchemaRecs((await fetchAdvisor()).recommendations); } catch { setSchemaRecs(null); }
+  }
+
   async function loadRegret() {
     try { setRegret(await fetchRegret()); } catch { setRegret(null); }
   }
@@ -64,6 +72,7 @@ export default function App() {
     loadModelStatus();
     loadSchema();
     loadRegret();
+    loadAdvisor();
   }, []);
 
   async function handleProductionRun() {
@@ -110,10 +119,6 @@ export default function App() {
   }
 
   const overall = trend?.overall;
-  const improvementPct =
-    overall?.native_avg_latency_ms && overall?.chosen_avg_latency_ms
-      ? (1 - overall.chosen_avg_latency_ms / overall.native_avg_latency_ms) * 100
-      : null;
 
   return (
     <>
@@ -177,6 +182,11 @@ export default function App() {
       )}
 
       <section className="card">
+        <h2>Database optimizations &mdash; fix the cause, not the symptom</h2>
+        <Recommendations queryRecs={result?.recommendations} schemaRecs={schemaRecs} />
+      </section>
+
+      <section className="card">
         <h2>Cumulative regret</h2>
         <RegretChart regret={regret} />
       </section>
@@ -187,30 +197,13 @@ export default function App() {
       </section>
 
       <section className="card">
-        <h2>Historical accuracy</h2>
+        <h2>Served vs. native &mdash; measured on matched runs</h2>
         {trendError && <div className="error-banner">{trendError}</div>}
-        {overall && (
-          <div className="stat-row" style={{ marginBottom: 16 }}>
-            <div className="stat-tile">
-              <div className="label">Native avg</div>
-              <div className="value">{overall.native_avg_latency_ms?.toFixed(1) ?? "-"} ms</div>
-            </div>
-            <div className="stat-tile">
-              <div className="label">Chosen avg</div>
-              <div className="value">{overall.chosen_avg_latency_ms?.toFixed(1) ?? "-"} ms</div>
-            </div>
-            <div className="stat-tile">
-              <div className="label">Improvement</div>
-              <div className="value" style={{ color: improvementPct > 0 ? "var(--status-good)" : "var(--text-primary)" }}>
-                {improvementPct != null ? `${improvementPct.toFixed(1)}%` : "-"}
-              </div>
-            </div>
-            <div className="stat-tile">
-              <div className="label">Logged executions</div>
-              <div className="value">{(overall.n_native ?? 0) + (overall.n_chosen ?? 0)}</div>
-            </div>
-          </div>
-        )}
+        <ServedVsNative trend={trend} />
+      </section>
+
+      <section className="card">
+        <h2>Over time</h2>
         <TrendChart byDay={trend?.by_day} />
       </section>
     </>
