@@ -1,0 +1,27 @@
+services:
+  postgres:
+    build: ./postgres
+    environment:
+      POSTGRES_DB: lqo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+      - ./data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    volumes:
+      - ./backend:/app
+
+volumes:
+  pgdata:
