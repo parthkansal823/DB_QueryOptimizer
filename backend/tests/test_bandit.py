@@ -77,7 +77,7 @@ def test_greedy_picks_lowest_mean():
     index, decision = select_index(ensemble, [[0]] * 3, policy="greedy")
     assert index == 1
     assert decision["policy"] == "greedy"
-    assert decision["predicted_latency_ms"] == 10.0
+    assert decision["predicted_score"] == 10.0
 
 
 def test_risk_averse_avoids_high_variance_candidate():
@@ -115,8 +115,8 @@ def test_thompson_does_not_explore_when_members_agree():
 def test_decision_record_exposes_all_predictions():
     ensemble = _ensemble_from([[5.0, 7.0], [5.0, 7.0]])
     _, decision = select_index(ensemble, [[0], [0]], policy="greedy")
-    assert decision["all_predicted_latency_ms"] == [5.0, 7.0]
-    assert len(decision["all_predicted_uncertainty_ms"]) == 2
+    assert decision["all_predicted_scores"] == [5.0, 7.0]
+    assert len(decision["all_predicted_uncertainty"]) == 2
 
 
 def test_unknown_policy_is_rejected():

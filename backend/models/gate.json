@@ -1,0 +1,7 @@
+{
+  "confidence_z": 0.5,
+  "min_relative_gain": 0.05,
+  "calibrated_on_n_queries": 30,
+  "expected_deviation_rate": 0.6333333333333333,
+  "expected_regression_rate": 0.0
+}

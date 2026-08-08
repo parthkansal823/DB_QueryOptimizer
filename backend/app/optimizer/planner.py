@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import time
 
-from app.optimizer.hints import apply_hint, generate_join_order_candidates
+from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
 from app.plan_extractor import get_plan
 
 
@@ -61,8 +61,16 @@ def plan_query(
     tables = baseline["tables_scanned"]
 
     candidates = []
-    for hint in generate_join_order_candidates(tables, max_candidates=max_candidates):
-        plan = get_plan(cur, apply_hint(sql, hint), analyze=False)
+    seen_plans = {plan_fingerprint(baseline)}
+    for hint in generate_candidates(tables, max_order_candidates=max_candidates):
+        try:
+            plan = get_plan(cur, apply_hint(sql, hint), analyze=False)
+        except Exception:  # noqa: BLE001 - a rejected hint is not a request failure
+            continue
+        fingerprint = plan_fingerprint(plan)
+        if fingerprint in seen_plans:
+            continue  # same plan as one already considered; not a real alternative
+        seen_plans.add(fingerprint)
         plan["hint"] = hint
         candidates.append(plan)
 

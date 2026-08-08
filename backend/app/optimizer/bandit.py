@@ -129,11 +129,16 @@ def select_index(
         scores = means
 
     index = min(range(len(scores)), key=lambda i: scores[i])
+    # Deliberately unit-free names. What the model predicts depends on how it
+    # was trained -- absolute milliseconds for older bundles, log-ratio vs.
+    # native for current ones (see train._relative_targets). Calling these
+    # "..._ms" was actively misleading once the target changed; `learned.py`
+    # attaches the target-specific interpretation.
     return index, {
         "policy": policy,
-        "predicted_latency_ms": means[index],
-        "predicted_uncertainty_ms": stds[index],
+        "predicted_score": means[index],
+        "predicted_uncertainty": stds[index],
         "score_used": scores[index],
-        "all_predicted_latency_ms": means,
-        "all_predicted_uncertainty_ms": stds,
+        "all_predicted_scores": means,
+        "all_predicted_uncertainty": stds,
     }

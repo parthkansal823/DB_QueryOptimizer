@@ -31,15 +31,29 @@ function DecisionNote({ decision }) {
   if (!decision) return null;
 
   const vetoed = decision.fell_back_to_baseline;
-  const predicted = decision.predicted_latency_ms;
-  const uncertainty = decision.predicted_uncertainty_ms;
+  // Current models predict speedup relative to native (<1.0 is faster);
+  // older bundles predicted absolute latency. Render whichever is present.
+  const speedup = decision.predicted_speedup_vs_native;
+  const pessimistic = decision.pessimistic_speedup_vs_native;
+  const required = decision.required_speedup;
+  const score = decision.predicted_score;
+  const uncertainty = decision.predicted_uncertainty;
+
+  const vetoMessage = {
+    no_confident_gain_over_native:
+      "Kept the native plan — no candidate was confidently faster than PostgreSQL's own choice.",
+    predicted_regression_vs_native:
+      "Kept the native plan — the best candidate is costed far above native's, so serving it risks a regression.",
+    regression_guard:
+      "Kept the native plan — this query has a measured history of the learned path being slower.",
+    no_candidates: "No join-order alternatives exist for this query.",
+  }[decision.reason];
 
   return (
     <div className="decision-note">
-      {vetoed && (
+      {vetoed && vetoMessage && (
         <p className="decision-veto">
-          <strong>Safety veto:</strong> the learned pick was discarded and the native plan kept
-          &mdash; its estimated cost sits too far above native&rsquo;s to risk serving.
+          <strong>Native kept:</strong> {vetoMessage}
         </p>
       )}
       <dl className="decision-facts">
@@ -49,20 +63,35 @@ function DecisionNote({ decision }) {
             <dd>{decision.policy}</dd>
           </>
         )}
-        {predicted != null && (
+        {speedup != null && (
           <>
-            <dt>Model predicted</dt>
+            <dt>Predicted vs native</dt>
             <dd>
-              {predicted.toFixed(1)} ms
-              {uncertainty != null && ` ± ${uncertainty.toFixed(1)} ms`}
+              {speedup.toFixed(2)}&times;
+              {pessimistic != null && ` (pessimistically ${pessimistic.toFixed(2)}×)`}
+            </dd>
+          </>
+        )}
+        {required != null && (
+          <>
+            <dt>Needed to deviate</dt>
+            <dd>&lt; {required.toFixed(2)}&times;</dd>
+          </>
+        )}
+        {speedup == null && score != null && (
+          <>
+            <dt>Model score</dt>
+            <dd>
+              {score.toFixed(2)}
+              {uncertainty != null && ` ± ${uncertainty.toFixed(2)}`}
             </dd>
           </>
         )}
       </dl>
-      {uncertainty != null && predicted != null && uncertainty > predicted * 0.25 && (
+      {speedup != null && pessimistic != null && pessimistic > speedup * 1.25 && (
         <p className="decision-caution">
-          High ensemble disagreement relative to the prediction &mdash; the model has thin
-          evidence here, so treat this pick as a guess.
+          Wide gap between the predicted and pessimistic speedup &mdash; the ensemble disagrees
+          here, so the model has thin evidence for this query.
         </p>
       )}
     </div>

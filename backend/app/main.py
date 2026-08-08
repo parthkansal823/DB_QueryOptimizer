@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from app import model_store, retrain
 from app.db import get_cursor
 from app.logging_store import log_execution
-from app.optimizer.hints import apply_hint, generate_join_order_candidates
+from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer.planner import optimize_and_execute
 from app.optimizer.regression_guard import RegressionGuard
@@ -105,10 +105,21 @@ def analyze_query(req: QueryRequest):
             is_baseline=True, selector_used="native",
         )
 
+        # Full action space: join orders *and* Bao-style operator toggles.
+        # Deduplicated, because most hints on a simple query re-produce the
+        # native plan -- counting those as candidates makes the action space
+        # look bigger than it is and guarantees a 0% improvement.
         candidate_plans = []
-        for hint in generate_join_order_candidates(tables):
-            hinted_query = apply_hint(req.sql, hint)
-            plan = get_plan(cur, hinted_query)
+        seen_plans = {plan_fingerprint(baseline_plan)}
+        for hint in generate_candidates(tables):
+            try:
+                plan = get_plan(cur, apply_hint(req.sql, hint))
+            except Exception:  # noqa: BLE001 - one bad hint shouldn't fail the request
+                continue
+            fingerprint = plan_fingerprint(plan)
+            if fingerprint in seen_plans:
+                continue
+            seen_plans.add(fingerprint)
             plan["hint"] = hint
             candidate_plans.append(plan)
 

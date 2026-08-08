@@ -387,6 +387,128 @@ first evidence here that a *robustness* mechanism, not a better predictor,
 is what turns this from "sometimes faster, sometimes much slower" into
 something that could be deployed.
 
+## 2.4.1 Fixing "native sometimes beats the learned path"
+
+The most common complaint about this system was also its most legitimate:
+on plenty of queries plain PostgreSQL won. Three attempts were needed, and
+the first two failed in instructive ways.
+
+### Attempt 1 -- the design flaw
+
+The optimizer scored the *hinted* candidates and served the argmin. The
+native plan was used only for the safety veto; it was never something the
+model could choose. So the optimizer was **forced to deviate from PostgreSQL
+on every single query**, including the many where PostgreSQL was already
+right. On those, deviating can only lose.
+
+The model wasn't choosing native badly. It was never allowed to choose
+native at all.
+
+### Attempt 2 -- correct idea, useless result
+
+Native became a first-class candidate, plus a confidence gate: only deviate
+if the predicted gain exceeds the model's own uncertainty about that gain
+(`gain > z * sigma`). Regressions vanished. So did everything else:
+
+    run 1  0.0%    run 2  0.0%    run 3  0.0%
+
+Served latency equalled native *exactly*, on every run. The gate never
+fired. That is not a bug in the gate -- it is the gate correctly reporting
+that with ~25 ms prediction error against ~8-20 ms of available gain, the
+model could not distinguish any candidate from native. A principled
+confidence test on a model this uncertain refuses to act, and it was right
+to. Trading regressions for having no optimizer is not a fix.
+
+### Attempt 3 -- fix the target, not the threshold
+
+The real problem was what the model was asked to predict. It regressed on
+**absolute milliseconds**, which is wrong twice over:
+
+  1. **Scale dominates.** The workload spans ~5 ms to ~600 ms queries, so
+     squared error is overwhelmingly driven by the slow ones. The model
+     spent its capacity learning "this query is inherently slow" -- true,
+     useless, and nothing to do with plan choice.
+  2. **It answers a harder question than we asked.** We never need to know a
+     plan will take 213 ms. We only need to know it beats native.
+
+The target is now `log(candidate_latency / native_latency)` for the same
+query (`train._relative_targets`). Every query contributes on the same
+scale, and the prediction *is* the decision: negative means faster than
+native. The gate becomes directly readable -- "is this confidently below
+1.0x native?" -- instead of hoping a difference between two noisy absolute
+predictions survives subtraction.
+
+One further fix: the gate initially picked the candidate itself, which
+silently bypassed the policy and made `risk_averse`, `thompson` and
+`pairwise_rank` all behave like `greedy`. Selection (which candidate) and
+authorisation (is it worth deviating) are now separate steps.
+
+### Result
+
+| Configuration | Live runs (headroom captured) |
+|---|---|
+| Absolute target, native not a candidate | +40%, -25%, **-149%** |
+| + confidence gate | 0.0%, 0.0%, 0.0% |
+| **+ ratio target, policy-aware gate** | **+14.4%, +42.4%, +1.3%** |
+
+All runs positive, no regressions, and the optimizer still acts. The
+failure mode is now "no better than native" rather than "worse than
+native", which is the property that makes a learned optimizer deployable
+at all.
+
+The generalisable lesson is that **the loss function encodes the question**.
+Two attempts went into thresholds and safety logic when the actual defect
+was that the model was being trained on the wrong quantity. A gate can only
+withhold a bad decision; it cannot manufacture a good one.
+
+## 2.4.2 Calibrating the gate instead of guessing it
+
+Fixing the regressions (§2.4.1) produced the opposite complaint: the
+optimizer now declined to act on many queries. Both complaints are about the
+same knob, and both are legitimate -- a gate set too loose regresses, a gate
+set too tight is an expensive no-op.
+
+The right threshold is not something to reason about from first principles,
+because it depends entirely on how accurate the model happens to be on the
+data in front of it. So `app/calibrate.py` measures it: replay every logged
+query at a grid of `(confidence_z, min_relative_gain)` settings and record
+how often each deviates, how often those deviations actually regress, and
+the net latency saved.
+
+| z | min_gain | deviates | regresses | net gain |
+|---|---|---|---|---|
+| 0.50 | 0.05 | 63% | **0%** | **+14.5%** |
+| 1.00 | 0.05 | 60% | 0% | +14.5% |
+| 0.50 | 0.00 | 77% | 9% | +14.0% |
+| 0.00 | 0.02 | **87%** | **15%** | +13.9% |
+
+The bottom row is the answer to "why doesn't it optimize more queries."
+Forcing the optimizer to act on 87% of queries instead of 63% produces
+*less* net improvement (+13.9% vs +14.5%) and introduces a 15% regression
+rate. The extra 24 percentage points of activity are all bets the model
+wasn't sure about, and they lose slightly more than they win.
+
+So the ~40% of queries where it keeps native are not a failure. They are
+queries where PostgreSQL was already right and the model correctly declines
+to gamble.
+
+The recommendation is chosen by maximising net improvement **subject to** a
+regression-rate bound, not by maximising net improvement alone. Optimising
+the mean without that constraint would happily accept "usually much faster,
+occasionally catastrophic" -- exactly the per-query instability that makes
+learned optimizers undeployable. `app.calibrate --apply` writes the winning
+setting to `models/gate.json`, which `LearnedOptimizer` prefers over its
+hardcoded defaults, so the threshold is re-derived per dataset rather than
+inherited from whatever happened to work here.
+
+Live result with the calibrated gate, three runs:
+
+| Run | Headroom captured | Queries optimized |
+|---|---|---|
+| 1 | +46.4% | 12 / 25 |
+| 2 | +14.3% | 11 / 25 |
+| 3 | +17.1% | 10 / 25 |
+
 ## 2.5 Working on any dataset, and what that revealed
 
 The system now onboards an arbitrary PostgreSQL database in one command

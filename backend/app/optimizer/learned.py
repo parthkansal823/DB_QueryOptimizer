@@ -37,6 +37,7 @@ selection falls back to the Phase 0 heuristic automatically.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import pickle
@@ -66,6 +67,17 @@ DEFAULT_MIN_GAIN_MS = 2.0
 DEFAULT_MIN_RELATIVE_GAIN = float(os.getenv("MIN_RELATIVE_GAIN", "0.05"))
 
 
+def _load_calibrated_gate(path: str = "models/gate.json") -> dict | None:
+    """Thresholds measured by `app.calibrate`, if a sweep has been run."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None  # a corrupt gate file must not stop the optimizer serving
+
+
 class LearnedOptimizer:
     def __init__(
         self,
@@ -89,6 +101,20 @@ class LearnedOptimizer:
         self.confidence_z = confidence_z
         self.min_gain_ms = min_gain_ms
         self.min_relative_gain = min_relative_gain
+        self.gate_calibration: dict | None = None
+
+        # A calibrated gate (written by `app.calibrate --apply`) beats the
+        # hardcoded defaults, because the right threshold depends on how
+        # accurate the model happens to be on *this* data -- it is measured,
+        # not reasoned about. Explicit constructor args still win, so tests
+        # and one-off experiments aren't silently overridden.
+        calibrated = _load_calibrated_gate()
+        if calibrated:
+            if confidence_z == DEFAULT_CONFIDENCE_Z:
+                self.confidence_z = calibrated.get("confidence_z", confidence_z)
+            if min_relative_gain == DEFAULT_MIN_RELATIVE_GAIN:
+                self.min_relative_gain = calibrated.get("min_relative_gain", min_relative_gain)
+            self.gate_calibration = calibrated
         self._rng = random.Random(seed)
         self.last_decision: dict = {}
 

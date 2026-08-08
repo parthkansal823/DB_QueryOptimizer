@@ -80,9 +80,78 @@ def generate_candidates(
     max_order_candidates: int = 8,
     include_join_methods: bool = False,
     max_method_orders: int = 4,
+    include_hint_sets: bool = True,
 ) -> list[str]:
-    """Order-only candidates, plus (opt-in) order x method candidates."""
+    """Order-only candidates, plus (opt-in) order x method, plus hint sets."""
     candidates = generate_join_order_candidates(tables, max_candidates=max_order_candidates)
     if include_join_methods and len(tables) >= 2:
         candidates += generate_join_method_candidates(tables, max_orders=max_method_orders)
+    if include_hint_sets:
+        candidates += generate_hint_sets()
     return candidates
+
+
+# -- Bao-style operator hint sets ------------------------------------------
+#
+# Join *order* alone turns out to be a weak action space. For a two-table
+# query there are only two orderings and PostgreSQL already picks the better
+# one, so every "candidate" comes back as the identical plan with the
+# identical cost -- the optimizer appears to run but cannot possibly improve
+# anything.
+#
+# Bao (SIGMOD 2021) takes a different action space: toggle whole *classes of
+# operator* off and let the planner re-plan under that restriction. Disabling
+# nested loops forces a hash or merge join throughout; disabling sequential
+# scans pushes the planner toward indexes. Each toggle produces a genuinely
+# different plan with a genuinely different cost, which is what gives the
+# model something to choose between.
+#
+# These are `Set()` hints on planner GUCs, which pg_hint_plan applies for the
+# duration of the statement. PostgreSQL never truly *disables* an operator --
+# it prices it at disable_cost (~1e10) -- so a plan is always producible even
+# if every listed operator is off. That is why no combination here can fail.
+HINT_SETS: tuple[tuple[str, ...], ...] = (
+    ("enable_nestloop",),
+    ("enable_hashjoin",),
+    ("enable_mergejoin",),
+    ("enable_seqscan",),
+    ("enable_indexscan",),
+    ("enable_nestloop", "enable_mergejoin"),      # -> hash joins
+    ("enable_hashjoin", "enable_mergejoin"),      # -> nested loops
+    ("enable_nestloop", "enable_hashjoin"),       # -> merge joins
+    ("enable_nestloop", "enable_seqscan"),
+    ("enable_hashjoin", "enable_seqscan"),
+    ("enable_mergejoin", "enable_seqscan"),
+    ("enable_material",),
+)
+
+
+def generate_hint_sets(hint_sets: tuple[tuple[str, ...], ...] = HINT_SETS) -> list[str]:
+    """One hint string per operator combination to disable."""
+    return [
+        "/*+ " + " ".join(f"Set({flag} off)" for flag in flags) + " */"
+        for flags in hint_sets
+    ]
+
+
+def plan_fingerprint(plan: dict) -> tuple:
+    """
+    A structural identity for a plan, used to drop candidates that came back
+    identical to one already seen.
+
+    Without this, most "candidates" for a simple query are byte-identical to
+    the native plan -- the optimizer then spends its time choosing between
+    copies of the same thing and reports a 0% improvement it never had a
+    chance to earn. Deduplicating makes the real size of the action space
+    visible instead of hiding it behind a candidate count.
+    """
+    def walk(node):
+        children = tuple(walk(c) for c in node.get("Plans", []))
+        return (
+            node.get("Node Type"),
+            node.get("Relation Name") or node.get("Alias"),
+            node.get("Join Type"),
+            children,
+        )
+
+    return walk(plan.get("raw_plan", plan))

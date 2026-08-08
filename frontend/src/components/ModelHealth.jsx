@@ -1,13 +1,22 @@
 import { useState } from "react";
 
 function VersionRow({ version }) {
+  const m = version.metrics ?? {};
+  // Current models are scored in log-ratio space, so report the typical
+  // multiplicative error (1.15 = "usually within 15%"). Older bundles carry
+  // an absolute millisecond MAE instead.
+  const accuracy =
+    m.test_typical_multiplicative_error != null
+      ? `±${((m.test_typical_multiplicative_error - 1) * 100).toFixed(0)}%`
+      : m.test_mae_ms != null
+        ? `${m.test_mae_ms.toFixed(1)} ms`
+        : "-";
+
   return (
     <tr>
       <td className="mono">{version.version_id}</td>
       <td>{version.promoted ? <span className="badge badge-chosen">serving</span> : ""}</td>
-      <td className="mono">
-        {version.metrics?.test_mae_ms != null ? `${version.metrics.test_mae_ms.toFixed(1)} ms` : "-"}
-      </td>
+      <td className="mono">{accuracy}</td>
     </tr>
   );
 }
@@ -108,7 +117,7 @@ export default function ModelHealth({ status, onRetrain, onRollback, busy }) {
                 <tr>
                   <th>Version</th>
                   <th>Status</th>
-                  <th>Test MAE</th>
+                  <th>Typical error</th>
                 </tr>
               </thead>
               <tbody>

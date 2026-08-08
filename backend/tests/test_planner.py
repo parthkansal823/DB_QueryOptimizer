@@ -5,18 +5,27 @@ class _RecordingCursor:
     """Records every EXPLAIN issued so a test can assert how many plans were
     actually *executed* versus merely planned."""
 
+    # Plans must differ between calls, because the planner deduplicates
+    # candidates by structure -- a hint that reproduces an already-seen plan
+    # is not a real alternative and is correctly discarded.
+    _JOIN_TYPES = ["Hash Join", "Nested Loop", "Merge Join"]
+
     def __init__(self):
         self.queries = []
+        self._calls = 0
 
     def execute(self, sql):
         self.queries.append(sql)
 
     def fetchone(self):
+        node_type = self._JOIN_TYPES[self._calls % len(self._JOIN_TYPES)]
+        scan_type = "Seq Scan" if self._calls % 2 else "Index Scan"
+        self._calls += 1
         return (
             [
                 {
                     "Plan": {
-                        "Node Type": "Hash Join",
+                        "Node Type": node_type,
                         "Join Type": "Inner",
                         "Total Cost": 100.0,
                         "Startup Cost": 0.0,
@@ -24,7 +33,7 @@ class _RecordingCursor:
                         "Plan Rows": 10,
                         "Plan Width": 8,
                         "Plans": [
-                            {"Node Type": "Seq Scan", "Relation Name": "orders", "Alias": "o",
+                            {"Node Type": scan_type, "Relation Name": "orders", "Alias": "o",
                              "Plan Rows": 10, "Plan Width": 8},
                             {"Node Type": "Seq Scan", "Relation Name": "users", "Alias": "u",
                              "Plan Rows": 10, "Plan Width": 8},

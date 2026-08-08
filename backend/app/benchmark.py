@@ -22,7 +22,7 @@ import argparse
 from app.db import get_cursor
 from app.logging_store import log_execution
 from app.optimizer.bandit import POLICIES
-from app.optimizer.hints import apply_hint, generate_join_order_candidates
+from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer.regression_guard import RegressionGuard
 from app.plan_extractor import get_plan
@@ -55,9 +55,19 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
             tables = baseline["tables_scanned"]
 
             candidates = []
-            for hint in generate_join_order_candidates(tables):
-                hinted = apply_hint(sql, hint)
-                plan = get_plan(cur, hinted)
+            seen_plans = {plan_fingerprint(baseline)}
+            for hint in generate_candidates(tables):
+                cur.execute("SAVEPOINT cand")
+                try:
+                    plan = get_plan(cur, apply_hint(sql, hint))
+                    cur.execute("RELEASE SAVEPOINT cand")
+                except Exception:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT cand")
+                    continue
+                fingerprint = plan_fingerprint(plan)
+                if fingerprint in seen_plans:
+                    continue
+                seen_plans.add(fingerprint)
                 plan["hint"] = hint
                 candidates.append(plan)
 
@@ -100,11 +110,15 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
                 print("safety veto: learned pick discarded, kept native plan")
             elif served_plan.get("hint"):
                 print(f"hint used: {served_plan['hint']}")
-            if decision.get("predicted_latency_ms") is not None:
+            if decision.get("predicted_speedup_vs_native") is not None:
                 print(
-                    f"model predicted {decision['predicted_latency_ms']:.1f} ms "
-                    f"(+/- {decision['predicted_uncertainty_ms']:.1f} ms ensemble spread)"
+                    f"model predicted {decision['predicted_speedup_vs_native']:.2f}x native "
+                    f"(pessimistically {decision['pessimistic_speedup_vs_native']:.2f}x, "
+                    f"needs < {decision['required_speedup']:.2f}x to deviate)"
                 )
+            elif decision.get("predicted_score") is not None:
+                print(f"model score {decision['predicted_score']:.2f} "
+                      f"(+/- {decision['predicted_uncertainty']:.2f})")
             print()
 
     headroom = native_total - oracle_total

@@ -123,7 +123,7 @@ heuristic in action -- it works with no model too):
 docker compose exec backend python -m app.collect_data   # Phase 1: populate plan_execution_log
 docker compose exec backend python -m app.train           # Phase 3: train + evaluate models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark        # Phase 4: native vs. learned, full workload
-docker compose exec backend pytest                         # backend test suite (91 tests)
+docker compose exec backend pytest                         # backend test suite (155 tests)
 ```
 
 Compare selection policies, or the regression guard, directly:
@@ -137,6 +137,7 @@ docker compose exec backend python -m app.benchmark --no-guard      # A/B the gu
 Drive the self-learning loop (also available as buttons on the dashboard):
 
 ```bash
+docker compose exec backend python -m app.calibrate --apply    # measure + apply the best confidence gate
 docker compose exec backend python -m app.retrain --status     # deployed version, unlearned feedback
 docker compose exec backend python -m app.retrain              # retrain if enough new data, gate, maybe promote
 docker compose exec backend python -m app.retrain --rollback   # restore the previous model version
@@ -219,12 +220,32 @@ oracle 919 ms on held-out queries) and this system captures none of it,
 because 194 executions across 8 queries cannot teach a 17-table join space.
 `docs/JOB_RESULTS.md` quantifies the gap rather than hiding it.
 
-**What made it deployable was robustness, not a better predictor.** Adding a
-per-query regression guard — which blocks the learned path for queries with
-a measured history of running slower than native — moved mean captured
-headroom from **+2% to +29%** across paired runs, and more importantly
-eliminated the negative runs entirely (worst guarded run +13.6%; worst
-unguarded run −23.7%). Details and the honest sample-size caveat in §2.4.
+**It no longer loses to native.** The original design forced the optimizer
+to deviate from PostgreSQL on *every* query — the native plan was never
+something the model could choose — so on the many queries Postgres already
+got right, deviating could only lose. Native is now a first-class candidate,
+the model predicts **speedup relative to native** rather than absolute
+milliseconds, and it only deviates when the predicted win exceeds its own
+uncertainty. Live runs went from `+40%, −25%, −149%` to `+14%, +42%, +1%` —
+all positive. §2.4.1 documents the two attempts that failed first.
+
+**It optimizes ~44% of queries, and that's deliberate.** For the rest it
+keeps PostgreSQL's plan, because the model isn't confident enough to gamble.
+That threshold is *measured*, not guessed — `python -m app.calibrate` sweeps
+it against your own logged outcomes:
+
+| Setting | Deviates | Regresses | Net gain |
+|---|---|---|---|
+| calibrated | 63% | **0%** | **+14.5%** |
+| forced to act more | 87% | 15% | +13.9% |
+
+Making it optimize more queries produces *less* net improvement and starts
+regressing — the extra activity is all bets the model wasn't sure about.
+
+**Robustness mattered more than prediction quality.** A per-query regression
+guard — blocking the learned path for queries with a measured history of
+running slower — moved mean captured headroom from **+2% to +29%** across
+paired runs and eliminated the negative runs (§2.4).
 
 Three findings behind those numbers are worth more than the numbers:
 

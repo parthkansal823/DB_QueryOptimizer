@@ -100,7 +100,7 @@ def test_last_decision_records_policy_and_prediction():
     optimizer = _with_model([9.0, 3.0])
     optimizer.select([_candidate(10), _candidate(20)])
     assert optimizer.last_decision["policy"] == "greedy"
-    assert optimizer.last_decision["predicted_latency_ms"] == 3.0
+    assert optimizer.last_decision["predicted_score"] == 3.0
 
 
 # -- safety fallback (Bao's "never much worse than native" property) --------
