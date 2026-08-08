@@ -5,6 +5,7 @@ __pycache__/
 node_modules/
 .venv/
 dist/
+.trunk/
 
 # JOB/IMDB stretch goal: large downloaded dataset + its own git clone --
 # fetched via the steps in data/job/README.md, not tracked here.
