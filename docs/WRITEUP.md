@@ -1,74 +1,83 @@
 # Writeup: literature review, results, and limitations
 
-This document covers what `docs/ROADMAP.md`'s Phase 5 asks for: how this
-project relates to the published learned-query-optimization literature, what
-the evaluation actually showed, and an honest account of where it falls
-short. See `README.md` for architecture and quickstart.
+This document covers what Phase 5 of `docs/ROADMAP.md` asks for: how this
+project relates to the published research on learned query optimization, what
+the evaluation actually showed, and an honest account of where it falls short.
+See `README.md` for the architecture and how to run it, `docs/DASHBOARD.md`
+for the dashboard, and `docs/METRICS.md` for how each number is worked out.
 
 ## 1. Literature review
 
-Query optimization -- picking an execution plan for a declarative query --
-has been cost-based and hand-tuned since System R. The systems below
-represent three different answers to "what should replace, or augment, the
-cost-based optimizer's choice."
+Query optimization means picking an execution plan for a declarative query.
+It has been cost-based and hand-tuned since System R. The systems below give
+three different answers to one question: what should replace, or add to, the
+cost-based optimizer's choice?
 
-**Native Postgres (cost-based optimizer, CBO).** Dynamic programming over
-join orders for small queries (falling back to a genetic algorithm, GEQO,
-past `geqo_threshold` tables), driven by selectivity estimates from
-per-column histograms and independence assumptions across predicates. No
-training required and well-tuned over decades, but the independence
-assumption breaks down under correlated predicates and data skew --
-cardinality estimation errors compound multiplicatively across joins. This
-is precisely the failure mode documented in Leis et al., ["How Good Are
-Query Optimizers, Really?"](http://www.vldb.org/pvldb/vol9/p204-leis.pdf)
-(VLDB 2015) -- the paper that introduced the Join Order Benchmark this
-project's stretch goal loads (Section 4).
+**Native Postgres (cost-based optimizer, CBO).** Uses dynamic programming
+over join orders for small queries, falling back to a genetic algorithm
+(GEQO) past `geqo_threshold` tables. It is driven by selectivity estimates
+from per-column histograms, and it assumes filters are independent of each
+other. It needs no training and has been tuned for decades. But the
+independence assumption breaks down when filters are correlated or the data is
+skewed, and row-count errors then multiply across joins. This is exactly the
+failure mode documented in Leis et al., ["How Good Are Query Optimizers,
+Really?"](http://www.vldb.org/pvldb/vol9/p204-leis.pdf) (VLDB 2015), the paper
+that introduced the Join Order Benchmark this project's stretch goal loads
+(Section 4).
 
 **Neo** (Marcus et al., ["Neo: A Learned Query Optimizer"](https://arxiv.org/abs/1904.03711),
-VLDB 2019). Builds a full plan bottom-up with a neural network (a tree-convolutional
-value network) trained via experience replay against real execution latency,
-bootstrapped from an existing optimizer's plans and then improving through
-exploration. Action space: essentially everything a classical optimizer
-controls -- join order, join method, access path -- learned end to end.
-Highest ceiling of the three, but the largest action space also means the
-slowest convergence, the most execution feedback needed, and the least
-interpretable failure mode: a bad exploration step can regress badly before
-the model corrects.
+VLDB 2019). Builds a full plan from the bottom up with a neural network, a
+tree-convolutional value network trained by experience replay against real
+execution time. It starts from an existing optimizer's plans and improves
+through exploration. Its action space covers essentially everything a
+classical optimizer controls, learned end to end: join order, join method and
+access path. That gives it the highest ceiling of the three. It also makes it
+the slowest to converge, the hungriest for execution feedback, and the hardest
+to debug when it fails, because a bad exploration step can regress badly
+before the model corrects itself.
 
 **Bao** (Marcus et al., ["Bao: Making Learned Query Optimization
-Practical"](https://arxiv.org/abs/2004.03814), SIGMOD 2021). Reframes the
-problem as a contextual bandit over a small, fixed set of coarse-grained
-query hints (~48 hint-sets in the paper, each toggling whole classes of
-operators on/off), using a tree-convolutional network to predict which
-hint-set will produce the best plan for a given query, with Thompson
-sampling for exploration and a safe fallback to the native optimizer. The
-small, bounded action space is the whole point: it makes the system safe to
-run in production (worst case, you get a plan the native optimizer could
-have produced anyway) and fast to retrain. **This project follows Bao's
-framing directly** -- hints over full plan construction -- but narrows the
-action space further (join order, plus join method as a stretch goal,
-instead of Bao's operator-class toggles) and replaces the contextual bandit
-with a simpler regression model, trading Bao's online regret bounds for
-something easier to train and explain with a small amount of data.
+Practical"](https://arxiv.org/abs/2004.03814), SIGMOD 2021). Treats the
+problem as a contextual bandit over a small, fixed set of coarse query hints:
+about 48 hint-sets in the paper, each switching whole classes of operators on
+or off. A tree-convolutional network predicts which hint-set will give the
+best plan for a query, with Thompson sampling for exploration and a safe
+fallback to the native optimizer.
 
-**This project.** Candidates are `pg_hint_plan` `Leading()` join-order hints
-(exhaustive permutation for <=5 tables, random sampling above that -- a
-named limitation, see below), extended for the stretch goal with forced
-join-method hints (`HashJoin`/`NestLoop`/`MergeJoin`) applied at every
-prefix of the join order. Each candidate is featurized two ways: per-table
-slots (selectivity, join position, scan type) and *plan-tree structure*
-(depth, bushiness, estimated intermediate-result blowup, operator mix --
-`backend/app/optimizer/plan_tree.py`), the latter being a cheap stand-in for
-the tree convolution Neo and Bao use. Selection is a **bootstrapped
-ensemble** of LightGBM regressors (`backend/app/optimizer/bandit.py`),
-which supports three policies -- `greedy` (argmin of the mean),
-`thompson` (sample one ensemble member per decision: Bao's bootstrapped
-Thompson sampling, giving genuine exploration), and `risk_averse` (argmin
-of mean + λ·σ, penalising plans the ensemble disagrees about). A **safety
-veto** discards any learned pick the planner costs far above the native
-plan, so the system cannot knowingly serve a large regression -- Bao's
-central practical claim. Cold start falls back to the Phase 0 heuristic
-(lowest Postgres-*estimated* cost) until a model has been trained.
+The small, bounded action space is the whole point. It makes the system safe
+to run in production, because the worst case is a plan the native optimizer
+could have produced anyway, and it makes retraining fast. **This project
+follows Bao's framing directly**, choosing among hints rather than building
+plans. It narrows the action space further, to join order plus join method as
+a stretch goal instead of Bao's operator-class toggles, and swaps the
+contextual bandit for a simpler regression model. That trades Bao's online
+regret bounds for something easier to train and explain on a small amount of
+data.
+
+**This project.** Candidates come from `pg_hint_plan` `Leading()`
+join-order hints: every permutation for 5 tables or fewer, random sampling
+above that (a named limitation, see below). The stretch goal adds forced
+join-method hints (`HashJoin`, `NestLoop`, `MergeJoin`) at every prefix of the
+join order.
+
+Each candidate is featurized two ways. Per-table slots carry selectivity, join
+position and scan type. *Plan-tree structure* carries depth, bushiness,
+estimated blowup of intermediate results, and operator mix
+(`backend/app/optimizer/plan_tree.py`). The second is a cheap stand-in for the
+tree convolution Neo and Bao use.
+
+Selection uses a **bootstrapped ensemble** of LightGBM regressors
+(`backend/app/optimizer/bandit.py`) with three policies: `greedy` takes the
+argmin of the mean; `thompson` samples one ensemble member per decision, which
+is Bao's bootstrapped Thompson sampling and gives real exploration; and
+`risk_averse` takes the argmin of mean + λ·σ, penalising plans the ensemble
+disagrees about.
+
+A **safety veto** throws out any learned pick the planner costs far above the
+native plan, so the system cannot knowingly serve a large regression. That is
+Bao's central practical claim. On a cold start it falls back to the Phase 0
+heuristic, the lowest Postgres-*estimated* cost, until a model has been
+trained.
 
 | | Native Postgres CBO | Neo | Bao | This project |
 |---|---|---|---|---|
@@ -88,7 +97,7 @@ central practical claim. Cold start falls back to the Phase 0 heuristic
 ### 2.0 A correctness bug that invalidated an earlier set of results
 
 Worth recording, because it is the single most important thing this project
-learned and because the failure was **silent**.
+learned, and because the failure was **silent**.
 
 `pg_hint_plan` installs its planner hooks when the library is *loaded*, so
 it must appear in `shared_preload_libraries`. `postgres/init/01_extensions.sql`
@@ -98,10 +107,10 @@ wrapped queries as `EXPLAIN (...) /*+ Leading(...) */ SELECT ...`, putting
 the hint *after* the `EXPLAIN` keyword, where pg_hint_plan does not look for
 it.
 
-Either bug alone is enough to make every hint a no-op. And a hint that
-cannot be applied is just a SQL comment -- it raises nothing, warns nothing.
-The pipeline ran happily and produced plausible-looking numbers for the
-entire candidate set while **every "candidate" was byte-identical to the
+Either bug on its own is enough to make every hint do nothing. And a hint
+that cannot be applied is just a SQL comment: it raises no error and prints no
+warning. The pipeline ran happily and produced believable numbers for the
+whole candidate set, while **every "candidate" was byte-identical to the
 native plan**. The measured "improvements" were run-to-run timing noise.
 
 The tell was that all 8 candidates for a 4-table query reported the exact
@@ -113,10 +122,10 @@ guards the regression. Data collection time went from 51s to 366s once the
 hints actually bound -- candidates were finally *different plans*, some of
 them slow. **Everything in §2.1/§2.2 below is from after the fix.**
 
-The generalisable lesson: an experiment whose treatment silently does
-nothing still produces a full set of numbers. Verifying that the
-intervention *changed anything at all* (here: do candidate plans differ
-from each other?) belongs in the pipeline, not in a reviewer's intuition.
+The general lesson: an experiment whose treatment silently does nothing
+still produces a full set of numbers. Checking that the intervention *changed
+anything at all* (here, do the candidate plans actually differ?) belongs in
+the pipeline, not in a reviewer's intuition.
 
 ### 2.1 Offline evaluation (`app.train`, query-level held-out split)
 
@@ -143,21 +152,22 @@ only difference is repetitions per candidate (`--reps 1` vs `--reps 3`):
 Model: bootstrapped ensemble of 8 LightGBM regressors, 41 features, split at
 the query level (6 held-out queries).
 
-Tripling the repetitions nearly halved prediction error. `risk_averse` --
-which penalises candidates the ensemble disagrees about -- consistently
-beats `greedy`, which is what theory predicts when a model is accurate on
-average but unreliable in places: distrusting your own high-variance
-predictions is worth more than chasing their minimum. `thompson` trailing
-both is also expected -- it *spends* performance to gather information,
-which is the trade exploration makes.
+Tripling the repetitions nearly halved the prediction error. `risk_averse`,
+which penalises candidates the ensemble disagrees about, consistently beats
+`greedy`. That is what theory predicts when a model is accurate on average but
+unreliable in places: distrusting your own high-variance predictions is worth
+more than chasing their minimum. `thompson` trailing both is expected too. It
+*spends* performance to gather information, which is the trade exploration
+makes.
 
-**A fourth selector: pairwise ranking.** Given that prediction error is
-comparable to the spread between candidates, predicting absolute latency is
-harder than the problem requires. `optimizer/ranker.py` implements the Lero
-(VLDB 2023) approach instead -- a classifier trained on *pairs* of
-same-query candidates answering only "is A faster than B?", scored at
-inference by how many pairwise duels each candidate wins. On median-
-aggregated labels it is the strongest offline selector:
+**A fourth selector: pairwise ranking.** Prediction error here is about as
+large as the spread between candidates, which means predicting absolute
+latency is a harder problem than we actually need to solve.
+`optimizer/ranker.py` uses the Lero (VLDB 2023) approach instead: a classifier
+trained on *pairs* of candidates from the same query, answering only "is A
+faster than B?". At inference each candidate is scored by how many pairwise
+duels it wins. On median-aggregated labels it is the strongest offline
+selector:
 
 | Selector | Headroom captured (held-out) |
 |---|---|
@@ -167,17 +177,18 @@ aggregated labels it is the strongest offline selector:
 | **`pairwise_rank`** | **+46%** |
 
 Worth noting honestly: `pairwise_rank` has the best *average* latency but
-the lowest beats-the-heuristic *rate* (33% of queries). It wins big when it
-wins and loses often but cheaply -- a different risk profile from
-`risk_averse` (83% win rate, smaller average gain), and which you'd prefer
-depends on whether you care about mean latency or per-query predictability.
+the lowest rate of beating the heuristic, at 33% of queries. It wins big when
+it wins, and loses often but cheaply. That is a different risk profile from
+`risk_averse`, which wins on 83% of queries for a smaller average gain. Which
+you prefer depends on whether you care about mean latency or about per-query
+predictability.
 
 ### 2.2 Live benchmark: the instability, and what fixed it
 
-Re-running the full workload live (`app.benchmark`) is the real test, since
-it re-executes every plan rather than replaying logged timings. Three runs
-per policy, share of oracle headroom captured (negative = worse than plain
-native):
+Re-running the full workload live (`app.benchmark`) is the real test,
+because it re-executes every plan instead of replaying logged timings. Three
+runs per policy, showing the share of oracle headroom captured (negative means
+worse than plain native):
 
 **Before median aggregation** (training on single-execution labels):
 
@@ -199,57 +210,57 @@ query/hint's repeated executions to their median before training):
 **Every run is now positive, averaging ~26% of oracle headroom, with no
 regressions.** The catastrophic -148.8% outlier is gone.
 
-This is the most useful result in the project, and it is a *data* fix rather
-than a model fix. Training on single noisy executions taught the model that
-whichever candidate got the luckiest timing was genuinely fastest; it then
-confidently served those plans and sometimes lost badly. Taking the median
-of three executions per candidate removed that failure mode entirely. The
-model architecture did not change.
+This is the most useful result in the project, and it is a *data* fix, not a
+model fix. Training on single noisy executions taught the model that whichever
+candidate got the luckiest timing was genuinely the fastest. It then served
+those plans confidently, and sometimes lost badly. Taking the median of three
+executions per candidate removed that failure mode completely. The model
+architecture did not change at all.
 
-This connects directly to the current research direction on learned
-optimizers: recent work targets the *per-query instability* that makes
-learned optimizers hard to deploy, since an optimizer that is 30% faster on
-average but occasionally 150% slower is unshippable. The evidence here says
-a meaningful share of that instability can be measurement noise in the
-training labels rather than anything intrinsic to the policy.
+This connects directly to where the research is heading. Recent work targets
+the *per-query instability* that makes learned optimizers hard to deploy: an
+optimizer that is 30% faster on average but occasionally 150% slower cannot be
+shipped. The evidence here says a meaningful share of that instability can be
+measurement noise in the training labels, rather than anything inherent to the
+policy.
 
 ### 2.2.1 Offline evaluation is optimistically biased
 
-One caveat that survives the fix. §2.1's offline numbers are computed by
-replaying *logged* latencies: for a held-out query the selector picks among
-candidate latencies measured once each, and is scored against those same
-recorded numbers. So it is rewarded partly for identifying which candidate
-got the luckiest measurement. The oracle column shares the bias -- "best
-possible" is really "best single sample observed."
+One caveat survives the fix. The offline numbers in §2.1 are computed by
+replaying *logged* latencies. For a held-out query, the selector picks among
+candidate latencies that were each measured once, and is then scored against
+those same recorded numbers. So it gets rewarded partly for spotting which
+candidate got the luckiest measurement. The oracle column shares the bias:
+"best possible" really means "best single sample observed."
 
 Live re-execution consistently comes in below the offline estimate. **A
-query-level train/test split does not fix this**: the split prevents leakage
+query-level train/test split does not fix this.** The split stops leakage
 *between* queries, but the noise lives *inside* each query's candidate
 measurements. Only re-execution measures the thing that matters.
 
-The general lesson, which applies well beyond this project: when label noise
-is comparable to the effect you are trying to measure, held-out evaluation
-on logged outcomes will flatter you. Only re-execution tests the thing you
-actually care about.
+The general lesson goes well beyond this project. When label noise is as
+large as the effect you are trying to measure, held-out evaluation on logged
+outcomes will flatter you. Only re-execution tests what you actually care
+about.
 
-The safety veto fired on 2-5 of 25 queries per run, doing real work: with
-hints binding, some forced join orders carry Postgres's `disable_cost`
-penalty (~1e10, signalling a cartesian product), and those are discarded
-before execution rather than served.
+The safety veto fired on 2 to 5 of the 25 queries per run, and it was doing
+real work. Now that hints bind, some forced join orders carry Postgres's
+`disable_cost` penalty of about 1e10, which signals a cartesian product. Those
+are thrown out before execution rather than served.
 
-### 2.3 Where this leaves things
+### 2.2.2 Where this leaves things
 
-**On the synthetic schema it works**: every live run beats native
-PostgreSQL, averaging ~26% of available oracle headroom with no regressions
-(§2.2). The honest qualifiers are that the workload is small (25 queries),
-the absolute headroom is modest (~8 ms/query), and the measurement
-environment is a laptop.
+**On the synthetic schema it works.** Every live run beats native
+PostgreSQL, averaging about 26% of the available oracle headroom with no
+regressions (§2.2). The honest qualifiers: the workload is small at 25
+queries, the absolute headroom is modest at roughly 8 ms per query, and the
+measurements were taken on a laptop.
 
-**On the real JOB benchmark it does not** (`docs/JOB_RESULTS.md`): 75% of
-latency is available there and the system captures none of it, because 194
-executions across 8 queries cannot teach a 17-table join space. This is the
-more informative of the two results -- it quantifies how far the system is
-from the regime the literature operates in.
+**On the real JOB benchmark it does not** (`docs/JOB_RESULTS.md`). There,
+75% of the latency is available and the system captures none of it, because
+194 executions across 8 queries cannot teach a 17-table join space. This is
+the more informative of the two results: it puts a number on how far the
+system is from the scale the research operates at.
 
 What the evidence says to do next, in priority order:
 
@@ -269,32 +280,35 @@ What the evidence says to do next, in priority order:
    justify the capacity.
 
 The `headroom_captured_vs_oracle` metric is what makes any of this
-diagnosable -- without an oracle column, "3% better than native" is
-unreadable.
+diagnosable. Without an oracle column, "3% better than native" tells you
+nothing about whether 3% was all there was or a small slice of a large
+opportunity.
 
 ### 2.3 JOB/IMDB stretch goal
 
-The real 21-table, ~74.5M-row IMDB dataset was downloaded and imported in
-full (`data/job/load_job.sh`). A smoke test -- 8 real JOB queries through
-the unmodified `app.collect_data`/`app.train` pipeline, `DATABASE_URL`
-repointed at the `job` database, zero code changes -- confirmed the whole
-pipeline works against it: `schema_introspection` discovered all 21 real
-tables automatically, and both the heuristic and the trained model
-correctly deferred to Postgres's own plan on both held-out queries (i.e.
-no regression, though 2 held-out queries is too small a sample to claim
-more than that). Full details, honestly including what a complete JOB
-evaluation would still need (all 113 queries, more reps, join-method
-candidates enabled): `docs/JOB_RESULTS.md`. Load procedure:
-`data/job/README.md`. Why the pipeline needed no code changes: Section 3
-below.
+The real 21-table, roughly 74.5M-row IMDB dataset was downloaded and
+imported in full (`data/job/load_job.sh`). A smoke test then ran 8 real JOB
+queries through the unchanged `app.collect_data` and `app.train` pipeline,
+with `DATABASE_URL` pointed at the `job` database and zero code changes.
+
+It confirmed the pipeline works against a real research benchmark:
+`schema_introspection` found all 21 tables automatically, and both the
+heuristic and the trained model kept Postgres's own plan on both held-out
+queries. So there was no regression, though two held-out queries is too small
+a sample to claim anything more than that.
+
+`docs/JOB_RESULTS.md` has the full details, including what a complete JOB
+evaluation would still need: all 113 queries, more repetitions, and
+join-method candidates enabled. `data/job/README.md` has the load procedure,
+and Section 3 explains why the pipeline needed no code changes.
 
 ## 2.4 Closing the loop: a system that actually keeps learning
 
-Everything above describes a system that is *trained*, then *serves*. That
-is not what "self-learning" means, and the gap was the honest limitation
-this document previously carried: Thompson sampling explored, but nothing
-ever learned from what the exploration found. Feedback accumulated in
-`plan_execution_log` until a human reran `app.train`.
+Everything above describes a system that is *trained*, and then *serves*.
+That is not what "self-learning" means, and the gap was an honest limitation
+this document used to carry. Thompson sampling explored, but nothing ever
+learned from what it found. Feedback piled up in `plan_execution_log` until a
+human reran `app.train`.
 
 Three components close it. All three are motivated by measurements above
 rather than by a feature list.
