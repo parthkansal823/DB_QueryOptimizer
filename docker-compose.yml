@@ -11,17 +11,37 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d
       - ./data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql
+      # Read-only: lets `data/job/load_job.sh` COPY the JOB/IMDB CSVs
+      # (stretch goal) straight from the container, no `docker cp` needed.
+      - ./data/job:/job_data:ro
 
   backend:
     build: ./backend
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo
+      FRONTEND_ORIGIN: http://localhost:5173
     ports:
       - "8000:8000"
     depends_on:
       - postgres
     volumes:
       - ./backend:/app
+      # Read-only: lets app.collect_data_job read the real JOB query files
+      # (stretch goal) without duplicating them into backend/.
+      - ./data/job/queries:/job_queries:ro
+
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
 
 volumes:
   pgdata:
+  frontend_node_modules:

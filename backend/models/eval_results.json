@@ -1,0 +1,15 @@
+{
+  "model_backend": "lightgbm",
+  "n_rows_total": 741,
+  "n_rows_train": 543,
+  "n_rows_test": 198,
+  "test_mae_ms": 14.308353370486302,
+  "n_tables_in_schema": 4,
+  "n_held_out_queries": 6,
+  "avg_latency_ms": {
+    "native": 93.76966666666665,
+    "heuristic": 95.31400000000001,
+    "learned": 92.471
+  },
+  "model_beats_or_ties_heuristic_rate": 1.0
+}

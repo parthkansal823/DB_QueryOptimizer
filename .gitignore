@@ -4,3 +4,10 @@ __pycache__/
 *.pkl
 node_modules/
 .venv/
+dist/
+
+# JOB/IMDB stretch goal: large downloaded dataset + its own git clone --
+# fetched via the steps in data/job/README.md, not tracked here.
+data/job/imdb.tgz
+data/job/csv/
+data/job/queries/

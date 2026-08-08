@@ -31,6 +31,7 @@ def get_plan(cursor, query: str, analyze: bool = True) -> dict:
         "node_type": plan.get("Node Type"),
         "join_types": _extract_join_types(plan),
         "tables_scanned": _extract_tables(plan),
+        "scan_relations": _extract_scan_relations(plan),
     }
 
 
@@ -57,3 +58,24 @@ def _extract_tables(plan: dict) -> list[str]:
     for child in plan.get("Plans", []):
         tables.extend(_extract_tables(child))
     return tables
+
+
+def _extract_scan_relations(plan: dict) -> dict[str, str]:
+    """
+    alias -> real table name, straight from the plan Postgres just ran.
+
+    This is what lets the feature layer (`optimizer/features.py`) work
+    against *any* schema with zero per-dataset config: it never has to
+    guess which table an alias like "o" or "mi1" refers to, because
+    Postgres already told us in the same EXPLAIN output. (Self-joins that
+    reuse the same table under two aliases collapse to that table's last
+    occurrence here -- a documented limitation, not a bug: see
+    `features.py`.)
+    """
+    relations: dict[str, str] = {}
+    if "Relation Name" in plan:
+        alias = plan.get("Alias", plan["Relation Name"])
+        relations[alias] = plan["Relation Name"]
+    for child in plan.get("Plans", []):
+        relations.update(_extract_scan_relations(child))
+    return relations
