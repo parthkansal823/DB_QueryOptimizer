@@ -323,40 +323,40 @@ the deployed model was trained, and if there is enough new feedback:
    *same* held-out queries.
 3. Promotes only if the challenger wins by more than a margin (default 2%).
 
-The margin is the important part, and §2.2.1 is why it exists. Offline
-evaluation here is noisy and optimistically biased; promoting on *any*
-measured improvement would mean promoting on noise roughly half the time,
-and the model would random-walk rather than improve. Requiring a clear
-margin makes the ratchet one-directional in expectation.
+The margin is the important part, and §2.2.1 explains why it exists.
+Offline evaluation here is noisy and biased towards optimism. Promoting on
+*any* measured improvement would mean promoting on noise about half the time,
+and the model would wander rather than improve. Requiring a clear margin makes
+the ratchet turn one way.
 
-Verified end to end: the first retrain promoted (no incumbent to compare
-against), and the immediately following retrain was **rejected** --
-`"challenger improved by 0.0%, below the 2% bar"`. The system declines to
-replace a model with a statistically indistinguishable one, which is the
-behaviour that makes unattended retraining safe.
+Checked end to end: the first retrain promoted, since there was no
+incumbent to compare against, and the very next retrain was **rejected** with
+`"challenger improved by 0.0%, below the 2% bar"`. The system refuses to
+replace a model with one it cannot tell apart, and that refusal is what makes
+unattended retraining safe.
 
 ### Versioned models with rollback (`app/model_store.py`)
 
-Previously each train overwrote `models/plan_selector.pkl`. For a system
-that retrains itself unattended that is unacceptable -- one bad automated
-promotion and the good model is gone. Every trained model is now stored
-under a timestamped version with its metrics; promotion is an explicit
-recorded act; `--rollback` restores the previous version. Given that §2.2.1
-establishes offline scores can mislead, an escape hatch for "this looked
-better offline and is worse live" is a requirement, not a nicety.
+Each train used to overwrite `models/plan_selector.pkl`. For a system that
+retrains itself unattended, that is unacceptable: one bad automatic promotion
+and the good model is gone. Every trained model is now saved under a
+timestamped version with its metrics, promotion is an explicit recorded act,
+and `--rollback` restores the previous version. Since §2.2.1 shows offline
+scores can mislead, an escape hatch for "this looked better offline and is
+worse live" is a requirement, not a nicety.
 
 ### Per-query regression guard (`app/optimizer/regression_guard.py`)
 
-The safety veto in `learned.py` is *prospective* -- it judges a plan before
-running it, using the cost estimates this project exists because it
+The safety veto in `learned.py` looks *forward*. It judges a plan before
+running it, using the very cost estimates this project exists because it
 distrusts. So it cannot catch a plan that is cheap on paper and slow in
-reality, which is precisely the interesting case.
+reality, which is exactly the interesting case.
 
-The regression guard is *retrospective*. It reads the system's own history
-and finds queries where the learned path has, in measured fact, been slower
-than plain native PostgreSQL (beyond a 10% tolerance, over at least 3
-executions). Those queries are served the native plan regardless of what
-the model currently believes.
+The regression guard looks *backward*. It reads the system's own history
+and finds queries where the learned path has actually measured slower than
+plain native PostgreSQL, by more than a 10% tolerance and over at least 3
+executions. Those queries get the native plan no matter what the model
+currently believes.
 
 On the accumulated history it flags 6 of 25 workload queries, e.g.:
 
@@ -366,17 +366,17 @@ On the accumulated history it flags 6 of 25 workload queries, e.g.:
 | `4w_full_country_us_electronics` | 106.3 ms | 124.3 ms | 1.17x |
 | `4w_full_broad` | 592.3 ms | 682.5 ms | 1.15x |
 
-This targets the deployment blocker named in the recent literature: an
+This targets the deployment blocker the recent literature names. An
 optimizer that is faster on average but occasionally much slower on a
-*specific* query is unshippable, because one user-facing query getting 30%
-slower outweighs a diffuse average win. Measuring per-query rather than in
-aggregate is the entire point -- an aggregate mean hides exactly the queries
-that would get someone paged.
+*specific* query cannot be shipped, because one user-facing query getting 30%
+slower outweighs a diffuse average win. Measuring per query rather than in
+aggregate is the entire point: an average hides exactly the queries that would
+get someone paged.
 
-The guard is deliberately asymmetric and recoverable: a query must
-demonstrate a regression over several executions to be blocked, and it keeps
-being re-evaluated from history, so it un-blocks itself if the model
-improves. It is a brake, not a ban.
+The guard is deliberately asymmetric, and a query can recover. It has to
+show a regression over several executions before it is blocked, and it keeps
+being re-checked against history, so it unblocks itself if the model improves.
+It is a brake, not a ban.
 
 **Does the guard help? Measured, not assumed** -- three paired runs of the
 same workload and policy, differing only in `--no-guard`:
@@ -388,32 +388,32 @@ same workload and policy, differing only in `--no-guard`:
 | 3 | +34.1% | **-23.7%** | +57.8 pp |
 | **mean** | **+29.4%** | **+1.7%** | **+27.7 pp** |
 
-Two things stand out. The guard raised mean captured headroom from ~2% to
-~29%. More importantly, **the guarded runs never went negative** (worst
-+13.6%) while the unguarded runs did (-23.7%) -- which is precisely the
-behaviour it was built for. Blocking the queries with a track record of
-regressing removes the left tail, and on this workload the left tail was
-large enough that removing it also moved the mean.
+Two things stand out. The guard raised mean captured headroom from about 2%
+to about 29%. More importantly, **the guarded runs never went negative**, with
+a worst case of +13.6%, while the unguarded runs did, at -23.7%. That is
+exactly the behaviour it was built for. Blocking the queries with a track
+record of regressing removes the left tail, and on this workload that tail was
+big enough that removing it also moved the mean.
 
-Three pairs is still a small sample and run 1 went the other way, so this
-is a supported direction rather than a settled effect size. But it is the
-first evidence here that a *robustness* mechanism, not a better predictor,
-is what turns this from "sometimes faster, sometimes much slower" into
-something that could be deployed.
+Three pairs is a small sample, and run 1 went the other way, so this is a
+supported direction rather than a settled effect size. Even so, it is the
+first evidence here that a *robustness* mechanism, rather than a better
+predictor, is what turns this from "sometimes faster, sometimes much slower"
+into something you could deploy.
 
 ## 2.4.1 Fixing "native sometimes beats the learned path"
 
-The most common complaint about this system was also its most legitimate:
-on plenty of queries plain PostgreSQL won. Three attempts were needed, and
-the first two failed in instructive ways.
+The most common complaint about this system was also the most fair: on
+plenty of queries, plain PostgreSQL won. Three attempts were needed, and the
+first two failed in useful ways.
 
 ### Attempt 1 -- the design flaw
 
-The optimizer scored the *hinted* candidates and served the argmin. The
-native plan was used only for the safety veto; it was never something the
-model could choose. So the optimizer was **forced to deviate from PostgreSQL
-on every single query**, including the many where PostgreSQL was already
-right. On those, deviating can only lose.
+The optimizer scored the *hinted* candidates and served the best of them.
+The native plan was used only by the safety veto; the model could never choose
+it. So the optimizer was **forced to deviate from PostgreSQL on every single
+query**, including the many where PostgreSQL was already right. On those,
+deviating can only lose.
 
 The model wasn't choosing native badly. It was never allowed to choose
 native at all.
@@ -426,12 +426,12 @@ if the predicted gain exceeds the model's own uncertainty about that gain
 
     run 1  0.0%    run 2  0.0%    run 3  0.0%
 
-Served latency equalled native *exactly*, on every run. The gate never
-fired. That is not a bug in the gate -- it is the gate correctly reporting
-that with ~25 ms prediction error against ~8-20 ms of available gain, the
-model could not distinguish any candidate from native. A principled
-confidence test on a model this uncertain refuses to act, and it was right
-to. Trading regressions for having no optimizer is not a fix.
+Served latency equalled native *exactly* on every run. The gate never
+fired. That is not a bug in the gate. It is the gate correctly reporting that
+with about 25 ms of prediction error against 8 to 20 ms of available gain, the
+model could not tell any candidate apart from native. A sound confidence test
+on a model this uncertain refuses to act, and it was right to. But trading
+regressions for having no optimizer at all is not a fix.
 
 ### Attempt 3 -- fix the target, not the threshold
 
@@ -446,16 +446,16 @@ The real problem was what the model was asked to predict. It regressed on
      plan will take 213 ms. We only need to know it beats native.
 
 The target is now `log(candidate_latency / native_latency)` for the same
-query (`train._relative_targets`). Every query contributes on the same
+query (`train._relative_targets`). Every query now contributes on the same
 scale, and the prediction *is* the decision: negative means faster than
-native. The gate becomes directly readable -- "is this confidently below
-1.0x native?" -- instead of hoping a difference between two noisy absolute
-predictions survives subtraction.
+native. The gate becomes something you can read directly, "is this confidently
+below 1.0x native?", instead of hoping that the difference between two noisy
+absolute predictions survives subtraction.
 
-One further fix: the gate initially picked the candidate itself, which
-silently bypassed the policy and made `risk_averse`, `thompson` and
-`pairwise_rank` all behave like `greedy`. Selection (which candidate) and
-authorisation (is it worth deviating) are now separate steps.
+One further fix. The gate originally picked the candidate itself, which
+quietly bypassed the policy and made `risk_averse`, `thompson` and
+`pairwise_rank` all behave like `greedy`. Choosing a candidate and authorising
+the deviation are now two separate steps.
 
 ### Result
 
@@ -477,17 +477,17 @@ withhold a bad decision; it cannot manufacture a good one.
 
 ## 2.4.2 Calibrating the gate instead of guessing it
 
-Fixing the regressions (§2.4.1) produced the opposite complaint: the
-optimizer now declined to act on many queries. Both complaints are about the
-same knob, and both are legitimate -- a gate set too loose regresses, a gate
-set too tight is an expensive no-op.
+Fixing the regressions in §2.4.1 produced the opposite complaint: the
+optimizer now refused to act on many queries. Both complaints are about the
+same knob, and both are fair. A gate set too loose causes regressions; a gate
+set too tight is an expensive way to do nothing.
 
-The right threshold is not something to reason about from first principles,
-because it depends entirely on how accurate the model happens to be on the
-data in front of it. So `app/calibrate.py` measures it: replay every logged
-query at a grid of `(confidence_z, min_relative_gain)` settings and record
-how often each deviates, how often those deviations actually regress, and
-the net latency saved.
+The right threshold cannot be worked out from first principles, because it
+depends entirely on how accurate the model happens to be on the data in front
+of it. So `app/calibrate.py` measures it. It replays every logged query across
+a grid of `(confidence_z, min_relative_gain)` settings and records how often
+each setting deviates, how often those deviations actually regress, and how
+much time is saved overall.
 
 | z | min_gain | deviates | regresses | net gain |
 |---|---|---|---|---|
@@ -496,24 +496,24 @@ the net latency saved.
 | 0.50 | 0.00 | 77% | 9% | +14.0% |
 | 0.00 | 0.02 | **87%** | **15%** | +13.9% |
 
-The bottom row is the answer to "why doesn't it optimize more queries."
-Forcing the optimizer to act on 87% of queries instead of 63% produces
-*less* net improvement (+13.9% vs +14.5%) and introduces a 15% regression
-rate. The extra 24 percentage points of activity are all bets the model
-wasn't sure about, and they lose slightly more than they win.
+The bottom row answers "why doesn't it optimize more queries?". Forcing the
+optimizer to act on 87% of queries instead of 63% produces *less* net
+improvement, +13.9% against +14.5%, and adds a 15% regression rate. The extra
+24 percentage points of activity are all bets the model was unsure about, and
+they lose slightly more than they win.
 
-So the ~40% of queries where it keeps native are not a failure. They are
-queries where PostgreSQL was already right and the model correctly declines
-to gamble.
+So the roughly 40% of queries where it keeps the native plan are not a
+failure. They are queries where PostgreSQL was already right, and the model
+correctly declined to gamble.
 
-The recommendation is chosen by maximising net improvement **subject to** a
-regression-rate bound, not by maximising net improvement alone. Optimising
-the mean without that constraint would happily accept "usually much faster,
-occasionally catastrophic" -- exactly the per-query instability that makes
-learned optimizers undeployable. `app.calibrate --apply` writes the winning
-setting to `models/gate.json`, which `LearnedOptimizer` prefers over its
-hardcoded defaults, so the threshold is re-derived per dataset rather than
-inherited from whatever happened to work here.
+The recommended setting maximises net improvement **subject to** a limit on
+the regression rate, rather than maximising net improvement alone. Optimising
+the mean without that limit would happily accept "usually much faster,
+occasionally catastrophic", which is exactly the per-query instability that
+makes learned optimizers undeployable. `app.calibrate --apply` writes the
+winning setting to `models/gate.json`, and `LearnedOptimizer` prefers that
+over its built-in defaults. The threshold is therefore re-derived for each
+dataset instead of being inherited from whatever happened to work here.
 
 Live result with the calibrated gate, three runs:
 
@@ -525,30 +525,33 @@ Live result with the calibrated gate, three runs:
 
 ## 2.5 Working on any dataset, and what that revealed
 
-The system now onboards an arbitrary PostgreSQL database in one command
-(`app/onboard.py`): discover schema -> generate workload -> collect -> train.
-The last hardcoded piece was the *workload* -- `workload.py` is 25 queries
-written for the synthetic schema, which made "works on any dataset" untrue
-in practice even though the feature layer was schema-agnostic.
+The system now sets up any PostgreSQL database in one command
+(`app/onboard.py`): discover the schema, generate a workload, collect data,
+train. The last hardcoded piece was the *workload*. `workload.py` holds 25
+queries written for the synthetic schema, which made "works on any dataset"
+untrue in practice, even though the feature layer was already
+schema-agnostic.
 
 `schema_graph.py` reads tables, columns, indexes and foreign keys and builds
-the join graph; `workload_generator.py` walks it for connected table subsets
-and writes queries whose predicates are **sampled from the data itself**
-(real percentiles for numerics, values actually present for text). Inventing
-predicate values is the obvious trap: a filter matching nothing makes every
-join order equally instant, and one matching everything makes the filter
-irrelevant. Either way the query teaches the model nothing.
+the join graph. `workload_generator.py` walks that graph for connected sets of
+tables and writes queries whose filters are **sampled from the data itself**:
+real percentiles for numbers, values that actually appear for text.
 
-**Schemas without declared foreign keys.** JOB/IMDB declares none -- and
+Inventing filter values is the obvious trap. A filter matching nothing makes
+every join order equally instant; a filter matching everything makes the
+filter irrelevant. Either way, the query teaches the model nothing.
+
+**Schemas without declared foreign keys.** JOB/IMDB declares none, and
 neither do plenty of production databases, which enforce integrity in the
-application or drop constraints for bulk-load speed. Requiring FKs would
-have meant not working on the literature's own benchmark. `infer_foreign_keys`
-falls back to naming conventions (`keyword_id` -> `keyword.id`;
-`kind_id` -> `kind_type.id` when exactly one table matches the prefix),
-requiring integer types on both sides so a coincidental name match can't
-manufacture a nonsense join. On JOB this recovers 11 join edges from 21
-tables -- enough to generate a workload. Inferred edges are flagged as such
-in `/schema` rather than presented as fact.
+application or drop constraints to speed up bulk loads. Requiring foreign keys
+would have meant not working on the literature's own benchmark.
+
+`infer_foreign_keys` falls back to naming conventions instead: `keyword_id`
+maps to `keyword.id`, and `kind_id` maps to `kind_type.id` when exactly one
+table matches the prefix. It requires integer types on both sides, so a
+coincidental name match cannot invent a nonsense join. On JOB this recovers 11
+join edges across 21 tables, which is enough to generate a workload. Inferred
+edges are labelled as inferred in `/schema` rather than presented as fact.
 
 ### The result: same command, two unrelated databases
 
@@ -568,45 +571,45 @@ Both rows are from auto-generated workloads, so this is the system solving a
 problem it set itself.
 
 **The disagreement between the two columns is the interesting part.** On the
-small, well-sampled synthetic schema, pairwise ranking wins. On JOB -- 21
-tables, 74M rows, only 103 training rows after aggregation -- every selector
-that trusts its point predictions collapses (`thompson` is 7x *worse* than
-native), and only `risk_averse`, which explicitly penalises candidates the
-ensemble disagrees about, survives. It captures 77% of headroom there.
+small, well-sampled synthetic schema, pairwise ranking wins. On JOB, with 21
+tables, 74M rows and only 103 training rows after aggregation, every selector
+that trusts its own point predictions collapses. `thompson` ends up 7x *worse*
+than native. Only `risk_averse` survives, because it explicitly penalises
+candidates the ensemble disagrees about, and it captures 77% of the headroom
+there.
 
-That is the clearest evidence in this project for a claim that recurs
-throughout it: **when data is thin relative to the problem, modelling
-uncertainty matters more than modelling the target.** It also means "which
-policy is best" is not a constant -- it depends on the data regime, and a
-system that ships a single hardcoded policy will be wrong on half its
-deployments. The policy is configurable (`SELECTION_POLICY`) for exactly
-this reason.
+That is the clearest evidence in this project for a claim that keeps coming
+up: **when the data is thin relative to the problem, modelling uncertainty
+matters more than modelling the target.** It also means "which policy is best"
+is not a fixed answer. It depends on the data, and a system that ships one
+hardcoded policy will be wrong on half its deployments. That is exactly why
+the policy is configurable through `SELECTION_POLICY`.
 
 ## 2.6 Production inference: choosing without executing
 
-`/query/analyze` and `app.benchmark` execute *every* candidate and then
-report which was fastest. That is a measurement harness, not an optimizer --
-it spends N executions to answer a question asked once, so serving traffic
-with it would be strictly slower than having no optimizer at all. This was a
-named limitation from the first draft of this document.
+`/query/analyze` and `app.benchmark` run *every* candidate and then report
+which was fastest. That is a measuring tool, not an optimizer. It spends N
+executions to answer a question asked once, so serving traffic with it would
+be strictly slower than having no optimizer at all. This was a named
+limitation in the first draft of this document.
 
 `optimizer/planner.py` is the real path. For N candidates it issues N
 `EXPLAIN`s **without** `ANALYZE` (Postgres plans but runs nothing), scores
 them, and executes only the winner. Measured live: **3.8 ms of planning
 overhead against 138 ms of execution**, ~2.7%.
 
-This only works because the feature layer never reads actuals.
-`plan_tree.py` and `features.py` were deliberately restricted to
-estimate-side fields (`Plan Rows`, `Total Cost`, `Plan Width`, node types).
-That looked like an arbitrary constraint when written; it is what makes
-production inference possible at all.
+This only works because the feature layer never reads actual measurements.
+`plan_tree.py` and `features.py` were deliberately restricted to estimate-side
+fields: `Plan Rows`, `Total Cost`, `Plan Width` and node types. That looked
+like an arbitrary restriction when it was written. It is what makes production
+inference possible at all.
 
 ## 2.7 Regret: the summary number that isn't a summary
 
-"Captured 29% of headroom" describes a run. Cumulative regret -- how much
-slower the served plans were than the best available, summed over time --
-describes a *trajectory*, and distinguishes a learner that converged from
-one making the same mistake repeatedly. Averages hide that completely.
+"Captured 29% of headroom" describes a run. Cumulative regret describes a
+*trajectory*: how much slower the served plans were than the best available,
+added up over time. It tells apart a learner that has converged from one
+repeating the same mistake. Averages hide that completely.
 
 Over 500 logged decisions:
 
@@ -616,15 +619,15 @@ Over 500 logged decisions:
 | Native PostgreSQL | 6,261 ms |
 | **Ratio** | **0.80** |
 
-The learned optimizer has accumulated 20% less regret than always trusting
-Postgres. This is the single most defensible number in the project: it is
-computed over every decision actually made, not a favourable subset, and a
-ratio above 1.0 would have meant the system was actively harmful.
+The learned optimizer has built up 20% less regret than always trusting
+Postgres. This is the most defensible number in the project. It is computed
+over every decision actually made, not a favourable subset, and a ratio above
+1.0 would have meant the system was doing active harm.
 
-Regret is measurable here only *because* the harness executes every
-candidate. In production you never learn what the plans you didn't run would
-have cost, so this is an offline diagnostic computed from
-`plan_execution_log`, not a live signal.
+Regret is measurable here only *because* the harness runs every candidate.
+In production you never learn what the plans you skipped would have cost, so
+this is an offline diagnostic computed from `plan_execution_log`, not a live
+signal. `docs/METRICS.md` §5 gives the exact definition.
 
 ## 2.8 Learned cardinality correction
 
@@ -649,13 +652,13 @@ that is a substantially larger change and is named as future work.
 
 The most persistent complaint about this system was that it did not reduce
 query cost. Investigating it properly produced the most important result in
-the project, and it was not about the model at all.
+the project, and it had nothing to do with the model.
 
 ### Measuring the ceiling
 
-For every query in the v1 workload, execute *every* candidate plan and
-record the fastest. That gives the **oracle ceiling** -- the best any
-selector could possibly do:
+For every query in the v1 workload, run *every* candidate plan and record
+the fastest. That gives the **oracle ceiling**: the best any selector could
+possibly do.
 
 | | v1 synthetic | TPC-H | JOB/IMDB |
 |---|---|---|---|
@@ -664,23 +667,22 @@ selector could possibly do:
 | Queries with >5% available | **7 / 25** | -- | 3 / 4 |
 | Best model's top-1 accuracy | **0%** | -- | 25% |
 
-On v1, PostgreSQL was already choosing the best plan for 18 of 25 queries.
-Six model classes were compared (LightGBM, random forest, extremely
+On v1, PostgreSQL was already choosing the best plan for 18 of the 25
+queries. Six model types were compared (LightGBM, random forest, extremely
 randomised trees, gradient boosting, ridge, and an MLP) and **not one picked
-the fastest plan even once**. That is not six model failures; it is the
-absence of a signal to learn. Where signal existed -- JOB -- extremely
-randomised trees reached 25% top-1 and captured 73% of headroom.
+the fastest plan even once**. That is not six failed models. There was no
+signal to learn. Where signal did exist, on JOB, extremely randomised trees
+reached 25% top-1 accuracy and captured 73% of the headroom.
 
-**A benchmark on which the baseline is already optimal cannot measure an
-improvement.** Every earlier attempt to fix "cost isn't reducing" by
-adjusting thresholds, targets and model classes was working on the wrong
-variable.
+**A benchmark where the baseline is already optimal cannot measure an
+improvement.** Every earlier attempt to fix "cost isn't reducing" by adjusting
+thresholds, targets and model types was working on the wrong variable.
 
 ### Rebuilding the dataset to be hard
 
-So `data/schema.sql` was rewritten against the specific mechanism Leis et
-al. identified: PostgreSQL's **independence assumption**. Given
-`WHERE a = x AND b = y` it estimates sel(a) x sel(b), which is correct only
+So `data/schema.sql` was rewritten to target the exact mechanism Leis et al.
+identified: PostgreSQL's **independence assumption**. Given
+`WHERE a = x AND b = y`, it estimates sel(a) x sel(b), which is only correct
 when the columns are unrelated. v2 makes them related on purpose:
 
     city    -> country      (Mumbai implies IN)
@@ -688,18 +690,19 @@ when the columns are unrelated. v2 makes them related on purpose:
     price_band ~ category   (electronics skew premium)
     channel ~ status        (cancellations cluster in one channel)
 
-Filtering on both halves of a dependency therefore produces a row estimate
-several times too small, and that error compounds through joins into a
-genuinely wrong join order. Two more tables widen the graph to six, so the
-workload reaches 5- and 6-way joins where ordering matters far more than at
+Filtering on both halves of a dependency now produces a row estimate several
+times too small, and that error compounds through the joins into a genuinely
+wrong join order. Two extra tables widen the graph to six, so the workload
+reaches 5- and 6-way joins, where ordering matters far more than it does at
 two or three. `workload.py` was rewritten to exercise each trap, with
-uncorrelated **control** queries alongside so the contrast is visible rather
-than assumed.
+uncorrelated **control** queries alongside, so the contrast is something you
+can see rather than something you have to assume.
 
-Deliberately absent: any `CREATE STATISTICS` object. Multi-column statistics
-are exactly how a DBA would *fix* these correlations, so leaving them off is
-what preserves the errors the benchmark exists to exploit. Adding them is
-the natural controlled experiment -- headroom should collapse.
+One thing is deliberately missing: any `CREATE STATISTICS` object.
+Multi-column statistics are exactly how a DBA would *fix* these correlations,
+so leaving them out is what preserves the errors the benchmark exists to
+exploit. Adding them is the obvious controlled experiment, and the headroom
+should collapse when you do.
 
 ### Result
 
@@ -717,34 +720,34 @@ with the largest gains landing exactly on the designed traps:
 | `corr_6w_everything` | both, over 6 tables | **93.6%** |
 | `corr_city_country` | city -> country | **63.1%** |
 
-The mechanism predicted the outcome, which is the strongest evidence
-available that the diagnosis was right rather than merely convenient.
+The mechanism predicted the outcome. That is the strongest evidence
+available that the diagnosis was right, rather than just convenient.
 
 ### A regression this exposed
 
-Expanding the action space (§2.10) without re-collecting training data
-caused **17 of 25 queries to hit the safety veto**: the model was being
-asked to score `Set(enable_*)` plans it had never seen during training, so
-its predictions were extrapolation and the confidence gate correctly refused
-them. Classic train/serve skew. The fix is not a code change -- it is
-re-running `app.collect_data` whenever the action space changes, which is
-now noted in the README.
+Widening the action space (§2.10) without re-collecting training data sent
+**17 of 25 queries into the safety veto**. The model was being asked to score
+`Set(enable_*)` plans it had never seen in training, so its predictions were
+guesses beyond its data, and the confidence gate correctly refused them. This
+is classic train/serve skew. The fix is not a code change: re-run
+`app.collect_data` whenever the action space changes, which the README now
+says.
 
 ## 2.10 Widening the action space
 
-`Leading()` join-order hints alone turned out to be nearly useless on small
-queries. For a two-table join there are only two orderings and PostgreSQL
-already picks the better one, so every "candidate" came back as the
-*identical plan with the identical cost* -- visible in the dashboard as
-native and chosen both reading 4673.9. The optimizer appeared to run while
-having nothing to choose between.
+`Leading()` join-order hints on their own turned out to be nearly useless on
+small queries. A two-table join has only two orderings, and PostgreSQL already
+picks the better one, so every "candidate" came back as the *same plan at the
+same cost*. You could see it in the dashboard: native and chosen both read
+4673.9. The optimizer looked like it was running while having nothing to
+choose between.
 
 `hints.py` now also emits Bao's actual action space: **operator toggles**
-(`Set(enable_nestloop off)`, `Set(enable_indexscan off)`, and combinations).
-Disabling a class of operator makes the planner re-plan under that
-restriction, which produces genuinely different plans. `plan_fingerprint`
-deduplicates candidates that come back structurally identical, so the
-candidate count reflects the real size of the action space instead of
+such as `Set(enable_nestloop off)`, `Set(enable_indexscan off)`, and
+combinations of them. Switching off a class of operator forces the planner to
+re-plan under that restriction, which produces genuinely different plans.
+`plan_fingerprint` removes candidates that come back structurally identical,
+so the candidate count reflects the real size of the action space rather than
 counting copies.
 
 On JOB this immediately found wins join-order hints could not reach:
@@ -754,32 +757,34 @@ On JOB this immediately found wins join-order hints could not reach:
 | `auto_2w_01` | 525.0 ms | 108.6 ms | **79.3%** | `Set(enable_indexscan off)` |
 | `auto_3w_03` | 320.9 ms | 180.2 ms | **43.8%** | `Set(enable_indexscan off)` |
 
-Note the winning hint in both cases is a scan-method toggle, not a join
-order -- an action the previous design could not express at all.
+In both cases the winning hint is a scan-method toggle, not a join order.
+That is an action the previous design could not even express.
 
 ## 3. Stretch goals
 
 **Join-method selection.** `generate_join_method_candidates`
-(`backend/app/optimizer/hints.py`) pairs each sampled join order with a
-forced method (`HashJoin`/`NestLoop`/`MergeJoin`) applied at every prefix of
-that order's left-deep join tree, since `Leading(a b c d)`'s join nodes are
-exactly the prefixes `(a b)`, `(a b c)`, `(a b c d)`. This roughly
-approximates "use this method throughout the plan" without a full per-node
-hint-tree generator. `features.py` counts join methods actually used per
-plan (`n_hash_join`/`n_nestloop_join`/`n_merge_join`), so the model can learn
-method-sensitive patterns, not just order-sensitive ones.
+(`backend/app/optimizer/hints.py`) pairs each sampled join order with a forced
+method (`HashJoin`, `NestLoop` or `MergeJoin`) applied at every prefix of that
+order's left-deep join tree. The join nodes of `Leading(a b c d)` are exactly
+the prefixes `(a b)`, `(a b c)` and `(a b c d)`, so this approximates "use
+this method throughout the plan" without needing a full per-node hint-tree
+generator. `features.py` counts the join methods each plan actually used
+(`n_hash_join`, `n_nestloop_join`, `n_merge_join`), so the model can learn
+patterns that depend on method, not just on order.
 
 **Dataset-agnostic pipeline.** `optimizer/features.py` originally hardcoded
-the synthetic schema's 4 tables and their aliases. It's now schema-driven:
-table identity comes from each EXPLAIN plan's own `scan_relations` (alias ->
-real table name, read directly off the plan by `plan_extractor.py`), and
-reference cardinalities come from `schema_introspection.py` querying
-Postgres's own `pg_class` statistics. Point `DATABASE_URL` at a different
-database and `hints.py`, `plan_extractor.py`, `features.py`, and `train.py`
-all adapt with no code change -- `feature_columns` and `table_cardinalities`
-are computed at training time and pickled alongside the model so inference
-stays consistent with whatever schema it was trained on. This is what let
-the JOB/IMDB import (Section 2.3) reuse the exact same pipeline.
+the synthetic schema's four tables and their aliases. It is now driven by the
+schema instead. Table identity comes from each EXPLAIN plan's own
+`scan_relations`, an alias-to-table-name map that `plan_extractor.py` reads
+straight off the plan, and reference row counts come from
+`schema_introspection.py` querying Postgres's own `pg_class` statistics.
+
+Point `DATABASE_URL` at a different database and `hints.py`,
+`plan_extractor.py`, `features.py` and `train.py` all adapt with no code
+change. `feature_columns` and `table_cardinalities` are computed at training
+time and pickled alongside the model, so inference stays consistent with
+whatever schema it was trained on. This is what let the JOB/IMDB import
+(Section 2.3) reuse the exact same pipeline.
 
 ## 4. Limitations, named on purpose
 
@@ -795,7 +800,7 @@ the JOB/IMDB import (Section 2.3) reuse the exact same pipeline.
   execute the chosen plan and use the optimizer's own cost estimate (or a
   learned cost model, as in Bao) to pick without running the alternatives.
 - **The headline limitation: prediction error exceeds available headroom.**
-  See §2.3. ~400 rows across 25 queries, one execution per candidate, gives
+  See §2.2.2. ~400 rows across 25 queries, one execution per candidate, gives
   a 44 ms MAE against ~7.5 ms/query of actual opportunity. Until that ratio
   inverts, no selection policy can demonstrate a real win, and any positive
   result on a single run should be assumed to be noise.
