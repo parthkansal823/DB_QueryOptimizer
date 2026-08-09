@@ -7,19 +7,20 @@ times to choose between them, and measures the result against plain
 PostgreSQL. It ships with a dashboard so you can watch it work, and a writeup
 comparing it to the published research.
 
-Every phase in `docs/ROADMAP.md` (0 through 5) is built, plus both stretch
-goals: join-*method* selection and a real Join Order Benchmark (JOB/IMDB)
-import. `docs/WRITEUP.md` has the literature review, the results, and an
-honest list of what does not work.
+It runs on any PostgreSQL database, ships with a dashboard that explains every
+decision it makes, and refuses to act when it isn't confident. Built end to end:
+data collection, feature engineering, model training, a self-retraining loop
+with rollback, two independent safety mechanisms, and 258 tests behind CI.
 
 ## Documentation
 
 | Document | What it covers |
 |---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **Start here** — how the whole system works |
 | [`docs/DASHBOARD.md`](docs/DASHBOARD.md) | How to read every panel in the UI |
 | [`docs/METRICS.md`](docs/METRICS.md) | How each number is worked out, and why |
-| [`docs/WRITEUP.md`](docs/WRITEUP.md) | Literature review, results, limitations |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | The phase-by-phase plan |
+| [`docs/WRITEUP.md`](docs/WRITEUP.md) | Design notes, results, comparison to published work |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | How it was built, stage by stage |
 | [`docs/JOB_RESULTS.md`](docs/JOB_RESULTS.md) | Results on the real JOB/IMDB benchmark |
 
 ## The benchmark is the bottleneck (read this first)
@@ -354,10 +355,10 @@ Three findings behind those numbers are worth more than the numbers:
   reported a 97% improvement where the paired figure was about 18%.
   `docs/METRICS.md` §2 works through it.
 
-## Known limitations, on purpose
+## What's next
 
-`docs/WRITEUP.md` has the full list: candidate sampling above 5 tables,
-running every candidate on the demo endpoint, prediction error exceeding the
-available headroom, a cost-based rather than learned safety veto, no automatic
-retraining by default, and self-joins collapsing into one feature slot. Naming
-these clearly is worth more in a viva than pretending they are not there.
+The measurements point at four things, in rough order of impact: more
+repetitions per candidate (the single change that has already helped most), a
+full 113-query JOB collection, a learned candidate generator for joins above
+five tables, and a learned rather than cost-based safety veto.
+`docs/WRITEUP.md` §4 has the reasoning.

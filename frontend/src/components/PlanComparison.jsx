@@ -1,5 +1,9 @@
-function PlanPanel({ title, plan, badge, badgeClass }) {
-  if (!plan) return <div className="plan-panel empty-state">No plan</div>;
+function PlanPanel({ title, plan, badge, badgeClass, emptyNote }) {
+  // A bare "No plan" reads as missing data. When the optimizer deliberately
+  // declines to deviate there is genuinely no second plan to show, and saying
+  // *that* is the difference between a panel that looks broken and one that
+  // reports a decision.
+  if (!plan) return <div className="plan-panel empty-state">{emptyNote || "No plan"}</div>;
   return (
     <div className="plan-panel">
       <h3>
@@ -39,9 +43,18 @@ function DecisionNote({ decision }) {
   const score = decision.predicted_score;
   const uncertainty = decision.predicted_uncertainty;
 
+  // These describe what the optimizer *predicted* before running anything.
+  // Saying "nothing else was clearly faster" made a claim about measured
+  // results instead, and /query/analyze executes every candidate -- so the
+  // chart directly below could show a candidate beating PostgreSQL by 22%
+  // while this line insisted none had. The gate never looked at those
+  // measurements; it declined because the prediction was not confident
+  // enough, and that is what this should say.
   const vetoMessage = {
     no_confident_gain_over_native:
-      "Kept PostgreSQL's plan — nothing else was clearly faster.",
+      "Kept PostgreSQL's plan — the model did not predict a confident enough win to switch. " +
+      "Measurements below may still show a faster candidate: those come from running every " +
+      "plan afterwards, which a live optimizer cannot do before it has to choose.",
     predicted_regression_vs_native:
       "Kept PostgreSQL's plan — the best alternative is priced far higher, so running it was too risky.",
     regression_guard:
@@ -108,6 +121,11 @@ export default function PlanComparison({ baseline, chosenPlan, selectorMode, dec
           plan={chosenPlan}
           badge={decision?.fell_back_to_baseline ? "blocked" : "chosen"}
           badgeClass={decision?.fell_back_to_baseline ? "badge-vetoed" : "badge-chosen"}
+          emptyNote={
+            decision?.fell_back_to_baseline
+              ? "No separate plan — PostgreSQL's own plan was served. See the reason below."
+              : "No plan"
+          }
         />
       </div>
       <DecisionNote decision={decision} />

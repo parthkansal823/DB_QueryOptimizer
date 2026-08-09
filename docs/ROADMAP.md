@@ -1,14 +1,17 @@
-# Roadmap
+# How it was built
 
-A phase plan for one person over one year. Line these up against your actual
-semester dates (synopsis, mid-term review, final defence) rather than treating
-the durations as fixed.
+The stages this project went through, in order, and what each one added. Useful
+if you want to understand *why* the system is shaped the way it is -- most of
+the design came from a measurement that forced it, not from a plan written up
+front.
 
-**Status: phases 0-5 done, both stretch goals attempted.** See
-`docs/WRITEUP.md` for results and an honest list of limitations, and
-`data/job/README.md` for where the JOB/IMDB stretch goal landed.
+`ARCHITECTURE.md` describes the finished system. This is the path to it.
 
-## Phase 0 -- Foundation [done]
+**Status: all stages complete, plus a large amount beyond the original scope.**
+`docs/WRITEUP.md` has the results and `data/job/README.md` covers the JOB/IMDB
+work.
+
+## Stage 0 -- Foundation [done]
 - Postgres + pg_hint_plan running in Docker
 - Synthetic benchmark schema loaded (users / products / orders / order_items)
 - Plan extraction (EXPLAIN JSON to structured metrics) working end to end
@@ -16,9 +19,9 @@ the durations as fixed.
 - A placeholder "learned" optimizer that just picks the lowest estimated cost.
   It proves the pipeline works before any real ML exists
 
-**Goal: run `python -m app.benchmark` and see real baseline and candidate times.**
+**Milestone: run `python -m app.benchmark` and see real baseline and candidate times.**
 
-## Phase 1 -- Data collection [done]
+## Stage 1 -- Data collection [done]
 - Workload grown to 25 queries (`backend/app/workload.py`): 2-way, 3-way and
   4-way joins, across a range of selectivities, each one tagged
 - Every (query, candidate plan, actual time) triple logged to the
@@ -27,7 +30,7 @@ the durations as fixed.
 - Skew added to the seed data: 100 power users account for 40% of all orders,
   200 popular products account for 50% of all order items (`data/schema.sql`)
 
-## Phase 2 -- Feature engineering [done]
+## Stage 2 -- Feature engineering [done]
 - `backend/app/optimizer/features.py` turns each (query, candidate plan) pair
   into a fixed-length feature vector: join position, selectivity, scan type,
   and join-method counts per table
@@ -35,7 +38,7 @@ the durations as fixed.
   real time budgeted to it in the original plan, and it is what made the
   JOB/IMDB stretch goal possible without a rewrite
 
-## Phase 3 -- Train the model [done]
+## Stage 3 -- Train the model [done]
 - LightGBM gradient-boosted trees (`backend/app/train.py`) predicting
   candidate latency. Falls back to scikit-learn's
   `GradientBoostingRegressor` if the LightGBM native library is missing
@@ -48,7 +51,7 @@ the durations as fixed.
   uncertainty. LinUCB was not attempted, because it assumes a linear reward
   model and the ensemble gives uncertainty without that assumption
 
-## Phase 4 -- Online integration [done]
+## Stage 4 -- Online integration [done]
 - `LearnedOptimizer._select_learned` built. `select()`'s interface did not
   change: the policy and safety additions are constructor arguments plus a new
   `select_plan()`, so existing callers were untouched
@@ -61,7 +64,7 @@ the durations as fixed.
 - Cold start handled honestly: it falls back to the Phase 0 heuristic until a
   model is trained (see `docs/WRITEUP.md` §4)
 
-## Phase 5 -- Dashboard + writeup [done]
+## Stage 5 -- Dashboard and writeup [done]
 - React (Vite) + Recharts dashboard (`frontend/`): paste a query and see
   PostgreSQL's plan against the chosen one, every candidate measured, why the
   decision went the way it did, and the history so far.
@@ -72,8 +75,9 @@ the durations as fixed.
 
 ## Beyond the original scope [done]
 
-Additions past phases 0-5. Each one came from a measurement rather than a
-feature list. `docs/WRITEUP.md` §2.4 has the evidence.
+Everything below came from a measurement rather than a feature list -- something
+in the data said the system needed it. `docs/WRITEUP.md` has the evidence for
+each.
 
 - **Self-learning loop** (`app/retrain.py`): retrains on accumulated feedback
   and deploys a new model **only if it clearly beats the one running**, scored

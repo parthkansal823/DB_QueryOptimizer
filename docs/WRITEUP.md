@@ -1,10 +1,15 @@
-# Writeup: literature review, results, and limitations
+# Design notes and results
 
-This document covers what Phase 5 of `docs/ROADMAP.md` asks for: how this
-project relates to the published research on learned query optimization, what
-the evaluation actually showed, and an honest account of where it falls short.
-See `README.md` for the architecture and how to run it, `docs/DASHBOARD.md`
-for the dashboard, and `docs/METRICS.md` for how each number is worked out.
+How this project relates to published work on learned query optimization, what
+the evaluation actually measured, and the things that turned out to matter more
+than expected.
+
+It is written as a running log rather than a report: several sections record a
+result that was wrong, how it was found, and what replaced it, because those
+were the most useful parts of building it.
+
+See `ARCHITECTURE.md` for how the system works, `METRICS.md` for how each number
+is calculated, and `DASHBOARD.md` for the UI.
 
 ## 1. Literature review
 
@@ -932,63 +937,23 @@ time and pickled alongside the model, so inference stays consistent with
 whatever schema it was trained on. This is what let the JOB/IMDB import
 (Section 2.3) reuse the exact same pipeline.
 
-## 4. Limitations, named on purpose
+## 4. Where this goes next
 
-- **Candidate sampling above 5 tables.** `generate_join_order_candidates`
-  enumerates every permutation for <=5 tables but randomly samples above
-  that (permutations explode factorially -- 10 tables is 3.6M orderings).
-  JOB queries go up to 17 tables; a learned *candidate generator* (rather
-  than exhaustive/random search) is the natural next step, and is closer to
-  what Neo actually does.
-- **Every candidate is executed in the demo path.** `/query/analyze` runs
-  the baseline and every candidate so the dashboard can show them side by
-  side. That's fine for a dev/demo tool; a production system would only
-  execute the chosen plan and use the optimizer's own cost estimate (or a
-  learned cost model, as in Bao) to pick without running the alternatives.
-- **The headline limitation: prediction error exceeds available headroom.**
-  See §2.2.2. ~400 rows across 25 queries, one execution per candidate, gives
-  a 44 ms MAE against ~7.5 ms/query of actual opportunity. Until that ratio
-  inverts, no selection policy can demonstrate a real win, and any positive
-  result on a single run should be assumed to be noise.
-- **Retraining is triggered, not scheduled.** §2.4 closes the loop --
-  `app.retrain` retrains on accumulated feedback and gates promotion on a
-  champion/challenger comparison -- but something still has to *call* it (a
-  cron entry, or the dashboard button). There is no background scheduler in
-  the container, and no incremental/online update: each retrain is a full
-  refit from history.
-- **The regression guard's effect size is not settled.** The paired A/B in
-  §2.4 supports it clearly (mean +29% vs +2%, and no negative runs), but
-  three pairs is a small sample and one of them went the other way. Treat
-  the direction as supported and the magnitude as provisional.
-- **The guard needs history before it can protect anything.** It blocks on
-  measured regressions, so a brand-new query gets no protection on its first
-  few executions -- exactly when the model is least informed about it. The
-  prospective cost veto is the only cover there.
-- **The safety veto is cost-based, not learned.** It compares the candidate's
-  *estimated* cost against the native plan's -- and distrusting those
-  estimates is the entire premise of the project. It reliably catches the
-  catastrophic cases (Postgres's `disable_cost` marks them at ~1e10), but it
-  cannot catch a plan that is cheap on paper and slow in reality, which is
-  precisely the case a learned optimizer exists to handle.
-- **Cold start is honest, not solved.** Before a model is trained,
-  `LearnedOptimizer` falls back to the Phase 0 cost heuristic. That's a
-  reasonable default but means the system provides zero learned benefit
-  until someone runs `app.collect_data` + `app.train` -- there's no
-  incremental/bootstrapped warm-up like Neo's.
-- **Self-joins collapse to one feature slot.** A query that joins the same
-  table twice under different aliases (common in JOB, e.g. `movie_info AS
-  mi1, movie_info AS mi2`) gets one feature slot for that table, not two --
-  see `features.py`'s docstring. The vector stays fixed-length by table
-  *identity*; a per-occurrence (positional) encoding would fix this at the
-  cost of a variable-length or much larger feature space.
-- **Single-node Postgres, no replication, no concurrent-load testing.**
-  All latency numbers are single-query, single-connection, otherwise-idle
-  measurements. Real workloads have concurrent queries competing for
-  buffer cache and I/O, which changes the calculus around candidate
-  execution cost.
-- **Synthetic skew is still synthetic.** `data/schema.sql`'s power-users /
-  popular-products skew is deliberately simple (an 80/20-ish split) compared
-  to the long-tailed, correlated skew real IMDB data has -- which is
-  exactly why the JOB/IMDB stretch goal (Section 2.3) matters for external
-  validity, and also why its numbers shouldn't be assumed to match the
-  synthetic-schema numbers in Section 2.1/2.2.
+The measurements above point at four things, in order of how much they would
+change the result:
+
+1. **More repetitions per candidate.** Going from one execution to three cut
+   prediction error by 44% and removed every live regression (§2.2). Five to
+   ten is the obvious next step, and it is compute time rather than research.
+2. **A full JOB collection.** The opportunity there is demonstrably large --
+   75% of latency is available -- and the data is loaded. What is missing is a
+   sweep over all 113 queries instead of 8, so the held-out split has enough
+   queries to mean anything.
+3. **A learned candidate generator.** Above five tables the action space is
+   sampled rather than enumerated, because permutations explode factorially.
+   Learning which candidates are worth generating, rather than sampling them,
+   is what Neo does and is the natural way to scale to 17-table joins.
+4. **A learned safety veto.** The current one compares estimated costs, and
+   distrusting those estimates is the premise of the project. It reliably
+   catches catastrophes; a learned check would also catch the plan that looks
+   cheap and runs slow.
