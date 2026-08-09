@@ -108,7 +108,12 @@ feature list. `docs/WRITEUP.md` §2.4 has the evidence.
   logged decisions. The trajectory, not just an average.
 - **Learned cardinality correction** (`app/optimizer/cardinality.py`): learns
   Postgres's own q-error from `Plan Rows` against `Actual Rows`, the root
-  cause Leis et al. identified.
+  cause Leis et al. identified. At join level the correction is fed back
+  through `pg_hint_plan`'s `Rows()` hint, so the planner searches with a better
+  premise instead of being overridden. Verified to bind against a live planner
+  (4 estimated rows becomes 400 under `Rows(o u *100)`); measured to raise the
+  oracle ceiling by 0.0% on this schema, and written up as the null result it
+  is (`docs/WRITEUP.md` 2.8.1). Disable with `ENABLE_ROWS_CORRECTION=0`.
 - **Honest dashboard reporting** (`app/stats.py`): every before-and-after
   figure is a matched pair from the same run. The panel previously divided two
   averages taken over different sets of queries and reported a 97% win that

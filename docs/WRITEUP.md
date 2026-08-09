@@ -643,10 +643,78 @@ optimizer gets wrong, which this project had been discarding.
 `optimizer/cardinality.py` learns to predict the log-ratio (q-error) from
 pre-execution features, giving a corrected row estimate.
 
-Honest scope: it is wired as an additional *signal*, not fed back into
-Postgres's planner. Doing the latter properly means intercepting cardinality
-estimation inside the planner (pg_hint_plan's `Rows` hint is the hook);
-that is a substantially larger change and is named as future work.
+A correction to an earlier version of this section, which claimed the scan
+corrector was "wired as an additional signal" into `features.py`. It was not.
+`CardinalityCorrector` was written, tested, and imported by nothing. The claim
+sat here unchallenged because nobody grepped for the call site. It is recorded
+rather than quietly deleted, because a documented capability that does not
+exist is the same class of error as §2.0: a plausible-looking write-up
+describing something that never ran.
+
+What *is* wired is the join-level correction described in §2.8.1.
+
+### 2.8.1 Correcting the estimate instead of overriding the plan
+
+Every candidate up to this point overrides the planner. `Leading(...)`
+dictates a join order, `Set(enable_hashjoin off)` bans an operator. All of them
+argue with the conclusion of a planner that is reasoning correctly from wrong
+numbers.
+
+pg_hint_plan's `Rows` hint allows the opposite move. `Rows(a b *10)` tells
+Postgres that the join of `a` and `b` yields ten times what it thinks, and then
+lets its own decades-tuned search run with a better premise.
+`JoinCardinalityCorrector` learns the join-level q-error from
+`plan_execution_log` and emits exactly those corrections, added as one extra
+candidate alongside the hint families.
+
+Join level rather than scan level is deliberate. Postgres estimates a join as
+`left * right * selectivity`, treating the sides as independent, so the error
+is not merely inherited from the scans -- it is *manufactured at the join*.
+The `log_implied_selectivity` feature is that assumption made measurable.
+
+**Verification first.** §2.0's lesson is that an unbound hint is silently a
+comment, so the hint was checked against a live planner before anything was
+measured: the same query estimated 4 rows unhinted and 400 rows under
+`Rows(o u *100)`. The hint binds.
+
+**The mechanism works.** Trained on 4,678 join observations, the largest
+logged q-error being a 195x underestimate, the corrected plan beats native on
+exactly the queries the v2 schema was built to break:
+
+| Query | Native | Corrected | |
+|---|---|---|---|
+| `corr_brand_category` | 29.9 ms | 5.2 ms | **+82.6%** |
+| `corr_city_country` | 17.9 ms | 5.0 ms | **+71.8%** |
+| `corr_brand_band` | 10.5 ms | 6.3 ms | **+39.5%** |
+
+**And it changes nothing.** Applied to every query unconditionally it is worse
+than native more often than better (4 faster, 7 slower across 12). More
+decisively, as a *candidate* -- which is how it is actually used -- it raises
+the oracle ceiling by **0.0%**:
+
+| | Total | Headroom |
+|---|---|---|
+| Native | 292.2 ms | -- |
+| Best of hint candidates | 184.4 ms | 36.9% |
+| Best, including Rows correction | 184.3 ms | 36.9% |
+
+Every win it finds against native was already reachable through the existing
+`Leading()`/`Set()` candidates. On a 4-to-6 table schema the hint action space
+is close to exhaustive, so there is nothing left for a smarter premise to
+reach. One query improved by 0.03 ms, which is noise.
+
+This is the §2.9 result again in a different costume: the mechanism was never
+the binding constraint. Publishing the 82.6% figure without the ceiling
+measurement beside it would have been the same error this document opens with
+-- a real effect, measured honestly, that changes nothing.
+
+It is kept, and left on, for one reason that is a hypothesis rather than a
+finding: the case it is built for is JOB scale. At 17 tables the candidate
+generator samples a handful of orderings out of millions and cannot cover the
+space, so "correct the estimate and let the planner search" reaches plans no
+enumeration will produce. That is untested here -- it needs the JOB collection
+§2.3 says is missing -- and it is why the feature ships behind
+`ENABLE_ROWS_CORRECTION=0` rather than being presented as a win.
 
 ## 2.9 The benchmark was the bottleneck
 

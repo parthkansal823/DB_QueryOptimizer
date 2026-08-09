@@ -173,7 +173,7 @@ which works with no model at all:
 docker compose exec backend python -m app.collect_data   # Phase 1: fill plan_execution_log
 docker compose exec backend python -m app.train          # Phase 3: train models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark      # Phase 4: native vs. learned, full workload
-docker compose exec backend pytest                       # backend test suite (200 tests)
+docker compose exec backend pytest                       # backend test suite (238 tests)
 ```
 
 Compare policies, or the regression guard, directly:
@@ -259,6 +259,7 @@ learned-query-optimizer/
 │           ├── regression_guard.py  per-query blocking, backward-looking
 │           ├── planner.py        the production path: plan N, run 1
 │           ├── regret.py         cumulative regret
+│           ├── cardinality.py   learned q-error + Rows() corrections
 │           └── learned.py        plan selection + forward-looking safety veto
 ├── frontend/                 Phase 5: React (Vite) + Recharts dashboard
 └── docs/
@@ -302,6 +303,17 @@ against your own logged results.
 
 Making it optimize more queries produces *less* net improvement and starts
 causing regressions. The extra activity is all bets the model was unsure about.
+
+**Correcting the estimate is not the same as having somewhere to go.** The
+newest addition learns how wrong PostgreSQL's *join* row estimates are and
+feeds corrections back with `pg_hint_plan`'s `Rows()` hint, so the planner
+searches with a better premise instead of being overridden. The mechanism is
+verified (a query estimated at 4 rows reports 400 under `Rows(o u *100)`) and
+it beats native by up to 83% on the correlation traps. It also raises the
+oracle ceiling by **0.0%**, because every one of those wins was already
+reachable through the existing hints. Kept for the JOB-scale case it was built
+for, disabled with `ENABLE_ROWS_CORRECTION=0`, and written up as the null
+result it is (§2.8.1).
 
 **Robustness mattered more than prediction quality.** A per-query regression
 guard, which blocks the learned path for queries with a measured history of

@@ -33,6 +33,7 @@ path outright.
 
 from __future__ import annotations
 
+import os
 import time
 
 from app.optimizer.hints import (
@@ -42,6 +43,18 @@ from app.optimizer.hints import (
     plan_fingerprint,
 )
 from app.plan_extractor import get_plan
+
+
+# Learned `Rows(...)` corrections as an extra candidate. On the synthetic
+# schema this measurably does *not* pay: the corrected plan beats native by up
+# to 83% on the correlation-trap queries, but every one of those wins was
+# already reachable through the existing Leading()/Set() candidates, so the
+# oracle ceiling moves 0.0% (docs/WRITEUP.md 2.8.1). It is left on because the
+# cost is one planning cycle and the case it is built for is JOB-scale queries,
+# where the action space is a random sample of millions of orderings and cannot
+# cover the space -- there, correcting the estimate and letting the planner
+# search is the only route to plans no hint enumerates. Set to "0" to turn off.
+ENABLE_ROWS_CORRECTION = os.getenv("ENABLE_ROWS_CORRECTION", "1") != "0"
 
 
 def candidate_hints(
@@ -56,17 +69,15 @@ def candidate_hints(
     appended as a single extra candidate, handing Postgres better row estimates
     and letting its own planner decide.
 
-    That candidate is the only one in the set that can produce a plan shape the
-    generator cannot express, so it is worth having even though it is just one
-    more entry. Shared by both serving paths so the action space they explore
-    cannot drift apart -- `/query/analyze` scoring candidates that
-    `/query/optimize` would never generate is the sort of train/serve skew that
-    docs/WRITEUP.md 2.9 already caught once.
+    Shared by both serving paths so the action space they explore cannot drift
+    apart -- `/query/analyze` scoring candidates that `/query/optimize` would
+    never generate is the sort of train/serve skew that docs/WRITEUP.md 2.9
+    already caught once.
     """
     hints = generate_candidates(tables, max_order_candidates=max_candidates)
 
     corrector = getattr(optimizer, "join_corrector", None)
-    if corrector is not None:
+    if corrector is not None and ENABLE_ROWS_CORRECTION:
         rows_hint = corrected_cardinality_hint(
             corrector.rows_hints(baseline_plan.get("raw_plan", {}))
         )
