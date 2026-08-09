@@ -35,8 +35,44 @@ from __future__ import annotations
 
 import time
 
-from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
+from app.optimizer.hints import (
+    apply_hint,
+    corrected_cardinality_hint,
+    generate_candidates,
+    plan_fingerprint,
+)
 from app.plan_extractor import get_plan
+
+
+def candidate_hints(
+    optimizer, baseline_plan: dict, tables: list[str], max_candidates: int = 8
+) -> list[str]:
+    """
+    The full action space for one query.
+
+    The hint families from `hints.py` all *force* something -- a join order, an
+    operator ban. This adds one more that does the opposite: if a join-level
+    cardinality corrector has been trained, its `Rows(...)` corrections are
+    appended as a single extra candidate, handing Postgres better row estimates
+    and letting its own planner decide.
+
+    That candidate is the only one in the set that can produce a plan shape the
+    generator cannot express, so it is worth having even though it is just one
+    more entry. Shared by both serving paths so the action space they explore
+    cannot drift apart -- `/query/analyze` scoring candidates that
+    `/query/optimize` would never generate is the sort of train/serve skew that
+    docs/WRITEUP.md 2.9 already caught once.
+    """
+    hints = generate_candidates(tables, max_order_candidates=max_candidates)
+
+    corrector = getattr(optimizer, "join_corrector", None)
+    if corrector is not None:
+        rows_hint = corrected_cardinality_hint(
+            corrector.rows_hints(baseline_plan.get("raw_plan", {}))
+        )
+        if rows_hint:
+            hints.append(rows_hint)
+    return hints
 
 
 def plan_query(
@@ -62,7 +98,7 @@ def plan_query(
 
     candidates = []
     seen_plans = {plan_fingerprint(baseline)}
-    for hint in generate_candidates(tables, max_order_candidates=max_candidates):
+    for hint in candidate_hints(optimizer, baseline, tables, max_candidates=max_candidates):
         try:
             plan = get_plan(cur, apply_hint(sql, hint), analyze=False)
         except Exception:  # noqa: BLE001 - a rejected hint is not a request failure

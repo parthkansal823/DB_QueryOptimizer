@@ -8,8 +8,33 @@ Postgres's single default choice.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import random
+
+
+def _rng_for(tables: list[str]) -> random.Random:
+    """
+    A generator seeded from the table list itself.
+
+    Sampling used the global `random`, so a query with more tables than the
+    candidate budget got a *different* action space on every call. Training
+    collection saw one subset, inference saw another, and the model was asked
+    to score plans it had never been shown. Two benchmark runs meant to differ
+    only in a flag (`--no-guard`, say) were also comparing different candidate
+    sets, which quietly undermines every A/B in the writeup.
+
+    This bites well before the "large query" case it was written for: six
+    tables is 720 permutations against a budget of 8, and the v2 workload
+    (docs/WRITEUP.md 2.9) is built around 5- and 6-way joins.
+
+    Seeding from the tables keeps sampling deterministic per query without a
+    global seed, so a process that never calls `random.seed` still reproduces
+    its own action space, and two different queries still get different draws.
+    """
+    # Not a security hash -- just a stable way to turn a table list into a seed.
+    digest = hashlib.md5(" ".join(tables).encode(), usedforsecurity=False).hexdigest()
+    return random.Random(int(digest[:16], 16))
 
 
 def generate_join_order_candidates(tables: list[str], max_candidates: int = 8) -> list[str]:
@@ -18,17 +43,21 @@ def generate_join_order_candidates(tables: list[str], max_candidates: int = 8) -
 
     Small queries (<=5 tables): enumerate every permutation.
     Larger queries: permutations explode factorially (10 tables = 3.6M),
-    so we randomly sample `max_candidates` distinct orderings instead.
-    This is a real limitation worth naming explicitly in your writeup --
-    it's also exactly why systems like Bao use a *learned* model to pick
-    good candidates rather than exhaustive search.
+    so we sample `max_candidates` distinct orderings instead -- deterministically
+    for a given table set, see `_rng_for`. This is a real limitation worth
+    naming explicitly in your writeup -- it's also exactly why systems like Bao
+    use a *learned* model to pick good candidates rather than exhaustive search.
     """
     if len(tables) <= 1:
         return []
 
     all_perms = list(itertools.permutations(tables))
 
-    chosen = all_perms if len(all_perms) <= max_candidates else random.sample(all_perms, max_candidates)
+    chosen = (
+        all_perms
+        if len(all_perms) <= max_candidates
+        else _rng_for(tables).sample(all_perms, max_candidates)
+    )
 
     return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
 
@@ -36,6 +65,20 @@ def generate_join_order_candidates(tables: list[str], max_candidates: int = 8) -
 def apply_hint(query: str, hint: str) -> str:
     """Prepend a pg_hint_plan hint comment to a SQL query."""
     return f"{hint}\n{query}"
+
+
+def corrected_cardinality_hint(rows_hints: list[str]) -> str | None:
+    """
+    Wrap learned `Rows(...)` corrections into a single hint comment.
+
+    Unlike every other candidate this module produces, the result does not
+    force a plan. It hands the planner better row estimates and lets it decide
+    for itself -- so the plan that comes back can be one no `Leading()` or
+    `Set()` candidate is able to express. See `optimizer/cardinality.py`.
+    """
+    if not rows_hints:
+        return None
+    return "/*+ " + " ".join(rows_hints) + " */"
 
 
 # -- Stretch goal: join *method* selection, not just join order -------------
@@ -70,7 +113,11 @@ def generate_join_method_candidates(
         return []
 
     all_perms = list(itertools.permutations(tables))
-    orders = all_perms if len(all_perms) <= max_orders else random.sample(all_perms, max_orders)
+    orders = (
+        all_perms
+        if len(all_perms) <= max_orders
+        else _rng_for(tables).sample(all_perms, max_orders)
+    )
 
     return [_method_hint_for_order(order, method) for order in orders for method in methods]
 

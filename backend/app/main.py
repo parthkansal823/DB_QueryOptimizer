@@ -10,9 +10,9 @@ from app import model_store, retrain, stats
 from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
 from app.logging_store import log_execution, query_fingerprint
-from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
+from app.optimizer.hints import apply_hint, plan_fingerprint
 from app.optimizer.learned import LearnedOptimizer
-from app.optimizer.planner import optimize_and_execute
+from app.optimizer.planner import candidate_hints, optimize_and_execute
 from app.optimizer.regression_guard import RegressionGuard
 from app.optimizer.regret import regret_curve
 from app.plan_extractor import get_plan
@@ -108,7 +108,7 @@ def analyze_query(req: QueryRequest):
         # look bigger than it is and guarantees a 0% improvement.
         candidate_plans = []
         seen_plans = {plan_fingerprint(baseline_plan)}
-        for hint in generate_candidates(tables):
+        for hint in candidate_hints(optimizer, baseline_plan, tables):
             try:
                 plan = get_plan(cur, apply_hint(req.sql, hint))
             except Exception:  # noqa: BLE001 - one bad hint shouldn't fail the request

@@ -117,12 +117,15 @@ class LearnedOptimizer:
             self.gate_calibration = calibrated
         self._rng = random.Random(seed)
         self.last_decision: dict = {}
+        self.join_corrector = None
 
         if os.path.exists(model_path):
             with open(model_path, "rb") as f:
                 bundle = pickle.load(f)
             self.model = bundle["model"]
             self.ranker = bundle.get("ranker")
+            # Older bundles predate join-level correction; absent is fine.
+            self.join_corrector = bundle.get("join_corrector")
             self.feature_columns = bundle["feature_columns"]
             self.table_cardinalities = bundle["table_cardinalities"]
             self.target = bundle.get("target", "actual_total_time_ms")

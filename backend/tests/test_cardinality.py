@@ -48,11 +48,25 @@ def test_zero_row_scans_do_not_blow_up():
     assert math.isfinite(log_qerror)
 
 
-def test_loops_are_multiplied_into_actual_rows():
-    """A nested-loop inner scan reports per-loop rows; the total is what matters."""
+def test_loop_count_does_not_invent_a_qerror():
+    """
+    `Actual Rows` and `Plan Rows` are both per-execution, so a scan estimated
+    perfectly is estimated perfectly however many times it runs.
+
+    This previously multiplied the actual side by `Actual Loops` and compared
+    it against a per-loop estimate, which reported log(50) of error for a scan
+    that was exactly right -- and did so on nested-loop inner scans, the nodes
+    where cardinality error actually matters.
+    """
     (_, single), = scan_nodes_with_actuals(_scan(100, 100, loops=1))
     (_, looped), = scan_nodes_with_actuals(_scan(100, 100, loops=50))
-    assert looped > single
+    assert single == looped == 0.0
+
+
+def test_a_real_underestimate_is_still_reported_under_loops():
+    """The fix must not flatten genuine error; only the phantom kind."""
+    (_, log_qerror), = scan_nodes_with_actuals(_scan(10, 1000, loops=50))
+    assert log_qerror > 4.0  # log(1001/11) ~= 4.5
 
 
 def test_features_capture_filter_complexity():

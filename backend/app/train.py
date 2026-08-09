@@ -30,6 +30,7 @@ import random
 from app.db import get_cursor
 from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
+from app.optimizer.cardinality import JoinCardinalityCorrector
 from app.optimizer.features import build_feature_columns, featurize, to_vector
 from app.optimizer.ranker import PairwisePlanRanker
 from app.plan_extractor import _extract_join_types, _extract_scan_relations, _extract_tables
@@ -338,6 +339,17 @@ def train(
     except ValueError as exc:  # too few distinct latencies to learn an ordering
         print(f"[warn] pairwise ranker not trained: {exc}")
 
+    # Join-level cardinality correction, learned from the same executed plans.
+    # Trained on the training queries only, for the same reason the selector is:
+    # a corrector that has seen a held-out query's actual row counts would make
+    # the evaluation of that query meaningless.
+    train_plans = [rows[i]["raw_plan"] for i in train_idx]
+    join_corrector = None
+    try:
+        join_corrector = JoinCardinalityCorrector(make_regressor).fit(train_plans)
+    except ValueError as exc:  # not enough join observations yet
+        print(f"[warn] join cardinality corrector not trained: {exc}")
+
     preds_test = ensemble.predict(X_test)
     # Error is now in log-ratio space. exp(MAE) reads as "typical multiplicative
     # error": 1.15 means predictions are typically off by ~15%.
@@ -357,6 +369,9 @@ def train(
     results = {
         "model_backend": f"bootstrapped-ensemble[{n_models}x {backend_name}]",
         "pairwise_ranker": "trained" if ranker is not None else "not trained",
+        "join_cardinality_corrector": (
+            "trained" if join_corrector is not None else "not trained"
+        ),
         "n_rows_raw": n_raw_rows,
         "reps_aggregated_to_median": aggregate_reps,
         "n_rows_total": len(rows),
@@ -379,6 +394,7 @@ def train(
             {
                 "model": ensemble,
                 "ranker": ranker,
+                "join_corrector": join_corrector,
                 "target": "log_ratio_vs_native",
                 "feature_columns": feature_columns,
                 "table_cardinalities": table_cardinalities,

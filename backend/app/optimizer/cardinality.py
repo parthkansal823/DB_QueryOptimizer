@@ -30,18 +30,40 @@ Applied at inference, it gives a corrected row estimate:
 
     corrected_rows = estimated_rows * exp(predicted_log_ratio)
 
-## How it's used, and the honest limit
+## Two things are learned here
 
-The correction feeds `features.py` as an extra signal -- "this scan's
-estimate is probably a 5x underestimate" is exactly the kind of thing a plan
-selector should know, and it is information Postgres's own cost model does
-not have.
+**Scan-level q-error** (`CardinalityCorrector`) predicts how wrong a base
+relation scan's estimate is. It feeds `features.py` as an extra signal --
+"this scan's estimate is probably a 5x underestimate" is exactly the kind of
+thing a plan selector should know, and Postgres's own cost model does not
+have it.
 
-It is *not* fed back into Postgres's planner. Doing that properly would mean
-intercepting cardinality estimation inside the planner itself (what
-pg_hint_plan's `Rows` hint enables, and what a system like Bao deliberately
-avoids). That is a substantially larger change and is named as future work
-rather than attempted here.
+**Join-level q-error** (`JoinCardinalityCorrector`) is the more interesting
+one, because it can be *fed back into the planner*. Every other candidate in
+this system works around a bad estimate by forcing a plan shape:
+`Leading(...)` dictates a join order, `Set(enable_hashjoin off)` bans an
+operator. All of them override a planner that is reasoning correctly from
+wrong numbers.
+
+pg_hint_plan's `Rows` hint takes the opposite route. `Rows(a b *10)` tells
+Postgres that the join of `a` and `b` yields ten times what it thinks, and
+then lets its own decades-tuned planner choose freely with a better number in
+hand. So instead of arguing with the conclusion, this corrects the premise.
+
+That distinction matters for the shape of the result. A forced join order is
+one plan; a corrected estimate can produce a plan no hint in the action space
+would have generated, including plan shapes the candidate generator cannot
+express at all.
+
+## Why join level is where the leverage is
+
+Postgres estimates a join as `left_rows * right_rows * selectivity`, treating
+the two sides as independent. That assumption is what breaks under correlated
+predicates, and the error compounds multiplicatively as joins stack -- so the
+error at a join is not merely inherited from its scans, it is *manufactured*
+at the join itself. `log_implied_selectivity` below is that assumption made
+into a feature: it is exactly the quantity Postgres guesses and this model
+learns to correct.
 """
 
 from __future__ import annotations
@@ -77,13 +99,19 @@ def scan_nodes_with_actuals(plan: dict, depth: int = 0):
     """
     if "Relation Name" in plan and "Actual Rows" in plan:
         estimated = float(plan.get("Plan Rows") or 0)
+
+        # Per-execution on both sides. PostgreSQL reports `Actual Rows` as an
+        # average over `Actual Loops`, and `Plan Rows` is the estimate for a
+        # single execution, so the two compare directly. Multiplying the
+        # actual side by the loop count (which this did) manufactured a
+        # log-qerror of log(loops) on every correctly-estimated scan sitting
+        # on the inner side of a nested loop -- the exact nodes whose
+        # cardinality matters most, taught with the exact wrong label.
         actual = float(plan.get("Actual Rows") or 0)
-        loops = float(plan.get("Actual Loops") or 1)
-        actual_total = actual * loops
 
         # +1 keeps zero-row scans (very common under selective filters) from
         # producing an infinite ratio.
-        log_qerror = math.log((actual_total + 1.0) / (estimated + 1.0))
+        log_qerror = math.log((actual + 1.0) / (estimated + 1.0))
 
         node_type = plan.get("Node Type", "")
         filter_text = plan.get("Filter", "") or ""
@@ -155,6 +183,191 @@ class CardinalityCorrector:
             if alias in corrections:
                 corrected[alias] = estimated * math.exp(corrections[alias])
         return corrected
+
+
+# -- join-level correction, fed back into the planner -----------------------
+
+JOIN_NODE_TYPES = ("Nested Loop", "Hash Join", "Merge Join")
+
+JOIN_QERROR_FEATURES = [
+    "log_estimated_rows",
+    "log_left_rows",
+    "log_right_rows",
+    # Postgres's independence assumption, made measurable: the selectivity it
+    # implicitly applied to the cross product. When predicates on the two
+    # sides are correlated this is the number that is wrong.
+    "log_implied_selectivity",
+    "n_relations",
+    "depth_in_tree",
+    "n_filtered_children",
+    "is_nested_loop",
+    "is_hash_join",
+    "is_merge_join",
+]
+
+# Corrections below this are noise, and a hint that says "you were right" only
+# adds risk. 1.5x in either direction is the band where re-planning is unlikely
+# to change anything anyway.
+MIN_CORRECTION_FACTOR = 1.5
+
+# However confident the model is, a single hint should not be able to move an
+# estimate by more than this. An unbounded multiplier on a badly extrapolated
+# prediction is how a correction turns into a catastrophe.
+MAX_CORRECTION_FACTOR = 1000.0
+
+
+def relations_under(node: dict) -> tuple[str, ...]:
+    """
+    Base relation aliases beneath a plan node, sorted.
+
+    This is the key a `Rows` hint is addressed by: `Rows(a b *10)` matches the
+    join that brings together exactly the relations `a` and `b`, whatever
+    shape the planner gives it.
+    """
+    found: list[str] = []
+    if "Relation Name" in node:
+        found.append(node.get("Alias", node["Relation Name"]))
+    for child in node.get("Plans", []):
+        found.extend(relations_under(child))
+    return tuple(sorted(found))
+
+
+def _join_feature_row(node: dict, depth: int) -> dict[str, float] | None:
+    """Estimate-only features for one join node, or None if unusable."""
+    children = node.get("Plans", [])
+    if len(children) < 2:
+        return None
+
+    estimated = float(node.get("Plan Rows") or 0)
+    left = float(children[0].get("Plan Rows") or 0)
+    right = float(children[1].get("Plan Rows") or 0)
+    cross = max(left, 1.0) * max(right, 1.0)
+
+    node_type = node.get("Node Type", "")
+    return {
+        "log_estimated_rows": math.log1p(estimated),
+        "log_left_rows": math.log1p(left),
+        "log_right_rows": math.log1p(right),
+        "log_implied_selectivity": math.log((estimated + 1.0) / cross),
+        "n_relations": float(len(relations_under(node))),
+        "depth_in_tree": float(depth),
+        "n_filtered_children": float(
+            sum(1 for c in children if c.get("Filter") or c.get("Recheck Cond"))
+        ),
+        "is_nested_loop": 1.0 if node_type == "Nested Loop" else 0.0,
+        "is_hash_join": 1.0 if node_type == "Hash Join" else 0.0,
+        "is_merge_join": 1.0 if node_type == "Merge Join" else 0.0,
+    }
+
+
+def join_nodes(plan: dict, depth: int = 0):
+    """Yield (node, features, relations) for every join, estimate-only."""
+    if plan.get("Node Type") in JOIN_NODE_TYPES:
+        features = _join_feature_row(plan, depth)
+        if features is not None:
+            yield plan, features, relations_under(plan)
+    for child in plan.get("Plans", []):
+        yield from join_nodes(child, depth + 1)
+
+
+def join_nodes_with_actuals(plan: dict, depth: int = 0):
+    """
+    Yield (features, log_qerror, relations) for joins that have actuals.
+
+    Per-execution on both sides, for the reason spelled out in
+    `scan_nodes_with_actuals`.
+    """
+    for node, features, relations in join_nodes(plan, depth):
+        if "Actual Rows" not in node:
+            continue
+        estimated = float(node.get("Plan Rows") or 0)
+        actual = float(node.get("Actual Rows") or 0)
+        yield features, math.log((actual + 1.0) / (estimated + 1.0)), relations
+
+
+def build_join_training_set(raw_plans: list[dict]) -> tuple[list[list[float]], list[float]]:
+    X, y = [], []
+    for plan in raw_plans:
+        for features, log_qerror, _ in join_nodes_with_actuals(plan):
+            X.append([features[c] for c in JOIN_QERROR_FEATURES])
+            y.append(log_qerror)
+    return X, y
+
+
+def format_rows_hint(relations: tuple[str, ...], factor: float) -> str:
+    """
+    One pg_hint_plan `Rows` correction.
+
+    The multiplier form is used rather than an absolute `#n` because the model
+    predicts a *ratio*: it has learned how wrong Postgres tends to be, not what
+    the answer is. Multiplying keeps whatever the planner already knows about
+    the shape of the data and adjusts it.
+    """
+    return f"Rows({' '.join(relations)} *{factor:.4g})"
+
+
+class JoinCardinalityCorrector:
+    """
+    Learns how wrong Postgres's join estimates are, and says so in a language
+    the planner understands.
+    """
+
+    def __init__(self, build_model=None):
+        self.build_model = build_model
+        self.model = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["build_model"] = None
+        return state
+
+    def fit(self, raw_plans: list[dict]) -> "JoinCardinalityCorrector":
+        X, y = build_join_training_set(raw_plans)
+        if len(X) < 20:
+            raise ValueError(f"only {len(X)} join observations; too few to learn q-error")
+        self.model = self.build_model()
+        self.model.fit(X, y)
+        return self
+
+    def predict_factors(self, plan: dict) -> dict[tuple[str, ...], float]:
+        """relations -> the multiplier this model would apply to their join."""
+        if self.model is None:
+            return {}
+
+        rows, keys = [], []
+        for _, features, relations in join_nodes(plan):
+            # A single-relation "join" cannot be addressed by a Rows hint, and
+            # duplicate relation sets (the same join reached twice) would emit
+            # contradictory hints for one node.
+            if len(relations) < 2 or relations in keys:
+                continue
+            keys.append(relations)
+            rows.append([features[c] for c in JOIN_QERROR_FEATURES])
+
+        if not rows:
+            return {}
+
+        factors = {}
+        for relations, log_ratio in zip(keys, self.model.predict(rows), strict=True):
+            factor = math.exp(float(log_ratio))
+            factors[relations] = min(max(factor, 1.0 / MAX_CORRECTION_FACTOR), MAX_CORRECTION_FACTOR)
+        return factors
+
+    def rows_hints(
+        self, plan: dict, min_factor: float = MIN_CORRECTION_FACTOR
+    ) -> list[str]:
+        """
+        `Rows(...)` corrections worth sending to the planner.
+
+        Only corrections outside [1/min_factor, min_factor] are emitted. A hint
+        that barely moves an estimate cannot change the plan, so issuing it
+        trades no upside for the risk of being wrong.
+        """
+        hints = []
+        for relations, factor in sorted(self.predict_factors(plan).items()):
+            if factor >= min_factor or factor <= 1.0 / min_factor:
+                hints.append(format_rows_hint(relations, factor))
+        return hints
 
 
 def _scan_features(plan: dict, depth: int = 0):

@@ -86,7 +86,16 @@ def analyze_plan(plan: dict) -> list[dict]:
         actual_raw = node.get("Actual Rows")
         if actual_raw is None:
             continue  # plan was never executed; nothing to compare against
-        actual = float(actual_raw) * float(node.get("Actual Loops") or 1)
+
+        # Both numbers are per-execution. PostgreSQL reports `Actual Rows` as
+        # an average across `Actual Loops`, and `Plan Rows` is likewise the
+        # estimate for one execution -- so they compare directly. Scaling only
+        # the actual side by the loop count (which this did) invented a
+        # q-error equal to the number of loops on every node on the inner side
+        # of a nested loop, and those are precisely the nodes the advisor is
+        # supposed to reason about. A scan estimated perfectly at 100 rows and
+        # executed 50 times was being reported as a 50x misestimate.
+        actual = float(actual_raw)
 
         relation = node.get("Relation Name")
         filter_text = node.get("Filter") or ""

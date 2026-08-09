@@ -39,7 +39,8 @@ def query_fingerprint(sql: str) -> str:
     id in SQL for rows written before ids were assigned.
     """
     normalized = _WHITESPACE.sub(" ", sql.strip())
-    return ADHOC_PREFIX + hashlib.md5(normalized.encode()).hexdigest()
+    # Not a security hash -- an identity for grouping rows by query text.
+    return ADHOC_PREFIX + hashlib.md5(normalized.encode(), usedforsecurity=False).hexdigest()
 
 
 # The SQL equivalent of `query_fingerprint`, applied as a fallback so rows

@@ -22,7 +22,8 @@ import argparse
 from app.db import get_cursor
 from app.logging_store import log_execution
 from app.optimizer.bandit import POLICIES
-from app.optimizer.hints import apply_hint, generate_candidates, plan_fingerprint
+from app.optimizer.hints import apply_hint, plan_fingerprint
+from app.optimizer.planner import candidate_hints
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer.regression_guard import RegressionGuard
 from app.plan_extractor import get_plan
@@ -52,7 +53,7 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
 
             candidates = []
             seen_plans = {plan_fingerprint(baseline)}
-            for hint in generate_candidates(tables):
+            for hint in candidate_hints(optimizer, baseline, tables):
                 cur.execute("SAVEPOINT cand")
                 try:
                     plan = get_plan(cur, apply_hint(sql, hint))
