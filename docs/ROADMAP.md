@@ -114,6 +114,16 @@ feature list. `docs/WRITEUP.md` §2.4 has the evidence.
   (4 estimated rows becomes 400 under `Rows(o u *100)`); measured to raise the
   oracle ceiling by 0.0% on this schema, and written up as the null result it
   is (`docs/WRITEUP.md` 2.8.1). Disable with `ENABLE_ROWS_CORRECTION=0`.
+- **Paired A/B experiments with confidence intervals** (`app/experiment.py`):
+  interleaved arms, bootstrap intervals and a sign test, so a comparison is
+  reported as *unresolved* when the interval spans zero instead of being read
+  off three runs. `app.benchmark` returning nothing was the reason the sample
+  size in §2.4 was 3.
+- **Integration tests and CI** (`tests/test_integration_hints.py`,
+  `.github/workflows/ci.yml`): the unit suite runs with no database; a second
+  job builds Postgres with pg_hint_plan and asserts against a live planner that
+  hints actually bind. These are the tests that would have caught §2.0, whose
+  absence let 200 passing tests sit on top of a pipeline doing nothing.
 - **Honest dashboard reporting** (`app/stats.py`): every before-and-after
   figure is a matched pair from the same run. The panel previously divided two
   averages taken over different sets of queries and reported a 97% win that

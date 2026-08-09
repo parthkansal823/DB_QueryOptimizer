@@ -98,26 +98,61 @@ def sign_test_p_value(differences: list[float]) -> float | None:
     return min(1.0, 2 * tail / (2 ** n))
 
 
-def compare(arm_a: Arm, arm_b: Arm, runs: int, quiet: bool = True) -> dict:
-    """Run both arms interleaved and report the paired difference."""
+def compare(
+    arm_a: Arm,
+    arm_b: Arm,
+    runs: int,
+    quiet: bool = True,
+    limit: int | None = None,
+    checkpoint: str | None = None,
+) -> dict:
+    """
+    Run both arms interleaved and report the paired difference.
+
+    A run that fails is dropped as a *pair* rather than partially recorded.
+    Keeping half of one would silently unpair the comparison, which is the one
+    thing this module exists to avoid. Failures are counted and reported.
+
+    Long experiments checkpoint after every pair. A 20-run comparison takes
+    over an hour, and losing it to a dropped connection at run 18 is how an
+    experiment quietly becomes n=3 again.
+    """
+    failures = 0
     for i in range(runs):
         # Order flips each round so neither arm systematically runs on a colder
         # cache than the other.
         order = (arm_a, arm_b) if i % 2 == 0 else (arm_b, arm_a)
-        for arm in order:
-            result = run_benchmark(quiet=quiet, **arm.kwargs)
-            captured = result["captured_pct"]
-            arm.captured.append(float(captured) if captured is not None else 0.0)
+        pair = {}
+        try:
+            for arm in order:
+                result = run_benchmark(quiet=quiet, limit=limit, **arm.kwargs)
+                captured = result["captured_pct"]
+                pair[arm.label] = float(captured) if captured is not None else 0.0
+        except Exception as exc:  # noqa: BLE001 - one lost run must not lose the rest
+            failures += 1
+            print(f"  run {i + 1:>2}/{runs}: FAILED, pair discarded ({type(exc).__name__}: {exc})",
+                  flush=True)
+            continue
+
+        arm_a.captured.append(pair[arm_a.label])
+        arm_b.captured.append(pair[arm_b.label])
         print(
             f"  run {i + 1:>2}/{runs}: "
             f"{arm_a.label} {arm_a.captured[-1]:+7.1f}%   "
             f"{arm_b.label} {arm_b.captured[-1]:+7.1f}%",
             flush=True,
         )
+        if checkpoint:
+            with open(checkpoint, "w") as f:
+                json.dump({arm_a.label: arm_a.captured, arm_b.label: arm_b.captured}, f, indent=2)
+
+    if not arm_a.captured:
+        raise RuntimeError(f"every run failed ({failures}/{runs}); nothing to compare")
 
     differences = [a - b for a, b in zip(arm_a.captured, arm_b.captured, strict=True)]
     return {
-        "runs": runs,
+        "runs": len(differences),
+        "failed_runs": failures,
         "arms": {
             arm.label: {
                 "captured_pct": arm.captured,
@@ -141,7 +176,9 @@ def compare(arm_a: Arm, arm_b: Arm, runs: int, quiet: bool = True) -> dict:
 
 
 def _print_report(result: dict) -> None:
-    print(f"\n=== {result['runs']} paired runs ===\n")
+    failed = result.get("failed_runs", 0)
+    note = f", {failed} discarded" if failed else ""
+    print(f"\n=== {result['runs']} paired runs{note} ===\n")
     print(f"{'arm':<16}{'mean':>9}{'median':>9}{'stdev':>9}   {'95% CI':>18}  negative")
     for label, arm in result["arms"].items():
         lo, hi = arm["ci95"]
@@ -178,6 +215,10 @@ def main() -> None:
     parser.add_argument("--arm-b", default="pairwise_rank", help="for --compare policy")
     parser.add_argument("--out", default=None, help="write the full result as JSON")
     parser.add_argument("--verbose", action="store_true", help="show per-query detail")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="use only the first N workload queries (smoke runs)")
+    parser.add_argument("--checkpoint", default=None,
+                        help="write partial results here after every pair")
     args = parser.parse_args()
 
     if args.compare == "guard":
@@ -188,7 +229,8 @@ def main() -> None:
         arm_b = Arm(args.arm_b, {"policy": args.arm_b, "use_guard": True})
 
     print(f"comparing {arm_a.label} vs {arm_b.label}, {args.runs} paired runs, interleaved\n")
-    result = compare(arm_a, arm_b, args.runs, quiet=not args.verbose)
+    result = compare(arm_a, arm_b, args.runs, quiet=not args.verbose,
+                     limit=args.limit, checkpoint=args.checkpoint)
     _print_report(result)
 
     if args.out:

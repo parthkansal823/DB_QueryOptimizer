@@ -173,10 +173,23 @@ which works with no model at all:
 docker compose exec backend python -m app.collect_data   # Phase 1: fill plan_execution_log
 docker compose exec backend python -m app.train          # Phase 3: train models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark      # Phase 4: native vs. learned, full workload
-docker compose exec backend pytest                       # backend test suite (238 tests)
+docker compose exec backend pytest                       # 238 unit tests, no database needed
+docker compose exec backend pytest -m integration        # 11 more: hints must actually bind
 ```
 
-Compare policies, or the regression guard, directly:
+Settle a comparison properly, with paired runs and confidence intervals
+rather than eyeballing three numbers:
+
+```bash
+docker compose exec backend python -m app.experiment --runs 20            # guard on vs off
+docker compose exec backend python -m app.experiment --runs 20     --compare policy --arm-a risk_averse --arm-b pairwise_rank
+```
+
+It interleaves the arms, discards a pair if either half fails, checkpoints as
+it goes, and reports a bootstrap interval plus a sign test. An interval that
+spans zero is reported as **unresolved**, however good the mean looks.
+
+Compare policies, or the regression guard, in a single run:
 
 ```bash
 docker compose exec backend python -m app.benchmark --policy risk_averse

@@ -444,6 +444,41 @@ first evidence here that a *robustness* mechanism, rather than a better
 predictor, is what turns this from "sometimes faster, sometimes much slower"
 into something you could deploy.
 
+**Why it stayed at three, and what replaced the excuse.** `app.benchmark`
+printed its numbers and returned nothing, so repeating it meant copying figures
+off a terminal by hand. Three runs is about as many as anyone does that way,
+and the sample size was set by the ergonomics of the tool rather than by the
+question.
+
+`app.experiment` now runs the comparison properly: arms interleaved so drift
+hits both equally, paired differences rather than two independent means,
+percentile-bootstrap confidence intervals (latency is too right-tailed to
+assume normality), and a sign test -- deliberately the weakest test available,
+because with runs this noisy anything stronger would report more confidence
+than the data holds. Failed runs discard the whole pair rather than silently
+unpairing the comparison, and results checkpoint after every pair so an
+hour-long experiment survives a dropped connection.
+
+A smoke run of the harness (4 pairs, first 6 queries only, `pairwise_rank`)
+already shows why the tooling mattered:
+
+| arm | mean | 95% CI | negative runs |
+|---|---|---|---|
+| guard on | 80.9% | [74.1, 85.0] | 0/4 |
+| guard off | 74.0% | [69.5, 78.5] | 0/4 |
+
+Paired difference **+6.9 pp, 95% CI [-2.6, +14.0], sign test p = 0.63**. The
+mean points the same way as the original result; the interval spans zero, so
+the verdict is *unresolved*.
+
+That is not a refutation of §2.4 -- it is 4 pairs on a 6-query subset, a
+smaller and easier sample than the 3 pairs on the full workload above, and the
+guard has fewer queries to block. What it does establish is that the honest
+verdict on this evidence is "unresolved", and that a mean of +6.9 or +27.7
+should not be read as an effect until an interval says so. The full experiment
+(`--runs 20`, whole workload, roughly two hours) is the one that settles it and
+has not been run here.
+
 ## 2.4.1 Fixing "native sometimes beats the learned path"
 
 The most common complaint about this system was also the most fair: on

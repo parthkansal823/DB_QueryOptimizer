@@ -35,6 +35,7 @@ def run(
     risk_lambda: float = 1.0,
     use_guard: bool = True,
     quiet: bool = False,
+    limit: int | None = None,
 ) -> dict:
     """Run the workload and return the run's metrics.
 
@@ -44,6 +45,7 @@ def run(
     so a 20-run experiment does not bury its own summary.
     """
     say = (lambda *a, **k: None) if quiet else print
+    workload = WORKLOAD[:limit] if limit else WORKLOAD
     optimizer = LearnedOptimizer(policy=policy, risk_lambda=risk_lambda, seed=0)
     selector_mode = "learned" if optimizer.model is not None else "heuristic"
     say(f"selector mode: {selector_mode}" + (f" (policy: {policy})" if selector_mode == "learned" else ""))
@@ -59,7 +61,7 @@ def run(
             say(f"regression guard: {len(blocked)} queries blocked from the learned path")
         say()
 
-        for item in WORKLOAD:
+        for item in workload:
             query_id, sql = item["id"], item["sql"]
             baseline = get_plan(cur, sql)
             tables = baseline["tables_scanned"]
@@ -144,13 +146,13 @@ def run(
     headroom = native_total - oracle_total
     captured = ((native_total - served_total) / headroom * 100) if headroom > 0 else None
 
-    say(f"=== totals across {len(WORKLOAD)} queries ===")
+    say(f"=== totals across {len(workload)} queries ===")
     say(f"native total:        {native_total:.2f} ms")
     say(f"served total:        {served_total:.2f} ms")
     say(f"oracle total (best): {oracle_total:.2f} ms")
     if captured is not None:
         say(f"captured {captured:.1f}% of the {headroom:.0f} ms available headroom")
-    say(f"safety vetoes: {n_vetoed}/{len(WORKLOAD)}   guard-blocked: {n_guarded}/{len(WORKLOAD)}")
+    say(f"safety vetoes: {n_vetoed}/{len(workload)}   guard-blocked: {n_guarded}/{len(workload)}")
 
     return {
         "policy": policy,
