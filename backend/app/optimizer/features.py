@@ -37,7 +37,7 @@ BASE_FEATURES = [
     "n_merge_join",
     "has_hint",
 ]
-PER_TABLE_SUFFIXES = ("present", "join_position", "selectivity", "index_scan")
+PER_TABLE_SUFFIXES = ("present", "join_position", "selectivity", "index_scan", "occurrences")
 
 
 def build_feature_columns(known_tables: list[str]) -> list[str]:
@@ -112,8 +112,27 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
         if table is None or table not in table_cardinalities:
             continue  # unmapped/unknown relation -- degrade gracefully, don't crash
 
+        # Slots are keyed by *table*, but a query can scan one table several
+        # times under different aliases -- `movie_info AS mi1, movie_info AS
+        # mi2` is common in JOB. Plain assignment made each occurrence
+        # overwrite the last, so a self-join was described by whichever alias
+        # happened to come last in the plan and the rest vanished from the
+        # vector entirely.
+        #
+        # Aggregating keeps the vector fixed-length -- still one slot per
+        # table, so the model shape still transfers across schemas -- while
+        # letting every occurrence contribute: earliest position (when the
+        # table enters the join), most selective scan (what drives the plan),
+        # index scan if any occurrence uses one, and a count so a self-join is
+        # distinguishable from a single scan at all.
+        seen_before = features[f"{table}_present"] == 1.0
         features[f"{table}_present"] = 1.0
-        features[f"{table}_join_position"] = float(i + 1) / max(len(tables_scanned), 1)
+        features[f"{table}_occurrences"] += 1.0
+
+        position = float(i + 1) / max(len(tables_scanned), 1)
+        features[f"{table}_join_position"] = (
+            min(features[f"{table}_join_position"], position) if seen_before else position
+        )
 
         node = scan_info.get(alias)
         # A table can legitimately report zero rows -- `reltuples` is -1 until
@@ -123,10 +142,16 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
         # tests, so the guard belongs at the division as well as the source.
         cardinality = table_cardinalities[table] or 1.0
         if node is not None:
-            features[f"{table}_selectivity"] = min(node["plan_rows"] / cardinality, 5.0)
-            features[f"{table}_index_scan"] = (
+            selectivity = min(node["plan_rows"] / cardinality, 5.0)
+            features[f"{table}_selectivity"] = (
+                min(features[f"{table}_selectivity"], selectivity)
+                if seen_before
+                else selectivity
+            )
+            uses_index = (
                 1.0 if ("Index" in node["node_type"] or "Bitmap" in node["node_type"]) else 0.0
             )
+            features[f"{table}_index_scan"] = max(features[f"{table}_index_scan"], uses_index)
 
     for table in known_tables:
         if features[f"{table}_present"] == 0.0:

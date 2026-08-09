@@ -42,7 +42,7 @@ work.
 - LightGBM gradient-boosted trees (`backend/app/train.py`) predicting
   candidate latency. Falls back to scikit-learn's
   `GradientBoostingRegressor` if the LightGBM native library is missing
-- Scored against the Phase 0 heuristic, native Postgres, **and** an oracle
+- Scored against the cost heuristic, native Postgres, **and** an oracle
   (the best candidate in hindsight). The oracle is what makes the other
   numbers readable. Results in `docs/WRITEUP.md` §2
 - **Contextual-bandit stretch goal [done]**: a bootstrapped ensemble
@@ -61,8 +61,8 @@ work.
 - Every `/query/analyze` call and every `app.benchmark` run logs to
   `plan_execution_log`, tagged with which selector produced it.
   `/stats/trend` turns that into "learned vs. native, over time"
-- Cold start handled honestly: it falls back to the Phase 0 heuristic until a
-  model is trained (see `docs/WRITEUP.md` §4)
+- Cold start handled honestly: it falls back to the cost heuristic until a
+  model is trained
 
 ## Stage 5 -- Dashboard and writeup [done]
 - React (Vite) + Recharts dashboard (`frontend/`): paste a query and see
@@ -70,8 +70,8 @@ work.
   decision went the way it did, and the history so far.
   `docs/DASHBOARD.md` explains each panel, `docs/METRICS.md` explains each
   number
-- `docs/WRITEUP.md`: literature review, a comparison table (this project vs.
-  Neo vs. Bao vs. native Postgres), results, and a limitations section
+- `docs/WRITEUP.md`: how this compares to published work (Neo, Bao, native
+  Postgres), the results, and the things that turned out to matter most
 
 ## Beyond the original scope [done]
 
@@ -142,4 +142,4 @@ each.
   (`data/job/load_job.sh`) downloads and imports the real 21-table IMDB
   dataset and 113 JOB queries into a second database. The join-order and
   join-method pipeline needed zero code changes to point at it, thanks to the
-  Phase 2 schema-introspection work
+  stage 2 schema-introspection work

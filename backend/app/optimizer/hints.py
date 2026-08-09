@@ -85,22 +85,102 @@ def _sample_orders(tables: list[str], k: int, rng: random.Random) -> list[tuple[
     return chosen
 
 
-def generate_join_order_candidates(tables: list[str], max_candidates: int = 8) -> list[str]:
+def _is_connected_order(order: tuple[str, ...], join_graph: dict[str, list[str]]) -> bool:
+    """True if every table after the first joins to one already placed."""
+    placed = {order[0]}
+    for table in order[1:]:
+        if not set(join_graph.get(table, ())) & placed:
+            return False
+        placed.add(table)
+    return True
+
+
+def _sample_connected_orders(
+    tables: list[str], join_graph: dict[str, list[str]], k: int, rng: random.Random
+) -> list[tuple[str, ...]]:
+    """
+    Up to `k` orderings that never force a cartesian product.
+
+    Grows each order one *neighbour* at a time rather than filtering random
+    permutations. Above a few tables the connected orders are a vanishing
+    fraction of all permutations, so rejection sampling would spend almost all
+    its draws on candidates it then discards; building only reachable orders
+    means every draw is usable.
+    """
+    orders: set[tuple[str, ...]] = set()
+
+    # Bounded: a sparse or disconnected graph may not be able to fill the
+    # quota, and this must not spin looking for orders that do not exist.
+    for _ in range(k * 40):
+        if len(orders) >= k:
+            break
+        remaining = set(tables)
+        order = [rng.choice(sorted(remaining))]
+        remaining.discard(order[0])
+        while remaining:
+            reachable = sorted(
+                t for t in remaining if set(join_graph.get(t, ())) & set(order)
+            )
+            if not reachable:
+                break  # this draw cannot be completed; start another
+            nxt = rng.choice(reachable)
+            order.append(nxt)
+            remaining.discard(nxt)
+        if not remaining:
+            orders.add(tuple(order))
+
+    return sorted(orders)
+
+
+def generate_join_order_candidates(
+    tables: list[str],
+    max_candidates: int = 8,
+    join_graph: dict[str, list[str]] | None = None,
+) -> list[str]:
     """
     Generate Leading() hint strings for different join orders of `tables`.
 
-    Small queries: enumerate every permutation.
-    Larger queries: permutations explode factorially (10 tables = 3.6M),
-    so we sample `max_candidates` distinct orderings instead -- deterministically
-    for a given table set, see `_rng_for`. This is a real limitation worth
-    naming explicitly in your writeup -- it's also exactly why systems like Bao
-    use a *learned* model to pick good candidates rather than exhaustive search.
+    Given a `join_graph` (from `plan_extractor.extract_join_graph`) only
+    **connected** orders are produced. Without one, the previous behaviour
+    applies: enumerate while that is affordable, sample beyond it.
+
+    Why connectivity is worth the trouble. A `Leading()` order that introduces
+    a table sharing no join predicate with the tables placed so far forces
+    Postgres to build the cross product of the two. It prices that at
+    `disable_cost` (~1e10), so the plan is never chosen -- the optimizer is
+    handed a list of alternatives most of which it cannot use. The waste grows
+    with table count: a 6-table chain join has 720 orderings and only 32
+    connected ones, so a blind sample of 8 is expected to contain well under
+    one usable candidate. This is the "sampling above 5 tables" limitation,
+    and constraining the search space is a cheaper fix than learning it.
     """
     if len(tables) <= 1:
         return []
 
-    chosen = _sample_orders(tables, max_candidates, _rng_for(tables))
+    rng = _rng_for(tables)
 
+    if join_graph:
+        if len(tables) <= _MATERIALIZE_MAX_TABLES:
+            # Small enough to enumerate: filtering gives *every* connected
+            # order, so the budget is spent on a complete set rather than
+            # whatever repeated sampling happened to reach.
+            connected = [
+                p for p in itertools.permutations(tables)
+                if _is_connected_order(p, join_graph)
+            ]
+            chosen = (
+                connected
+                if len(connected) <= max_candidates
+                else rng.sample(connected, max_candidates)
+            )
+        else:
+            chosen = _sample_connected_orders(tables, join_graph, max_candidates, rng)
+        # A graph that yields nothing -- a genuine cross join, or conditions the
+        # parser could not read -- falls through rather than returning nothing.
+        if chosen:
+            return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
+
+    chosen = _sample_orders(tables, max_candidates, rng)
     return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
 
 
@@ -165,9 +245,12 @@ def generate_candidates(
     include_join_methods: bool = False,
     max_method_orders: int = 4,
     include_hint_sets: bool = True,
+    join_graph: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Order-only candidates, plus (opt-in) order x method, plus hint sets."""
-    candidates = generate_join_order_candidates(tables, max_candidates=max_order_candidates)
+    candidates = generate_join_order_candidates(
+        tables, max_candidates=max_order_candidates, join_graph=join_graph
+    )
     if include_join_methods and len(tables) >= 2:
         candidates += generate_join_method_candidates(tables, max_orders=max_method_orders)
     if include_hint_sets:

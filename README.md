@@ -152,7 +152,7 @@ the same pipeline adapts with no code changes.
 - **Learned part**: `backend/app/optimizer/learned.py`. A bootstrapped
   ensemble (`bandit.py`) that predicts latency *with uncertainty*, three
   selection policies (`greedy`, `thompson` for exploring, `risk_averse`), and
-  a safety veto against serving a regression. Falls back to the Phase 0 cost
+  a safety veto against serving a regression. Falls back to a cost
   heuristic when no model exists yet
 - **Frontend**: React (Vite) + Recharts, in `frontend/`
 
@@ -167,13 +167,13 @@ That builds Postgres with `pg_hint_plan`, loads the synthetic dataset
 on `localhost:5173`.
 
 Then run the pipeline once from the repo root to get a trained model. You can
-skip straight to the dashboard if you just want to see the Phase 0 heuristic,
+skip straight to the dashboard if you just want to see the cost heuristic,
 which works with no model at all:
 
 ```bash
-docker compose exec backend python -m app.collect_data   # Phase 1: fill plan_execution_log
-docker compose exec backend python -m app.train          # Phase 3: train models/plan_selector.pkl
-docker compose exec backend python -m app.benchmark      # Phase 4: native vs. learned, full workload
+docker compose exec backend python -m app.collect_data   # gather training data
+docker compose exec backend python -m app.train          # train models/plan_selector.pkl
+docker compose exec backend python -m app.benchmark      # native vs. learned, full workload
 docker compose exec backend pytest                       # 238 unit tests, no database needed
 docker compose exec backend pytest -m integration        # 11 more: hints must actually bind
 ```
@@ -258,15 +258,15 @@ learned-query-optimizer/
 │       ├── plan_extractor.py     EXPLAIN JSON -> structured metrics
 │       ├── schema_introspection.py  table row counts from pg_class, any schema
 │       ├── advisor.py            index and statistics recommendations
-│       ├── workload.py           Phase 1: the 25-query benchmark workload
-│       ├── collect_data.py       Phase 1: offline collection -> plan_execution_log
-│       ├── train.py              Phase 3: trains and evaluates the model
-│       ├── benchmark.py          Phase 4: CLI, native vs. learned
+│       ├── workload.py           the 25-query benchmark workload
+│       ├── collect_data.py       offline collection -> plan_execution_log
+│       ├── train.py              trains and evaluates the model
+│       ├── benchmark.py          CLI: native vs. learned over the workload
 │       ├── retrain.py            learning loop: champion/challenger gate
 │       ├── model_store.py        versioned models, promotion, rollback
 │       └── optimizer/
 │           ├── hints.py          join-order + join-method candidates
-│           ├── features.py       Phase 2: schema-agnostic feature vectors
+│           ├── features.py       schema-agnostic feature vectors
 │           ├── plan_tree.py      plan-TREE encoding (Neo/Bao-inspired)
 │           ├── bandit.py         bootstrapped ensemble: Thompson sampling
 │           ├── ranker.py         Lero-style pairwise learning-to-rank
@@ -275,7 +275,7 @@ learned-query-optimizer/
 │           ├── regret.py         cumulative regret
 │           ├── cardinality.py   learned q-error + Rows() corrections
 │           └── learned.py        plan selection + forward-looking safety veto
-├── frontend/                 Phase 5: React (Vite) + Recharts dashboard
+├── frontend/                 React (Vite) + Recharts dashboard
 └── docs/
     ├── DASHBOARD.md          how to read every panel
     ├── METRICS.md            how each number is worked out

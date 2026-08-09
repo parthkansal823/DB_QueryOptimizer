@@ -74,7 +74,13 @@ def candidate_hints(
     never generate is the sort of train/serve skew that docs/WRITEUP.md 2.9
     already caught once.
     """
-    hints = generate_candidates(tables, max_order_candidates=max_candidates)
+    hints = generate_candidates(
+        tables,
+        max_order_candidates=max_candidates,
+        # Read off the baseline plan's own join conditions, so the order
+        # candidates skip the cartesian products Postgres would never pick.
+        join_graph=baseline_plan.get("join_graph"),
+    )
 
     corrector = getattr(optimizer, "join_corrector", None)
     if corrector is not None and ENABLE_ROWS_CORRECTION:

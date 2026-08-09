@@ -61,7 +61,8 @@ data.
 
 **This project.** Candidates come from `pg_hint_plan` `Leading()`
 join-order hints: every permutation for 5 tables or fewer, random sampling
-above that (a named limitation, see below). The stretch goal adds forced
+above that -- see §4 for why a learned candidate generator is the way past
+that. The stretch goal adds forced
 join-method hints (`HashJoin`, `NestLoop`, `MergeJoin`) at every prefix of the
 join order.
 
@@ -80,8 +81,8 @@ disagrees about.
 
 A **safety veto** throws out any learned pick the planner costs far above the
 native plan, so the system cannot knowingly serve a large regression. That is
-Bao's central practical claim. On a cold start it falls back to the Phase 0
-heuristic, the lowest Postgres-*estimated* cost, until a model has been
+Bao's central practical claim. On a cold start it falls back to a cost
+heuristic -- the lowest Postgres-*estimated* cost -- until a model has been
 trained.
 
 | | Native Postgres CBO | Neo | Bao | This project |
@@ -93,7 +94,7 @@ trained.
 | **Exploration** | None | Epsilon-greedy over tree search | Bootstrapped Thompson sampling | Bootstrapped Thompson sampling (same mechanism, smaller action space) |
 | **Uncertainty** | None | Implicit | Ensemble spread | Ensemble spread (drives the risk-averse policy) |
 | **Safety** | N/A | None explicit | Falls back to native optimizer | Cost-ratio veto vs. the native plan |
-| **Cold start** | N/A | Bootstrapped from CBO plans | Falls back to native optimizer | Falls back to Phase 0 heuristic |
+| **Cold start** | N/A | Bootstrapped from CBO plans | Falls back to native optimizer | Falls back to a cost heuristic |
 | **Key strength** | Zero training cost, decades of tuning | Highest ceiling -- learns operators too | Bounded risk, safe in production | Simple to train and explain; oracle-relative evaluation; query-level split |
 | **Key limitation** | Cardinality-estimation errors compound across joins | Slow to converge, large feedback requirement | Coarser control (whole operator classes, not per-join) | Prediction error exceeds available headroom at this data scale (see §2) |
 
@@ -177,7 +178,7 @@ flat form; a test now pins that it must.
 
 ### 2.1 Offline evaluation (`app.train`, query-level held-out split)
 
-Trained on `plan_execution_log` after Phase 1 data collection (25 workload
+Trained on `plan_execution_log` after data collection (25 workload
 queries x native baseline + join-order + join-method candidates). Split at
 the *query* level (75/25) so a query's own candidates never leak between
 train and test -- with 25 queries that's 6 held-out queries.
@@ -190,7 +191,7 @@ only difference is repetitions per candidate (`--reps 1` vs `--reps 3`):
 | Test MAE (latency prediction) | 44.4 ms | **25.5 ms** |
 | Mean ensemble uncertainty | 27.1 ms | **10.6 ms** |
 | Avg. latency -- native Postgres | 108.4 ms | 108.4 ms |
-| Avg. latency -- Phase 0 heuristic | 107.4 ms | 107.9 ms |
+| Avg. latency -- cost heuristic | 107.4 ms | 107.9 ms |
 | Avg. latency -- **oracle (best possible)** | 100.9 ms | 86.3 ms |
 | Avg. latency -- learned, `greedy` | 105.5 ms | 98.9 ms |
 | Avg. latency -- learned, `thompson` | 107.7 ms | 101.9 ms |
