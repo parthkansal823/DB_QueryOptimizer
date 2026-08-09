@@ -938,23 +938,120 @@ time and pickled alongside the model, so inference stays consistent with
 whatever schema it was trained on. This is what let the JOB/IMDB import
 (Section 2.3) reuse the exact same pipeline.
 
-## 4. Where this goes next
+## 4. Limitations, and what was done about them
 
-The measurements above point at four things, in order of how much they would
-change the result:
+Every item here was written down as a known weakness first. Several turned out
+to be fixable once they were stated precisely, which is the main argument for
+keeping a list like this at all.
 
-1. **More repetitions per candidate.** Going from one execution to three cut
-   prediction error by 44% and removed every live regression (§2.2). Five to
-   ten is the obvious next step, and it is compute time rather than research.
-2. **A full JOB collection.** The opportunity there is demonstrably large --
-   75% of latency is available -- and the data is loaded. What is missing is a
-   sweep over all 113 queries instead of 8, so the held-out split has enough
-   queries to mean anything.
-3. **A learned candidate generator.** Above five tables the action space is
-   sampled rather than enumerated, because permutations explode factorially.
-   Learning which candidates are worth generating, rather than sampling them,
-   is what Neo does and is the natural way to scale to 17-table joins.
-4. **A learned safety veto.** The current one compares estimated costs, and
-   distrusting those estimates is the premise of the project. It reliably
-   catches catastrophes; a learned check would also catch the plan that looks
-   cheap and runs slow.
+### Closed
+
+**Candidate generation wasted most of its budget.** Join orders were sampled
+blindly from all permutations, and an order that introduces a table sharing no
+join predicate with those already placed forces a cartesian product -- which
+Postgres prices at `disable_cost` (~1e10) and never chooses. The optimizer was
+handed a list of alternatives most of which it could not use.
+
+`plan_extractor.extract_join_graph` now reads the query's join graph off the
+baseline plan's own conditions (`Hash Cond`, `Merge Cond`, `Index Cond`), and
+generation only produces connected orders. Measured over the workload's 3- and
+4-table queries:
+
+| | Usable candidates |
+|---|---|
+| Blind permutation | 23 / 48 (48%) |
+| Graph-aware | 40 / 40 (**100%**) |
+
+The effect is larger than the rate suggests, because the absolute count rose
+too. On `corr_4w_premium_us` blind sampling produced **one** usable candidate
+out of eight; the graph-aware generator produces eight. That query effectively
+had no action space at all. Note also that this bit at four tables, not "above
+five" as originally written.
+
+**Self-joins collapsed to one feature slot.** Per-table slots were assigned,
+not aggregated, so `movie_info AS mi1, movie_info AS mi2` was described by
+whichever alias appeared last in the plan and the other vanished. The vector
+could not distinguish a self-join from a single scan -- and self-joins are
+routine in JOB, the benchmark this most needed to work on.
+
+Slots now aggregate across occurrences: earliest join position, most selective
+scan, index-scan if any occurrence uses one, plus an `occurrences` count. The
+vector stays fixed-length and one-slot-per-table, so it still transfers across
+schemas.
+
+**The guard could not protect a query it had never seen.** Blocking is
+retrospective: a query has to *demonstrate* a regression over several
+executions before it is stopped, so the first few runs of a new query had
+nothing watching them -- exactly when the model is most likely to be
+extrapolating.
+
+Refusing to act on unseen queries would make the optimizer useless on any
+fresh workload, so the confidence bar is scaled instead.
+`RegressionGuard.caution_multiplier` returns 2x with no history and eases
+linearly to 1x once `min_observations` served executions exist, and
+`select_plan` multiplies both halves of the gate by it. A marginal prediction
+on an unknown query no longer clears the bar; a clear win still does.
+
+**Explicit thresholds were silently ignored.** Found while testing the above.
+"Explicit constructor arguments win over `models/gate.json`" was implemented as
+`if arg == DEFAULT`, which cannot distinguish a deliberately-passed default
+from an untouched argument -- so a caller asking for `confidence_z=1.0` got
+whatever the calibration file said, and there was no way to opt out short of
+deleting the file. A sentinel now separates the two cases. This mattered more
+than it looks: the deployed `gate.json` holds `confidence_z=0.0,
+min_relative_gain=0.0`, so anything relying on the documented defaults was
+running with the gate effectively disabled.
+
+**Training on single executions.** `collect_data` defaulted to `--reps 1`, the
+value §2.2 identifies as the cause of live runs ranging from +40% to -149%.
+The default is now 3, matching `app.onboard`, so the median aggregation that
+removed every regression is available by default rather than opt-in.
+
+**The regression guard's effect size could not be settled.** Not because the
+question was hard, but because `app.benchmark` printed its results and returned
+nothing, so repeating it meant copying numbers off a terminal. `app.experiment`
+now runs the comparison with interleaved arms, bootstrap confidence intervals
+and a sign test, and reports *unresolved* when the interval spans zero. §2.4
+has the first output.
+
+**Non-reproducible action spaces.** Sampling used the unseeded global `random`,
+so a query above the candidate budget got a different action space on every
+call -- training saw one subset, inference another, and two benchmark runs
+meant to differ only in a flag were also comparing different candidates.
+Seeding from the table list makes generation deterministic per query.
+
+### Already present, just undocumented
+
+**Scheduled retraining.** The list said retraining was "triggered, not
+scheduled". A background scheduler has been there all along:
+`AUTO_RETRAIN_SECONDS` runs `retrain_if_needed` on an interval, off the event
+loop, holding a reference to the task so it cannot be garbage collected
+mid-await, and cancelling it cleanly on shutdown. It is off by default because
+a job that silently swaps the served model should be opted into. The limitation
+was a documentation gap, not a missing feature.
+
+### Still open
+
+**Prediction error against available headroom.** ~400 rows across 25 queries
+gives an error comparable to the opportunity being measured. More repetitions
+help and are now the default; the real fix is more data, which is compute time
+rather than a design question.
+
+**The safety veto is cost-based, not learned.** It compares estimated costs,
+and distrusting those estimates is the premise of the project. It reliably
+catches catastrophes (`disable_cost` marks them clearly) but cannot catch a
+plan that is cheap on paper and slow in reality.
+
+**Cold start.** Before a model exists, selection falls back to the cost
+heuristic. Reasonable, but there is no bootstrapped warm-up of the kind Neo
+uses.
+
+**Single-node, single-connection measurement.** Every latency here is measured
+on an otherwise-idle database. Real workloads have concurrent queries competing
+for buffer cache and I/O, which changes the arithmetic on candidate execution
+cost.
+
+**Synthetic skew is still synthetic.** `data/schema.sql`'s correlations are
+deliberately clean compared to real data's long tails, which is exactly why the
+JOB results in §2.3 matter for external validity -- and why the synthetic
+numbers should not be assumed to carry over.

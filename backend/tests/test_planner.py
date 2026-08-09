@@ -56,7 +56,8 @@ class _FakeOptimizer:
         self.veto = veto
         self.last_decision = {}
 
-    def select_plan(self, candidates, baseline_plan=None):
+    def select_plan(self, candidates, baseline_plan=None, caution=1.0):
+        self.last_caution = caution
         if self.veto:
             self.last_decision = {"fell_back_to_baseline": True, "policy": "greedy"}
             return baseline_plan
@@ -65,11 +66,15 @@ class _FakeOptimizer:
 
 
 class _Guard:
-    def __init__(self, blocked=()):
+    def __init__(self, blocked=(), caution=1.0):
         self.blocked = set(blocked)
+        self.caution = caution
 
     def is_blocked(self, query_id):
         return query_id in self.blocked
+
+    def caution_multiplier(self, query_id):
+        return self.caution
 
 
 SQL = "SELECT o.id FROM orders o JOIN users u ON o.user_id = u.id"
@@ -129,3 +134,21 @@ def test_overhead_is_measured():
     cur = _RecordingCursor()
     result = planner.plan_query(cur, SQL, _FakeOptimizer())
     assert result["optimizer_overhead_ms"] >= 0.0
+
+
+def test_the_guards_caution_reaches_the_optimizer():
+    """
+    An unseen query has to arrive at the decision as a stricter bar, or the
+    guard's blind spot on first executions stays open.
+    """
+    cur = _RecordingCursor()
+    optimizer = _FakeOptimizer()
+    planner.plan_query(cur, SQL, optimizer, query_id="new_query", guard=_Guard(caution=2.0))
+    assert optimizer.last_caution == 2.0
+
+
+def test_no_guard_means_no_extra_caution():
+    cur = _RecordingCursor()
+    optimizer = _FakeOptimizer()
+    planner.plan_query(cur, SQL, optimizer, query_id="q")
+    assert optimizer.last_caution == 1.0

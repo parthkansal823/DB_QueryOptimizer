@@ -355,10 +355,27 @@ Three findings behind those numbers are worth more than the numbers:
   reported a 97% improvement where the paired figure was about 18%.
   `docs/METRICS.md` §2 works through it.
 
-## What's next
+## Known limitations
 
-The measurements point at four things, in rough order of impact: more
-repetitions per candidate (the single change that has already helped most), a
-full 113-query JOB collection, a learned candidate generator for joins above
-five tables, and a learned rather than cost-based safety veto.
-`docs/WRITEUP.md` §4 has the reasoning.
+`docs/WRITEUP.md` §4 keeps an honest list, split into what has been fixed and
+what has not. Recently closed: candidate generation now follows the query's
+join graph instead of sampling blindly (usable candidates went from 48% to
+100%), self-joins no longer collapse into a single feature slot, and data
+collection defaults to the three repetitions the evidence calls for.
+
+Also closed: the regression guard now raises the confidence bar on queries it
+has no history for, instead of leaving first executions unprotected.
+
+Still open: prediction error is comparable to the available headroom at this
+data scale, the safety veto reasons about cost estimates rather than learned
+ones, and all latency numbers come from a single-connection, otherwise-idle
+database.
+
+### Optional settings
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SELECTION_POLICY` | `pairwise_rank` | `greedy`, `thompson`, `risk_averse`, `pairwise_rank` |
+| `AUTO_RETRAIN_SECONDS` | `0` (off) | Retrain on a background interval; promotion is still gated |
+| `ENABLE_ROWS_CORRECTION` | `1` | Learned `Rows()` cardinality corrections as an extra candidate |
+| `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin the API accepts |

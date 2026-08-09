@@ -2,14 +2,34 @@ from app.optimizer.regression_guard import RegressionGuard, find_regressed_queri
 
 
 class _FakeCursor:
-    def __init__(self, rows):
+    """
+    Serves the regression query and the observation-count query separately.
+
+    `refresh` issues two now: one to find regressed queries, one to count how
+    many times each query has been served (which drives
+    `caution_multiplier`). A fake returning the same rows to both would feed
+    4-tuples into a 2-tuple unpack.
+    """
+
+    def __init__(self, rows, observations=None):
         self._rows = rows
+        self._observations = observations
+        self._last = rows
 
     def execute(self, query, params=None):
-        pass
+        if "COUNT(*) FILTER (WHERE is_chosen)" in query:
+            self._last = (
+                list(self._observations.items())
+                if self._observations is not None
+                # Default: every query in the regression rows has enough
+                # history, so existing tests keep their original meaning.
+                else [(r[0], r[3]) for r in self._rows]
+            )
+        else:
+            self._last = self._rows
 
     def fetchall(self):
-        return self._rows
+        return self._last
 
 
 # (query_id, native_avg, chosen_avg, n_chosen)
@@ -68,3 +88,38 @@ def test_guard_recovers_when_history_improves():
 
     guard.refresh(_FakeCursor([("q", 100.0, 80.0, 20)]))
     assert guard.is_blocked("q") is False
+
+
+# -- caution on queries with little or no history ---------------------------
+
+
+def test_an_unseen_query_raises_the_confidence_bar():
+    """
+    The guard's blind spot: it blocks only on *measured* regressions, so a
+    query it has never served gets no protection at all -- exactly when the
+    model is most likely to be extrapolating. The bar is raised instead.
+    """
+    guard = RegressionGuard()
+    guard.refresh(_FakeCursor([], observations={}))
+    assert guard.caution_multiplier("brand_new") > 1.0
+
+
+def test_a_well_known_query_is_not_penalised():
+    guard = RegressionGuard(min_observations=3)
+    guard.refresh(_FakeCursor([], observations={"seen": 10}))
+    assert guard.caution_multiplier("seen") == 1.0
+
+
+def test_caution_eases_as_evidence_arrives():
+    """Gradual, so evidence pays off rather than flipping at the nth run."""
+    guard = RegressionGuard(min_observations=4)
+    guard.refresh(_FakeCursor([], observations={"a": 0, "b": 2, "c": 4}))
+    assert guard.caution_multiplier("a") > guard.caution_multiplier("b")
+    assert guard.caution_multiplier("b") > guard.caution_multiplier("c")
+    assert guard.caution_multiplier("c") == 1.0
+
+
+def test_a_query_with_no_id_is_treated_as_unseen():
+    guard = RegressionGuard()
+    guard.refresh(_FakeCursor([], observations={}))
+    assert guard.caution_multiplier(None) > 1.0

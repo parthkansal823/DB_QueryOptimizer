@@ -147,7 +147,10 @@ def plan_query(
             "optimizer_overhead_ms": planning_ms,
         }
 
-    served = optimizer.select_plan(candidates, baseline_plan=baseline)
+    # A query the guard has no history for gets a stricter bar: blocking is
+    # retrospective, so an unseen query is the one case nothing is watching.
+    caution = guard.caution_multiplier(query_id) if guard is not None else 1.0
+    served = optimizer.select_plan(candidates, baseline_plan=baseline, caution=caution)
     decision = dict(optimizer.last_decision)
     vetoed = decision.get("fell_back_to_baseline", False)
 
@@ -155,6 +158,7 @@ def plan_query(
         "hint": None if vetoed else served.get("hint"),
         "chosen_plan": served,
         "reason": "safety_veto" if vetoed else decision.get("policy", "heuristic"),
+        "caution": caution,
         "decision": decision,
         "n_candidates_planned": len(candidates),
         "optimizer_overhead_ms": planning_ms,

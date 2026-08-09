@@ -67,6 +67,9 @@ DEFAULT_MIN_GAIN_MS = 2.0
 # before deviating from native. 0.05 = "must look at least 5% faster".
 DEFAULT_MIN_RELATIVE_GAIN = float(os.getenv("MIN_RELATIVE_GAIN", "0.05"))
 
+# Distinguishes "caller passed nothing" from "caller passed the default".
+_UNSET = object()
+
 
 def _load_calibrated_gate(path: str = "models/gate.json") -> dict | None:
     """Thresholds measured by `app.calibrate`, if a sweep has been run."""
@@ -86,9 +89,9 @@ class LearnedOptimizer:
         policy: str = os.getenv("SELECTION_POLICY", "greedy"),
         risk_lambda: float = float(os.getenv("RISK_LAMBDA", "1.0")),
         safety_margin: float = DEFAULT_SAFETY_MARGIN,
-        confidence_z: float = float(os.getenv("CONFIDENCE_Z", DEFAULT_CONFIDENCE_Z)),
+        confidence_z: float = _UNSET,
         min_gain_ms: float = float(os.getenv("MIN_GAIN_MS", DEFAULT_MIN_GAIN_MS)),
-        min_relative_gain: float = DEFAULT_MIN_RELATIVE_GAIN,
+        min_relative_gain: float = _UNSET,
         seed: int | None = None,
     ):
         self.model = None
@@ -99,9 +102,14 @@ class LearnedOptimizer:
         self.policy = policy
         self.risk_lambda = risk_lambda
         self.safety_margin = safety_margin
-        self.confidence_z = confidence_z
+        self.confidence_z = (
+            float(os.getenv("CONFIDENCE_Z", DEFAULT_CONFIDENCE_Z))
+            if confidence_z is _UNSET else confidence_z
+        )
         self.min_gain_ms = min_gain_ms
-        self.min_relative_gain = min_relative_gain
+        self.min_relative_gain = (
+            DEFAULT_MIN_RELATIVE_GAIN if min_relative_gain is _UNSET else min_relative_gain
+        )
         self.gate_calibration: dict | None = None
 
         # A calibrated gate (written by `app.calibrate --apply`) beats the
@@ -109,12 +117,20 @@ class LearnedOptimizer:
         # accurate the model happens to be on *this* data -- it is measured,
         # not reasoned about. Explicit constructor args still win, so tests
         # and one-off experiments aren't silently overridden.
+        # "Explicit arguments win" was implemented by comparing against the
+        # default value, which cannot tell `confidence_z=1.0` (deliberately
+        # passed) from an argument left alone -- 1.0 *is* the default. So a
+        # caller asking for the default value silently got the calibrated one
+        # instead, and there was no way to opt out of `models/gate.json` short
+        # of deleting the file. `_UNSET` distinguishes the two properly.
         calibrated = _load_calibrated_gate()
         if calibrated:
-            if confidence_z == DEFAULT_CONFIDENCE_Z:
-                self.confidence_z = calibrated.get("confidence_z", confidence_z)
-            if min_relative_gain == DEFAULT_MIN_RELATIVE_GAIN:
-                self.min_relative_gain = calibrated.get("min_relative_gain", min_relative_gain)
+            if confidence_z is _UNSET:
+                self.confidence_z = calibrated.get("confidence_z", self.confidence_z)
+            if min_relative_gain is _UNSET:
+                self.min_relative_gain = calibrated.get(
+                    "min_relative_gain", self.min_relative_gain
+                )
             self.gate_calibration = calibrated
         self._rng = random.Random(seed)
         self.last_decision: dict = {}
@@ -165,7 +181,12 @@ class LearnedOptimizer:
             return self._select_learned(candidate_plans)
         return self._select_heuristic(candidate_plans)
 
-    def select_plan(self, candidate_plans: list[dict], baseline_plan: dict | None = None) -> dict:
+    def select_plan(
+        self,
+        candidate_plans: list[dict],
+        baseline_plan: dict | None = None,
+        caution: float = 1.0,
+    ) -> dict:
         """
         Pick a plan to serve, defaulting to native unless there is *evidence*
         a hinted plan is better.
@@ -194,6 +215,12 @@ class LearnedOptimizer:
         than native" instead of "worse than native", which is the property
         that makes it deployable at all (and is Bao's central claim).
 
+        `caution` scales that bar. The regression guard supplies it: a query
+        the system has never served gets a stricter test (see
+        `regression_guard.caution_multiplier`), because the guard itself cannot
+        protect a query with no history and that is exactly when the model is
+        most likely to be extrapolating.
+
         `self.last_decision` records the comparison so any individual choice
         can be explained after the fact.
         """
@@ -214,9 +241,11 @@ class LearnedOptimizer:
                 return baseline_plan
             return chosen
 
-        return self._select_against_native(candidate_plans, baseline_plan)
+        return self._select_against_native(candidate_plans, baseline_plan, caution)
 
-    def _select_against_native(self, candidate_plans: list[dict], baseline_plan: dict) -> dict:
+    def _select_against_native(
+        self, candidate_plans: list[dict], baseline_plan: dict, caution: float = 1.0
+    ) -> dict:
         """
         Choose in *ratio space*: the model predicts log(latency / native), so
         a prediction is directly a speedup claim rather than two absolute
@@ -249,8 +278,8 @@ class LearnedOptimizer:
         best_i = self.select(candidate_plans)
         predicted_ratio = math.exp(means[best_i])
         # Pessimistic ratio: the worst this plan plausibly is, one sigma out.
-        upper_ratio = math.exp(means[best_i] + self.confidence_z * stds[best_i])
-        required_ratio = 1.0 - self.min_relative_gain
+        upper_ratio = math.exp(means[best_i] + self.confidence_z * caution * stds[best_i])
+        required_ratio = 1.0 - self.min_relative_gain * caution
 
         chosen = candidate_plans[best_i]
         self.last_decision = {

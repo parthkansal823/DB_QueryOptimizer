@@ -36,6 +36,19 @@ from __future__ import annotations
 # guard exists to detect: that deviating on this query has been making it
 # worse. What is being blocked is the deviation, so the deviations are what
 # get measured.
+# How much stricter the confidence bar is for a query with no served history.
+# 2x is a judgement call rather than a measured optimum: enough that a marginal
+# prediction on an unknown query will not clear it, small enough that a clear
+# win still can. `app.calibrate` sweeps the base thresholds; this scales them.
+UNSEEN_QUERY_CAUTION = 2.0
+
+OBSERVATION_COUNT_SQL = """
+    SELECT query_id, COUNT(*) FILTER (WHERE is_chosen)
+    FROM plan_execution_log
+    WHERE query_id IS NOT NULL AND actual_total_time_ms IS NOT NULL
+    GROUP BY query_id
+"""
+
 REGRESSION_SQL = """
     SELECT
         query_id,
@@ -88,13 +101,44 @@ class RegressionGuard:
         self.tolerance = tolerance
         self.min_observations = min_observations
         self.blocked: dict[str, dict] = {}
+        self.observations: dict[str, int] = {}
 
     def refresh(self, cur) -> dict[str, dict]:
         self.blocked = find_regressed_queries(
             cur, tolerance=self.tolerance, min_observations=self.min_observations
         )
+        cur.execute(OBSERVATION_COUNT_SQL)
+        self.observations = {qid: int(n) for qid, n in cur.fetchall()}
         return self.blocked
 
     def is_blocked(self, query_id: str | None) -> bool:
         # Ad-hoc queries (no stable id) can't have a history to judge them on.
         return query_id is not None and query_id in self.blocked
+
+    def caution_multiplier(self, query_id: str | None) -> float:
+        """
+        How much more confident the model should be before deviating on this
+        query, given how little is known about it.
+
+        This closes the guard's blind spot. Blocking is retrospective: a query
+        must *demonstrate* a regression over several executions before it is
+        stopped, so a query the system has never served gets no protection at
+        all -- exactly when the model knows least about it and is most likely
+        to be extrapolating. The first few executions of a new query were the
+        one place nothing was watching.
+
+        Rather than refuse to act on unseen queries (which would make the
+        optimizer useless on any fresh workload), the confidence bar is raised
+        and then relaxed as evidence arrives: 2x with no history at all, easing
+        to 1x once `min_observations` served executions exist. Deviating on a
+        new query stays possible, it just has to look clearly worth it.
+        """
+        if query_id is None:
+            return UNSEEN_QUERY_CAUTION
+        seen = self.observations.get(query_id, 0)
+        if seen >= self.min_observations:
+            return 1.0
+        # Linear easing between the two, so evidence pays off gradually rather
+        # than at a cliff edge on the nth execution.
+        progress = seen / max(self.min_observations, 1)
+        return UNSEEN_QUERY_CAUTION - (UNSEEN_QUERY_CAUTION - 1.0) * progress
