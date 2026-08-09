@@ -37,11 +37,59 @@ def _rng_for(tables: list[str]) -> random.Random:
     return random.Random(int(digest[:16], 16))
 
 
+# Above this many tables, n! is too large to build in memory. The old code
+# called `list(itertools.permutations(tables))` *before* sampling it down,
+# which meant the factorial explosion it documented as avoided was paid in
+# full on every call: 10 tables cost 2.2s and 466MB to return 8 candidates,
+# 12 tables exhausts memory outright. JOB's schema has 21 tables, so the
+# stretch-goal benchmark was the exact case that could not run.
+#
+# The cutoff sits at 8 (40320 permutations, ~5MB, ~0.03s) rather than lower
+# because staying on the materialising path where it is affordable keeps the
+# *sampled orderings themselves* byte-identical to what previous runs drew.
+# Changing which orderings get sampled would silently move the action space
+# out from under every model already trained against it -- the train/serve
+# skew README.md warns about -- so the fix deliberately changes behaviour
+# only where the old path could not produce an answer at all.
+_MATERIALIZE_MAX_TABLES = 8
+
+
+def _sample_orders(tables: list[str], k: int, rng: random.Random) -> list[tuple[str, ...]]:
+    """
+    Up to `k` distinct orderings of `tables`, drawn uniformly.
+
+    Enumerates exhaustively while that is cheap, and falls back to rejection
+    sampling of individual shuffles beyond that -- which never materialises
+    more than `k` permutations. Both branches consume `rng`, so the result
+    stays deterministic per table set either way (see `_rng_for`).
+    """
+    n = len(tables)
+
+    if n <= _MATERIALIZE_MAX_TABLES:
+        all_perms = list(itertools.permutations(tables))
+        if len(all_perms) <= k:
+            return all_perms
+        return rng.sample(all_perms, k)
+
+    # n! here is astronomically larger than k (9 tables is already 362880),
+    # so repeated draws practically never collide and the loop terminates in
+    # ~k iterations. The `seen` set is what keeps the orderings distinct,
+    # which is the property `rng.sample` was providing above.
+    seen: set[tuple[str, ...]] = set()
+    chosen: list[tuple[str, ...]] = []
+    while len(chosen) < k:
+        perm = tuple(rng.sample(tables, n))
+        if perm not in seen:
+            seen.add(perm)
+            chosen.append(perm)
+    return chosen
+
+
 def generate_join_order_candidates(tables: list[str], max_candidates: int = 8) -> list[str]:
     """
     Generate Leading() hint strings for different join orders of `tables`.
 
-    Small queries (<=5 tables): enumerate every permutation.
+    Small queries: enumerate every permutation.
     Larger queries: permutations explode factorially (10 tables = 3.6M),
     so we sample `max_candidates` distinct orderings instead -- deterministically
     for a given table set, see `_rng_for`. This is a real limitation worth
@@ -51,13 +99,7 @@ def generate_join_order_candidates(tables: list[str], max_candidates: int = 8) -
     if len(tables) <= 1:
         return []
 
-    all_perms = list(itertools.permutations(tables))
-
-    chosen = (
-        all_perms
-        if len(all_perms) <= max_candidates
-        else _rng_for(tables).sample(all_perms, max_candidates)
-    )
+    chosen = _sample_orders(tables, max_candidates, _rng_for(tables))
 
     return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
 
@@ -112,12 +154,7 @@ def generate_join_method_candidates(
     if len(tables) <= 1:
         return []
 
-    all_perms = list(itertools.permutations(tables))
-    orders = (
-        all_perms
-        if len(all_perms) <= max_orders
-        else _rng_for(tables).sample(all_perms, max_orders)
-    )
+    orders = _sample_orders(tables, max_orders, _rng_for(tables))
 
     return [_method_hint_for_order(order, method) for order in orders for method in methods]
 

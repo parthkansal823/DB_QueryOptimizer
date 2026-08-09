@@ -38,6 +38,7 @@ selection falls back to the Phase 0 heuristic automatically.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import pickle
@@ -120,15 +121,41 @@ class LearnedOptimizer:
         self.join_corrector = None
 
         if os.path.exists(model_path):
+            self._load_bundle(model_path)
+
+    def _load_bundle(self, model_path: str) -> None:
+        """
+        Load a trained bundle, degrading to the cold-start heuristic if it
+        cannot be read.
+
+        An unreadable pickle used to propagate straight out of the
+        constructor, and since `app.main` constructs the optimizer at import,
+        that turned one damaged file into a backend that would not boot at
+        all -- the worst possible response to "the model is unavailable",
+        when serving native PostgreSQL plans is a perfectly good fallback.
+        Same reasoning as `_load_calibrated_gate` above.
+        """
+        try:
             with open(model_path, "rb") as f:
                 bundle = pickle.load(f)
-            self.model = bundle["model"]
-            self.ranker = bundle.get("ranker")
-            # Older bundles predate join-level correction; absent is fine.
-            self.join_corrector = bundle.get("join_corrector")
-            self.feature_columns = bundle["feature_columns"]
-            self.table_cardinalities = bundle["table_cardinalities"]
-            self.target = bundle.get("target", "actual_total_time_ms")
+            model = bundle["model"]
+            feature_columns = bundle["feature_columns"]
+            table_cardinalities = bundle["table_cardinalities"]
+        except Exception:  # noqa: BLE001 - corrupt, truncated, or stale-format bundle
+            logging.getLogger("lqo.optimizer").exception(
+                "could not load %s; serving the cost heuristic instead", model_path
+            )
+            return
+
+        # Assigned only once every required field has been read, so a bundle
+        # that fails halfway cannot leave a half-configured optimizer behind.
+        self.model = model
+        self.feature_columns = feature_columns
+        self.table_cardinalities = table_cardinalities
+        self.ranker = bundle.get("ranker")
+        # Older bundles predate join-level correction; absent is fine.
+        self.join_corrector = bundle.get("join_corrector")
+        self.target = bundle.get("target", "actual_total_time_ms")
 
     # -- selection ---------------------------------------------------------
 

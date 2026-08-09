@@ -78,9 +78,10 @@ def find_regressed_queries(
 
 class RegressionGuard:
     """
-    Holds the current blocklist. Refreshed explicitly (see
-    `app.main`'s /model/refresh-guard) rather than queried per request, so a
-    live query never pays for a `GROUP BY` over the whole history.
+    Holds the current blocklist. Refreshed explicitly rather than queried per
+    request, so a live query never pays for a `GROUP BY` over the whole
+    history. `app.main` refreshes it at startup, on every `/model/status`
+    call, and whenever a retrain promotes a new model.
     """
 
     def __init__(self, tolerance: float = 0.10, min_observations: int = 3):

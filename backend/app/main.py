@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,17 +19,6 @@ from app.optimizer.regret import regret_curve
 from app.plan_extractor import get_plan
 from app.schema_graph import discover_with_inference
 from app.schema_graph import summarize as schema_summary
-
-app = FastAPI(title="Learned Query Optimizer")
-
-# Dev origin only -- the Vite dashboard from Phase 5. FRONTEND_ORIGIN lets
-# docker-compose override this for other environments without editing code.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 optimizer = LearnedOptimizer()
 SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
@@ -66,8 +56,8 @@ async def _auto_retrain_loop() -> None:
             log.exception("auto-retrain failed; continuing to serve the current model")
 
 
-@app.on_event("startup")
-async def _startup() -> None:
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
     # Prime the guard so the first served query already benefits from history.
     try:
         with get_cursor() as cur:
@@ -75,9 +65,40 @@ async def _startup() -> None:
     except Exception:  # noqa: BLE001 - an empty/absent log table is fine at boot
         log.warning("could not prime the regression guard at startup")
 
+    task = None
     if AUTO_RETRAIN_SECONDS > 0:
-        asyncio.create_task(_auto_retrain_loop())
+        # The reference matters: asyncio only holds a *weak* one, so a bare
+        # `create_task(...)` whose result nobody keeps can be garbage
+        # collected mid-await. The retrain loop would then stop silently --
+        # the server keeps serving, so nothing looks wrong, and the model
+        # just quietly stops being updated.
+        task = asyncio.create_task(_auto_retrain_loop())
         log.info("auto-retrain enabled every %ss", AUTO_RETRAIN_SECONDS)
+
+    yield
+
+    # Shut the loop down rather than letting it be killed mid-retrain, so a
+    # promotion is never left half-applied on restart.
+    if task is not None:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+# Built with the lifespan handler rather than `@app.on_event("startup")`,
+# which FastAPI deprecated -- it still ran, but emitted a DeprecationWarning
+# on every import and is slated for removal. The lifespan form also gives the
+# shutdown half, which on_event's startup hook had no equivalent for.
+app = FastAPI(title="Learned Query Optimizer", lifespan=_lifespan)
+
+# Dev origin only -- the Vite dashboard from Phase 5. FRONTEND_ORIGIN lets
+# docker-compose override this for other environments without editing code.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")

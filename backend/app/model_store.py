@@ -33,25 +33,96 @@ def _read_registry() -> dict:
         return json.load(f)
 
 
+def _atomic_replace(write, destination: str) -> None:
+    """
+    Write via a temp file in the same directory, then `os.replace` it into
+    place -- which is atomic, so a reader sees either the old file or the new
+    one and never a half-written one.
+
+    This matters because the files here are read by a *live* server. `promote`
+    used to copy straight onto `plan_selector.pkl` while request threads could
+    be unpickling it, and a process killed mid-copy left a truncated pickle on
+    disk permanently. Since the optimizer loads that file at import, a torn
+    write did not degrade the service -- it stopped the backend booting at all,
+    until someone knew to delete the file by hand.
+
+    Same directory on purpose: `os.replace` is only atomic within a filesystem.
+    """
+    os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
+    tmp = f"{destination}.tmp"
+    try:
+        write(tmp)
+        os.replace(tmp, destination)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
 def _write_registry(registry: dict) -> None:
     os.makedirs(MODELS_DIR, exist_ok=True)
-    with open(REGISTRY_PATH, "w") as f:
-        json.dump(registry, f, indent=2)
+
+    def write(path: str) -> None:
+        with open(path, "w") as f:
+            json.dump(registry, f, indent=2)
+
+    _atomic_replace(write, REGISTRY_PATH)
 
 
 def new_version_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _unique_version_id(existing: set[str]) -> str:
+    """
+    An auto-generated id that no stored version already uses.
+
+    `new_version_id` resolves to the second, and two saves inside one second
+    produced the *same* id -- on which `save_version` overwrites the version
+    file and drops the older registry entry, destroying a model that may be
+    the one currently being served. `rollback` then restores a version whose
+    bytes are somebody else's, which is precisely when it is least affordable
+    to get wrong.
+
+    A `-2` suffix rather than finer timestamp resolution, because ids are
+    sorted lexicographically for "newest first" and a longer timestamp would
+    sort *before* the existing `...SSZ` ids rather than after them. A suffixed
+    id sorts immediately after the id it disambiguates, which is also the
+    right chronological order.
+    """
+    base = new_version_id()
+    if base not in existing:
+        return base
+    suffix = 2
+    while f"{base}-{suffix}" in existing:
+        suffix += 1
+    return f"{base}-{suffix}"
+
+
 def save_version(bundle: dict, metrics: dict, version_id: str | None = None) -> str:
-    """Persist a trained bundle as a new version. Does NOT promote it."""
-    version_id = version_id or new_version_id()
+    """
+    Persist a trained bundle as a new version. Does NOT promote it.
+
+    An explicit `version_id` still overwrites any version of that name -- the
+    caller named it, so it is taken to mean it. Auto-generated ids are made
+    unique instead (see `_unique_version_id`), since a caller that did not
+    choose the name cannot have meant to overwrite anything.
+    """
+    registry = _read_registry()
+    if version_id is None:
+        version_id = _unique_version_id({v["version_id"] for v in registry["versions"]})
+
     os.makedirs(VERSIONS_DIR, exist_ok=True)
     path = os.path.join(VERSIONS_DIR, f"plan_selector_{version_id}.pkl")
-    with open(path, "wb") as f:
-        pickle.dump(bundle, f)
 
-    registry = _read_registry()
+    def write(target: str) -> None:
+        with open(target, "wb") as f:
+            pickle.dump(bundle, f)
+
+    # Atomic here too: a half-written version file would otherwise be
+    # registered as a promotable candidate and only fail at promotion time.
+    _atomic_replace(write, path)
+
     registry["versions"] = [v for v in registry["versions"] if v["version_id"] != version_id]
     registry["versions"].append(
         {
@@ -78,7 +149,7 @@ def promote(version_id: str, reason: str = "") -> None:
     if entry is None:
         raise KeyError(f"unknown model version {version_id!r}")
 
-    shutil.copyfile(entry["path"], CURRENT_PATH)
+    _atomic_replace(lambda target: shutil.copyfile(entry["path"], target), CURRENT_PATH)
     for v in registry["versions"]:
         v["promoted"] = v["version_id"] == version_id
     registry["current"] = version_id

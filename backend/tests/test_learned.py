@@ -241,3 +241,37 @@ def test_risk_averse_policy_is_selectable_via_constructor():
     optimizer = LearnedOptimizer(model_path=NO_MODEL, policy="risk_averse", risk_lambda=2.0)
     assert optimizer.policy == "risk_averse"
     assert optimizer.risk_lambda == 2.0
+
+
+def test_a_corrupt_bundle_degrades_to_the_heuristic(tmp_path):
+    """
+    An unreadable model must cost the learned path, not the service.
+
+    `app.main` builds the optimizer at import, so a truncated pickle used to
+    stop the backend starting at all -- when falling back to native PostgreSQL
+    plans is a perfectly serviceable answer to "the model is unavailable".
+    """
+    corrupt = tmp_path / "plan_selector.pkl"
+    corrupt.write_bytes(b"\x80\x04not-a-pickle")
+
+    optimizer = LearnedOptimizer(model_path=str(corrupt), policy="greedy")
+
+    assert optimizer.model is None  # cold start, exactly as if no file existed
+    candidates = [_candidate(500), _candidate(100)]
+    assert optimizer.select_plan(candidates) is candidates[1]  # cheapest, by cost
+    assert optimizer.last_decision["policy"] == "heuristic_min_cost"
+
+
+def test_a_bundle_missing_required_keys_does_not_half_configure(tmp_path):
+    """A bundle that reads but lacks required fields must not leave a model
+    set with no feature columns to featurize against -- that fails later, at
+    the first query, instead of here."""
+    import pickle
+
+    partial = tmp_path / "plan_selector.pkl"
+    partial.write_bytes(pickle.dumps({"model": object()}))  # no feature_columns
+
+    optimizer = LearnedOptimizer(model_path=str(partial), policy="greedy")
+
+    assert optimizer.model is None
+    assert optimizer.feature_columns == []

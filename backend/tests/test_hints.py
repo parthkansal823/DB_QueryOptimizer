@@ -1,4 +1,5 @@
 import itertools
+import tracemalloc
 
 from app.optimizer.hints import (
     JOIN_METHODS,
@@ -30,6 +31,52 @@ def test_large_table_set_is_sampled_down():
     candidates = generate_join_order_candidates(tables, max_candidates=8)
     assert len(candidates) == 8
     assert len(set(candidates)) == 8  # distinct orderings
+
+
+def test_many_tables_do_not_materialise_every_permutation():
+    """
+    A 12-table join must cost the candidate budget, not 12! (479 million).
+
+    The generator used to build the full permutation list *before* sampling it
+    down, so the factorial blow-up its own docstring said it avoided was paid
+    on every call -- 10 tables took 2.2s and 466MB to return 8 hints, and JOB's
+    21-table schema could not run at all. Tracing allocation is what actually
+    pins that down: a count-only assertion passes just as happily against an
+    implementation that built every permutation first.
+    """
+    tables = [f"t{i}" for i in range(12)]
+
+    tracemalloc.start()
+    try:
+        candidates = generate_join_order_candidates(tables, max_candidates=8)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(candidates) == 8
+    assert len(set(candidates)) == 8
+    # Comfortably above what 8 hints need, far below what 12! would take.
+    assert peak_bytes < 5_000_000
+
+
+def test_sampled_orders_are_deterministic_for_a_table_set():
+    """
+    The same tables must always yield the same action space.
+
+    Training collects data on one candidate set and inference scores another
+    unless this holds, which is train/serve skew rather than a model problem
+    (see `_rng_for`). It is asserted across both sampling branches: 6 tables
+    enumerates-then-samples, 12 samples shuffles directly.
+    """
+    for n in (6, 12):
+        tables = [f"t{i}" for i in range(n)]
+        assert generate_join_order_candidates(tables) == generate_join_order_candidates(tables)
+        assert generate_join_method_candidates(tables) == generate_join_method_candidates(tables)
+
+    # ...and different table sets still get different draws.
+    assert generate_join_order_candidates([f"t{i}" for i in range(12)]) != (
+        generate_join_order_candidates([f"u{i}" for i in range(12)])
+    )
 
 
 def test_join_method_candidates_cover_all_methods_per_order():
