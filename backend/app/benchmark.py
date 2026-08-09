@@ -30,10 +30,23 @@ from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 
 
-def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True) -> None:
+def run(
+    policy: str = "greedy",
+    risk_lambda: float = 1.0,
+    use_guard: bool = True,
+    quiet: bool = False,
+) -> dict:
+    """Run the workload and return the run's metrics.
+
+    Returning rather than only printing is what lets `app.experiment`
+    repeat this and put a confidence interval around the result. The
+    printed output is unchanged; `quiet` suppresses the per-query detail
+    so a 20-run experiment does not bury its own summary.
+    """
+    say = (lambda *a, **k: None) if quiet else print
     optimizer = LearnedOptimizer(policy=policy, risk_lambda=risk_lambda, seed=0)
     selector_mode = "learned" if optimizer.model is not None else "heuristic"
-    print(f"selector mode: {selector_mode}" + (f" (policy: {policy})" if selector_mode == "learned" else ""))
+    say(f"selector mode: {selector_mode}" + (f" (policy: {policy})" if selector_mode == "learned" else ""))
 
     native_total = served_total = oracle_total = 0.0
     n_vetoed = 0
@@ -43,8 +56,8 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
         guard = RegressionGuard()
         if use_guard:
             blocked = guard.refresh(cur)
-            print(f"regression guard: {len(blocked)} queries blocked from the learned path")
-        print()
+            say(f"regression guard: {len(blocked)} queries blocked from the learned path")
+        say()
 
         for item in WORKLOAD:
             query_id, sql = item["id"], item["sql"]
@@ -108,36 +121,48 @@ def run(policy: str = "greedy", risk_lambda: float = 1.0, use_guard: bool = True
                 + [c["actual_total_time_ms"] for c in candidates]
             )
 
-            print(f"--- {query_id} ({len(candidates)} candidates) ---")
-            print(f"baseline (native Postgres): {baseline['actual_total_time_ms']:.2f} ms")
-            print(f"served   ({selector_mode} path):    {served_plan['actual_total_time_ms']:.2f} ms")
+            say(f"--- {query_id} ({len(candidates)} candidates) ---")
+            say(f"baseline (native Postgres): {baseline['actual_total_time_ms']:.2f} ms")
+            say(f"served   ({selector_mode} path):    {served_plan['actual_total_time_ms']:.2f} ms")
             if decision.get("reason") == "regression_guard":
-                print("regression guard: query has a history of regressing, kept native plan")
+                say("regression guard: query has a history of regressing, kept native plan")
             elif vetoed:
-                print("safety veto: learned pick discarded, kept native plan")
+                say("safety veto: learned pick discarded, kept native plan")
             elif served_plan.get("hint"):
-                print(f"hint used: {served_plan['hint']}")
+                say(f"hint used: {served_plan['hint']}")
             if decision.get("predicted_speedup_vs_native") is not None:
-                print(
+                say(
                     f"model predicted {decision['predicted_speedup_vs_native']:.2f}x native "
                     f"(pessimistically {decision['pessimistic_speedup_vs_native']:.2f}x, "
                     f"needs < {decision['required_speedup']:.2f}x to deviate)"
                 )
             elif decision.get("predicted_score") is not None:
-                print(f"model score {decision['predicted_score']:.2f} "
+                say(f"model score {decision['predicted_score']:.2f} "
                       f"(+/- {decision['predicted_uncertainty']:.2f})")
-            print()
+            say()
 
     headroom = native_total - oracle_total
     captured = ((native_total - served_total) / headroom * 100) if headroom > 0 else None
 
-    print(f"=== totals across {len(WORKLOAD)} queries ===")
-    print(f"native total:        {native_total:.2f} ms")
-    print(f"served total:        {served_total:.2f} ms")
-    print(f"oracle total (best): {oracle_total:.2f} ms")
+    say(f"=== totals across {len(WORKLOAD)} queries ===")
+    say(f"native total:        {native_total:.2f} ms")
+    say(f"served total:        {served_total:.2f} ms")
+    say(f"oracle total (best): {oracle_total:.2f} ms")
     if captured is not None:
-        print(f"captured {captured:.1f}% of the {headroom:.0f} ms available headroom")
-    print(f"safety vetoes: {n_vetoed}/{len(WORKLOAD)}   guard-blocked: {n_guarded}/{len(WORKLOAD)}")
+        say(f"captured {captured:.1f}% of the {headroom:.0f} ms available headroom")
+    say(f"safety vetoes: {n_vetoed}/{len(WORKLOAD)}   guard-blocked: {n_guarded}/{len(WORKLOAD)}")
+
+    return {
+        "policy": policy,
+        "guard": use_guard,
+        "native_ms": native_total,
+        "served_ms": served_total,
+        "oracle_ms": oracle_total,
+        "headroom_ms": headroom,
+        "captured_pct": captured,
+        "n_vetoed": n_vetoed,
+        "n_guarded": n_guarded,
+    }
 
 
 if __name__ == "__main__":

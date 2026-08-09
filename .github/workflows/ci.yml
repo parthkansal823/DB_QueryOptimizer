@@ -1,0 +1,112 @@
+name: CI
+
+# Every bug found in the last audit was catchable by a test that now exists.
+# Nothing ran them automatically, which is why they survived. This fixes that.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-unit:
+    name: Backend unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      # No database service here on purpose. The unit suite must stay runnable
+      # without infrastructure -- it was not, until the connection pool stopped
+      # being built at import time, and this job is what keeps it that way.
+      - name: Unit tests (no database)
+        working-directory: backend
+        run: pytest -q -m "not integration"
+
+  backend-integration:
+    name: Backend integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      # Built rather than pulled: pg_hint_plan has to be compiled against the
+      # server and loaded via shared_preload_libraries. A stock postgres image
+      # would let every hint silently become a comment, which is the exact
+      # failure these tests exist to catch.
+      - name: Build Postgres with pg_hint_plan
+        run: docker build -t lqo-postgres ./postgres
+
+      - name: Start Postgres
+        run: |
+          docker run -d --name lqo-pg \
+            -e POSTGRES_DB=lqo -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 --shm-size=1g \
+            -v "$PWD/postgres/init:/docker-entrypoint-initdb.d" \
+            -v "$PWD/data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql" \
+            lqo-postgres \
+            postgres -c shared_preload_libraries=pg_hint_plan
+
+      - name: Wait for the seed data to load
+        run: |
+          for i in $(seq 1 90); do
+            if docker exec lqo-pg pg_isready -U postgres -d lqo >/dev/null 2>&1 \
+               && docker exec lqo-pg psql -U postgres -d lqo -tAc \
+                  "SELECT to_regclass('public.orders') IS NOT NULL" | grep -q t; then
+              echo "ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres never became ready"; docker logs lqo-pg | tail -50; exit 1
+
+      - name: Integration tests (hints must actually bind)
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/lqo
+        run: pytest -q -m integration
+
+      - name: Postgres logs on failure
+        if: failure()
+        run: docker logs lqo-pg | tail -100
+
+  frontend:
+    name: Frontend build and lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build

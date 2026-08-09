@@ -127,6 +127,49 @@ still produces a full set of numbers. Checking that the intervention *changed
 anything at all* (here, do the candidate plans actually differ?) belongs in
 the pipeline, not in a reviewer's intuition.
 
+#### A correction to the diagnosis above
+
+The paragraph about hint placement is wrong, and finding that out took
+measuring it, which is the point.
+
+On pg_hint_plan 1.6.3 -- the version pinned in `postgres/Dockerfile` -- a hint
+placed *after* the `EXPLAIN` keyword binds exactly as well as one placed
+before it. Measured on a 4-table query:
+
+| | Total cost |
+|---|---|
+| No hint | 11,699 |
+| `Set(enable_hashjoin off)` before `EXPLAIN` | 42,094 |
+| `Set(enable_hashjoin off)` after `EXPLAIN` | 42,094 |
+| `Leading(u p oi o)` before `EXPLAIN` | 2.00000e10 |
+| `Leading(u p oi o)` after `EXPLAIN` | 2.00000e10 |
+
+So "either bug alone is enough to make every hint a no-op" is false. There was
+one bug, not two: the missing `shared_preload_libraries`. Hoisting the hint in
+`plan_extractor._split_hint` fixed nothing, and the fact that the results
+improved after doing both changes made it look causal.
+
+This is the same error as the original, one level up. The diagnosis of a
+silent failure was itself never checked against a planner -- two plausible
+causes were identified, both were fixed at once, the numbers moved, and the
+explanation was written up as established. `_split_hint` stays, because
+hoisting is harmless and other pg_hint_plan versions may genuinely require it,
+but it is defensive rather than load-bearing.
+
+Both claims are now pinned by
+`tests/test_integration_hints.py`, which asserts against a live planner that
+hints bind, that the candidate set contains genuinely different plans, and
+that placement does not matter on this version. Those are the tests that would
+have caught §2.0 in the first place, and their absence is why a unit suite of
+200 passing tests could sit on top of a pipeline whose central mechanism did
+nothing.
+
+A third trap surfaced while writing them: pg_hint_plan accepts
+`Leading(a b c)` but **silently ignores** `Leading(((a b) c))`. A generator
+emitting the nested form would produce an action space of identical plans and
+no error at all -- §2.0 exactly, waiting to happen again. `hints.py` emits the
+flat form; a test now pins that it must.
+
 ### 2.1 Offline evaluation (`app.train`, query-level held-out split)
 
 Trained on `plan_execution_log` after Phase 1 data collection (25 workload

@@ -20,9 +20,18 @@ from app.optimizer.hints import apply_hint, generate_candidates
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 
+# Three, not one. Training on single executions taught the model that
+# whichever candidate got the luckiest timing was genuinely fastest, and
+# live runs ranged from +40% to -149% as a result. Aggregating repeated
+# executions to their median removed every regression with no change to the
+# model (docs/WRITEUP.md 2.2) -- so collecting a single rep makes that fix
+# impossible, and shipping 1 as the default contradicted the project's own
+# strongest finding. `app.onboard` already used 3; these agree with it now.
+DEFAULT_REPS = 3
+
 
 def collect(
-    reps: int = 1,
+    reps: int = DEFAULT_REPS,
     include_join_methods: bool = True,
     workload: list[dict] | None = None,
     statement_timeout_ms: int = 30_000,
@@ -119,7 +128,10 @@ def collect(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reps", type=int, default=1, help="repetitions per candidate")
+    parser.add_argument(
+        "--reps", type=int, default=DEFAULT_REPS,
+        help="executions per candidate; the median becomes the training label",
+    )
     parser.add_argument(
         "--no-join-methods",
         action="store_true",

@@ -23,7 +23,7 @@ import glob
 import os
 import re
 
-from app.collect_data import collect
+from app.collect_data import DEFAULT_REPS, collect
 
 QUERY_DIR = "/job_queries"  # see the backend service's volume mount in docker-compose.yml
 SKIP_FILES = {"schema.sql", "fkindexes.sql"}
@@ -55,7 +55,7 @@ def load_job_workload(n: int, query_dir: str = QUERY_DIR) -> list[dict]:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=8, help="number of (smallest) JOB queries to collect")
-    parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument("--reps", type=int, default=DEFAULT_REPS)
     parser.add_argument("--timeout-ms", type=int, default=60_000)
     args = parser.parse_args()
 
