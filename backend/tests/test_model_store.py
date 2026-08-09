@@ -62,6 +62,25 @@ def test_rollback_restores_the_previous_version():
     assert model_store.current_version() == old
 
 
+def test_repeated_rollback_keeps_walking_backwards():
+    """
+    Rolling back twice must not return the model being escaped from.
+
+    "Newest version that isn't current" oscillated: v3 -> v2 -> v3. Anyone
+    reaching for rollback a second time wants to keep going back, and handing
+    them the version they just rejected is the opposite of an escape hatch.
+    """
+    v1 = model_store.save_version(_bundle("v1"), {}, version_id="20260101T000000Z")
+    v2 = model_store.save_version(_bundle("v2"), {}, version_id="20260202T000000Z")
+    v3 = model_store.save_version(_bundle("v3"), {}, version_id="20260303T000000Z")
+    model_store.promote(v3)
+
+    assert model_store.rollback() == v2
+    assert model_store.rollback() == v1
+    assert model_store.rollback() is None  # end of the line, not back to v2
+    assert model_store.current_version() == v1
+
+
 def test_rollback_with_no_alternative_returns_none():
     only = model_store.save_version(_bundle("only"), {})
     model_store.promote(only)
@@ -135,6 +154,24 @@ def test_a_failed_promotion_leaves_the_served_model_intact():
         assert f.read() == served_before  # still the model that was working
     assert model_store.load_version(good)["model"] == "good"
     assert not os.path.exists(f"{model_store.CURRENT_PATH}.tmp")  # no debris left
+
+
+def test_a_damaged_registry_does_not_block_saving_a_model():
+    """
+    The registry is rebuildable bookkeeping; the models are not. A truncated
+    or malformed one reads as "no versions yet" rather than raising, so
+    `/model/status` still answers and a retrain can still store its result.
+    """
+    for damaged in ('{"current": "x"', '{"versions": "not-a-list"}', "null", ""):
+        with open(model_store.REGISTRY_PATH, "w") as f:
+            f.write(damaged)
+
+        assert model_store.current_version() in (None, "x")
+        assert model_store.list_versions() == []
+
+        version = model_store.save_version(_bundle("recovered"), {})
+        assert model_store.load_version(version)["model"] == "recovered"
+        os.remove(model_store.REGISTRY_PATH)
 
 
 def test_metrics_are_retained_with_each_version():

@@ -19,7 +19,14 @@ def run(query_key="q1", at=T0, sql="SELECT 1", native=100.0, served=80.0,
 
 
 class _FakeCursor:
-    """Serves the runs query then the counts query, in that order."""
+    """
+    Serves the runs query then the counts query, in that order.
+
+    The runs query applies its LIMIT in SQL rather than slicing in Python, so
+    this honours the limit parameter too -- a fake that ignored it would let
+    `test_limit_keeps_the_most_recent_runs` pass against an endpoint that had
+    stopped bounding what it loads.
+    """
 
     def __init__(self, runs, counts=(0, 0, 0)):
         self._responses = [(RUN_COLUMNS, runs), (COUNT_COLUMNS, [counts])]
@@ -29,6 +36,11 @@ class _FakeCursor:
     def execute(self, sql, params=None):
         columns, rows = self._responses.pop(0)
         self.description = [(c,) for c in columns]
+        # (selector, limit) on the runs query; the counts query has no limit.
+        if params and len(params) == 2:
+            at = RUN_COLUMNS.index("created_at")
+            newest_first = sorted(rows, key=lambda r: r[at], reverse=True)[: params[1]]
+            rows = sorted(newest_first, key=lambda r: r[at])
         self._current = rows
 
     def fetchall(self):
@@ -137,7 +149,13 @@ def test_by_day_groups_runs_by_calendar_day():
 
 def test_limit_keeps_the_most_recent_runs():
     runs = [run(at=T0 + timedelta(seconds=i)) for i in range(50)]
-    assert served_vs_native(_FakeCursor(runs), limit=10)["overall"]["n_runs"] == 10
+    result = served_vs_native(_FakeCursor(runs), limit=10)
+
+    assert result["overall"]["n_runs"] == 10
+    # The most recent ten, oldest-first -- the run sequence the dashboard
+    # plots is only meaningful if the window is both bounded and in order.
+    assert result["runs"][0]["at"] == (T0 + timedelta(seconds=40)).isoformat()
+    assert result["runs"][-1]["at"] == (T0 + timedelta(seconds=49)).isoformat()
 
 
 def test_log_counts_are_reported_separately_from_matched_runs():

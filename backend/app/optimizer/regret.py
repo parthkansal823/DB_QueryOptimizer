@@ -32,18 +32,28 @@ from app.logging_store import QUERY_KEY_SQL
 # Falling back to a fingerprint of the SQL text keeps ad-hoc runs in, and
 # groups repeat executions of the same query together the way named workload
 # queries already were.
+# Newest-first with a LIMIT, then re-sorted ascending -- the same window the
+# Python tail-slice produced, without transferring the whole history to discard
+# it. `query_key` breaks ties on `created_at`, which is frozen per transaction
+# and so is shared by every query a single run logs: without it the window
+# boundary and the plotted order were both left to Postgres's discretion and
+# could differ between identical calls.
 REGRET_SQL = f"""
-    SELECT
-        {QUERY_KEY_SQL}                                                  AS query_key,
-        created_at,
-        MIN(actual_total_time_ms)                                        AS best_ms,
-        MIN(actual_total_time_ms) FILTER (WHERE is_chosen)               AS served_ms,
-        MIN(actual_total_time_ms) FILTER (WHERE is_baseline)             AS native_ms
-    FROM plan_execution_log
-    WHERE actual_total_time_ms IS NOT NULL
-    GROUP BY 1, created_at
-    HAVING MIN(actual_total_time_ms) FILTER (WHERE is_chosen) IS NOT NULL
-    ORDER BY created_at
+    SELECT * FROM (
+        SELECT
+            {QUERY_KEY_SQL}                                              AS query_key,
+            created_at,
+            MIN(actual_total_time_ms)                                    AS best_ms,
+            MIN(actual_total_time_ms) FILTER (WHERE is_chosen)           AS served_ms,
+            MIN(actual_total_time_ms) FILTER (WHERE is_baseline)         AS native_ms
+        FROM plan_execution_log
+        WHERE actual_total_time_ms IS NOT NULL
+        GROUP BY 1, created_at
+        HAVING MIN(actual_total_time_ms) FILTER (WHERE is_chosen) IS NOT NULL
+        ORDER BY created_at DESC, query_key DESC
+        LIMIT %s
+    ) recent
+    ORDER BY created_at, query_key
 """
 
 
@@ -56,8 +66,8 @@ def regret_curve(cur, limit: int = 500) -> dict:
     above it, the optimizer is actively harmful, and no summary statistic
     should be allowed to obscure that.
     """
-    cur.execute(REGRET_SQL)
-    rows = cur.fetchall()[-limit:]
+    cur.execute(REGRET_SQL, (limit,))
+    rows = cur.fetchall()
 
     points = []
     cumulative_learned = 0.0

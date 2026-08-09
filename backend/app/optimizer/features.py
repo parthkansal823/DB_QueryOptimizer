@@ -116,7 +116,12 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
         features[f"{table}_join_position"] = float(i + 1) / max(len(tables_scanned), 1)
 
         node = scan_info.get(alias)
-        cardinality = table_cardinalities[table]
+        # A table can legitimately report zero rows -- `reltuples` is -1 until
+        # a table is first analysed, and an empty table stays at 0. The
+        # discovery query clamps to 1, but this function is also fed
+        # cardinalities unpickled from older bundles and hand-built dicts in
+        # tests, so the guard belongs at the division as well as the source.
+        cardinality = table_cardinalities[table] or 1.0
         if node is not None:
             features[f"{table}_selectivity"] = min(node["plan_rows"] / cardinality, 5.0)
             features[f"{table}_index_scan"] = (

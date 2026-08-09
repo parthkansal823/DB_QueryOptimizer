@@ -130,3 +130,20 @@ def test_all_declared_policies_are_selectable():
     for policy in POLICIES:
         index, _ = select_index(ensemble, [[0], [0]], policy=policy, rng=random.Random(0))
         assert index in (0, 1)
+
+
+def test_fitting_on_an_empty_set_says_so():
+    """The bootstrap loop drew indices before checking it had any rows, so an
+    empty training set surfaced as `randrange(0)` from inside `random` --
+    which says nothing about what the caller got wrong."""
+    ensemble = BootstrappedEnsemble(build_model=lambda: None, n_models=2)
+    with pytest.raises(ValueError, match="empty training set"):
+        ensemble.fit([], [])
+
+
+def test_mismatched_X_and_y_are_rejected():
+    """Otherwise the bootstrap silently pairs features with whichever label
+    happens to share an index, and trains on nonsense."""
+    ensemble = BootstrappedEnsemble(build_model=lambda: None, n_models=2)
+    with pytest.raises(ValueError, match="3 rows but y has 2"):
+        ensemble.fit([[1.0], [2.0], [3.0]], [1.0, 2.0])

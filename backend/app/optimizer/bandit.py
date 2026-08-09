@@ -66,8 +66,14 @@ class BootstrappedEnsemble:
     def fit(self, X: list[list[float]], y: list[float]) -> "BootstrappedEnsemble":
         if self.build_model is None:
             raise RuntimeError("this ensemble was loaded from a pickle and cannot be refit; train a new one")
-        rng = random.Random(self.seed)
         n = len(X)
+        if n == 0:
+            # Otherwise this surfaces as `randrange(0)` from inside the
+            # bootstrap loop, which says nothing about the actual problem.
+            raise ValueError("cannot fit an ensemble on an empty training set")
+        if len(y) != n:
+            raise ValueError(f"X has {n} rows but y has {len(y)}")
+        rng = random.Random(self.seed)
         self.models = []
         for _ in range(self.n_models):
             # Sample n rows *with replacement* -- each member sees a slightly

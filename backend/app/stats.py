@@ -116,24 +116,42 @@ def _decision_quality(runs: list[dict]) -> dict:
         "missed_ms": missed_ms,
     }
 
+# The `LIMIT` lives in SQL rather than being sliced off in Python. Both mean
+# "the most recent `limit` runs", but slicing meant every call transferred and
+# built dicts for the *entire* comparable history before throwing all but the
+# tail away -- work that grew with the log forever, on an endpoint the
+# dashboard polls. The GROUP BY still scans the log; what this bounds is what
+# crosses the wire and what is held in memory.
+#
+# `query_key` is a tiebreaker, not decoration. `created_at` defaults to
+# `now()`, which Postgres freezes per transaction, so one benchmark run logging
+# six queries gives all six the *same* timestamp -- ordering by it alone is not
+# a total order. Postgres may then return tied rows in any order, so which of
+# them fell inside the window shifted between identical calls, and the run
+# sequence the dashboard plots could reshuffle on refresh. Ordering by both
+# columns makes the window and its order reproducible.
 RUNS_SQL = f"""
-    SELECT
-        {QUERY_KEY_SQL}                                        AS query_key,
-        created_at,
-        MIN(sql_text)                                          AS sql_text,
-        MIN(actual_total_time_ms) FILTER (WHERE is_baseline)   AS native_ms,
-        MIN(actual_total_time_ms) FILTER (WHERE is_chosen)     AS served_ms,
-        MIN(actual_total_time_ms)                              AS best_ms,
-        COUNT(*)                                               AS n_plans,
-        bool_or(is_chosen AND hint IS NOT NULL)                AS deviated,
-        MIN(selector_used) FILTER (WHERE is_chosen)            AS selector
-    FROM plan_execution_log
-    WHERE actual_total_time_ms IS NOT NULL
-      AND selector_used <> %s
-    GROUP BY 1, 2
-    HAVING MIN(actual_total_time_ms) FILTER (WHERE is_baseline) IS NOT NULL
-       AND MIN(actual_total_time_ms) FILTER (WHERE is_chosen) IS NOT NULL
-    ORDER BY created_at
+    SELECT * FROM (
+        SELECT
+            {QUERY_KEY_SQL}                                        AS query_key,
+            created_at,
+            MIN(sql_text)                                          AS sql_text,
+            MIN(actual_total_time_ms) FILTER (WHERE is_baseline)   AS native_ms,
+            MIN(actual_total_time_ms) FILTER (WHERE is_chosen)     AS served_ms,
+            MIN(actual_total_time_ms)                              AS best_ms,
+            COUNT(*)                                               AS n_plans,
+            bool_or(is_chosen AND hint IS NOT NULL)                AS deviated,
+            MIN(selector_used) FILTER (WHERE is_chosen)            AS selector
+        FROM plan_execution_log
+        WHERE actual_total_time_ms IS NOT NULL
+          AND selector_used <> %s
+        GROUP BY 1, 2
+        HAVING MIN(actual_total_time_ms) FILTER (WHERE is_baseline) IS NOT NULL
+           AND MIN(actual_total_time_ms) FILTER (WHERE is_chosen) IS NOT NULL
+        ORDER BY created_at DESC, query_key DESC
+        LIMIT %s
+    ) recent
+    ORDER BY created_at, query_key
 """
 
 # Everything in the log, so the dashboard can say how many executions exist
@@ -340,9 +358,9 @@ def served_vs_native(cur, limit: int = 2000) -> dict:
     included -- the offline collection sweep and any half-logged run are
     excluded rather than counted on one side of the comparison.
     """
-    cur.execute(RUNS_SQL, (COLLECTION_SELECTOR,))
+    cur.execute(RUNS_SQL, (COLLECTION_SELECTOR, limit))
     columns = [c[0] for c in cur.description]
-    runs = [dict(zip(columns, row)) for row in cur.fetchall()][-limit:]
+    runs = [dict(zip(columns, row)) for row in cur.fetchall()]
 
     cur.execute(COUNTS_SQL, (COLLECTION_SELECTOR,))
     n_rows, n_collection, n_queries = cur.fetchone()

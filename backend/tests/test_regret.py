@@ -6,14 +6,26 @@ T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 class _FakeCursor:
+    """
+    Stands in for the database, including the LIMIT the query applies.
+
+    The limit lives in SQL rather than in a Python tail-slice, so a fake that
+    ignored `params` would report the full history and let the assertion below
+    pass against an endpoint that had stopped limiting anything. Modelling
+    "newest N, returned oldest-first" is what keeps the test honest.
+    """
+
     def __init__(self, rows):
         self._rows = rows
+        self._result = rows
 
     def execute(self, sql, params=None):
-        pass
+        limit = params[0] if params else len(self._rows)
+        newest_first = sorted(self._rows, key=lambda r: r[1], reverse=True)[:limit]
+        self._result = sorted(newest_first, key=lambda r: r[1])
 
     def fetchall(self):
-        return self._rows
+        return self._result
 
 
 # (query_id, created_at, best_ms, served_ms, native_ms)
@@ -71,7 +83,13 @@ def test_rows_without_a_served_plan_are_skipped():
 
 def test_limit_keeps_the_most_recent_decisions():
     rows = [("q", T0 + timedelta(seconds=i), 10.0, 11.0, 20.0) for i in range(100)]
-    assert regret_curve(_FakeCursor(rows), limit=10)["n_decisions"] == 10
+    result = regret_curve(_FakeCursor(rows), limit=10)
+
+    assert result["n_decisions"] == 10
+    # The *most recent* ten, still oldest-first -- a curve plotted from the
+    # oldest ten, or from a reversed window, would also have 10 points.
+    assert result["points"][0]["at"] == (T0 + timedelta(seconds=90)).isoformat()
+    assert result["points"][-1]["at"] == (T0 + timedelta(seconds=99)).isoformat()
 
 
 def test_mean_regret_is_reported():

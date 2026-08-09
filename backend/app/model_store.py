@@ -27,10 +27,32 @@ REGISTRY_PATH = os.path.join(MODELS_DIR, "registry.json")
 
 
 def _read_registry() -> dict:
+    """
+    The version registry, normalised so callers can rely on its shape.
+
+    A registry that is missing, unreadable, or truncated reads as "no versions
+    yet" rather than raising. Every caller here is on a path where the
+    alternative is worse: `current_version()` is called by `/model/status`,
+    and `save_version` reads before writing -- so a damaged registry would
+    otherwise turn into a failed endpoint and an unsaveable model, when the
+    file is rebuildable bookkeeping rather than the models themselves.
+    """
+    empty = {"current": None, "versions": []}
     if not os.path.exists(REGISTRY_PATH):
-        return {"current": None, "versions": []}
-    with open(REGISTRY_PATH) as f:
-        return json.load(f)
+        return empty
+    try:
+        with open(REGISTRY_PATH) as f:
+            registry = json.load(f)
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(registry, dict):
+        return empty
+    registry.setdefault("current", None)
+    # A registry without this key would KeyError in `save_version` and
+    # `list_versions`, which both index it directly.
+    if not isinstance(registry.get("versions"), list):
+        registry["versions"] = []
+    return registry
 
 
 def _atomic_replace(write, destination: str) -> None:
@@ -178,18 +200,33 @@ def load_version(version_id: str) -> dict:
 
 def rollback() -> str | None:
     """
-    Promote the most recent version that isn't the current one.
+    Promote the newest version *older than* the one currently served.
 
     The escape hatch for "the automated retrain promoted something that
     looked better offline and is worse in production" -- which the offline
     evaluation bias documented in docs/WRITEUP.md §2.2.1 makes a live
     possibility, not a hypothetical.
+
+    "Older than current" rather than "newest that isn't current", because the
+    latter oscillated: rolling back from v3 promoted v2, and rolling back
+    again promoted v3 -- the very model being escaped from. Anyone reaching
+    for this twice wants to keep going back, not to be returned to the thing
+    that was already judged bad. Stepping strictly backwards also makes the
+    end of the line reachable, where the old rule ping-ponged forever.
     """
     registry = _read_registry()
     current = registry.get("current")
-    candidates = [v for v in list_versions() if v["version_id"] != current]
-    if not candidates:
+
+    older = [v for v in list_versions() if v["version_id"] < (current or "")]
+    if not older:
+        # Nothing promoted yet: any version is a step forward rather than back.
+        if current is None:
+            newest = list_versions()
+            if newest:
+                promote(newest[0]["version_id"], reason="rollback with no current model")
+                return newest[0]["version_id"]
         return None
-    target = candidates[0]["version_id"]
+
+    target = older[0]["version_id"]  # list_versions is newest-first
     promote(target, reason=f"rollback from {current}")
     return target

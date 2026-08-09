@@ -58,6 +58,7 @@ def get_cursor():
     """Yield a cursor from the pool; commits on success, rolls back on error."""
     active = get_pool()
     conn = active.getconn()
+    cur = None
     try:
         cur = conn.cursor()
         yield cur
@@ -66,4 +67,10 @@ def get_cursor():
         conn.rollback()
         raise
     finally:
+        # Connections are pooled and therefore long-lived, so a cursor left
+        # unclosed here is not reclaimed when the request ends -- it stays
+        # attached to the connection, holding its result set, until the
+        # connection itself is discarded. Closing keeps that bounded.
+        if cur is not None:
+            cur.close()
         active.putconn(conn)

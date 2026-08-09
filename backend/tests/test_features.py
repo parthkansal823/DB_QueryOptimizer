@@ -131,3 +131,16 @@ def test_self_join_collapses_to_one_slot_documented_limitation():
     )
     features = featurize(plan, cardinalities)
     assert features["movie_info_present"] == 1.0
+
+
+def test_a_zero_row_table_does_not_divide_by_zero():
+    """`reltuples` is -1 until a table is first analysed and 0 while it is
+    empty. The discovery query clamps it, but bundles pickled from older runs
+    and hand-built dicts reach this function directly, so the division needs
+    its own guard rather than trusting every caller."""
+    plan = _candidate(_join("Hash Join", "Inner", _scan("o", "orders"), _scan("u", "users")))
+
+    features = featurize(plan, {"orders": 0.0, "users": 50_000})
+
+    assert features["orders_present"] == 1.0
+    assert features["orders_selectivity"] >= 0.0  # finite, not a crash
