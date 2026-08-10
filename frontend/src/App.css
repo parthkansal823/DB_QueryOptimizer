@@ -664,3 +664,116 @@ code {
 .probe-fail {
   color: var(--negative, #c2554d);
 }
+
+/* -- saved queries -------------------------------------------------------- */
+
+.query-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.query-editor input,
+.query-editor textarea {
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+}
+
+.query-editor textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
+.query-actions,
+.train-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.query-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.75rem 0 0;
+}
+
+.query-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.query-item pre {
+  margin: 0.35rem 0 0;
+  padding: 0.5rem;
+  border-radius: 6px;
+  background: var(--surface-2);
+  font-size: 0.8rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.query-desc {
+  color: var(--text-muted);
+}
+
+/* -- training ------------------------------------------------------------- */
+
+.train-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.train-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.train-controls input[type="number"] {
+  width: 5rem;
+  padding: 0.3rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.train-status {
+  margin-top: 1rem;
+}
+
+.train-progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.train-bar {
+  height: 100%;
+  background: var(--accent, #4a90d9);
+  transition: width 0.4s ease;
+}
+
+.train-log {
+  max-height: 12rem;
+  overflow-y: auto;
+  padding: 0.5rem;
+  border-radius: 6px;
+  background: var(--surface-2);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}

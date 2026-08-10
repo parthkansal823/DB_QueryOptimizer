@@ -1,36 +1,37 @@
 {
   "model_backend": "bootstrapped-ensemble[8x lightgbm]",
   "pairwise_ranker": "trained",
-  "n_rows_raw": 1223,
+  "join_cardinality_corrector": "trained",
+  "n_rows_raw": 3519,
   "reps_aggregated_to_median": true,
-  "n_rows_total": 623,
-  "n_rows_train": 475,
-  "n_rows_test": 148,
-  "n_features": 49,
-  "test_mae_log_ratio": 0.45424453036744405,
-  "test_typical_multiplicative_error": 1.5749830815823782,
-  "test_mean_uncertainty_log_ratio": 0.16147896322836996,
+  "n_rows_total": 682,
+  "n_rows_train": 505,
+  "n_rows_test": 177,
+  "n_features": 55,
+  "test_mae_log_ratio": 0.5570046108031002,
+  "test_typical_multiplicative_error": 1.7454364007943572,
+  "test_mean_uncertainty_log_ratio": 0.23956783138161747,
   "n_tables_in_schema": 6,
   "n_held_out_queries": 6,
   "avg_latency_ms": {
-    "native": 34.466,
-    "heuristic": 34.466,
-    "oracle_best_possible": 21.593999999999998,
-    "learned_greedy": 24.5265,
-    "learned_thompson": 24.5265,
-    "learned_risk_averse": 24.5265,
-    "learned_pairwise_rank": 23.162000000000003
+    "native": 153.9955,
+    "heuristic": 159.93033333333332,
+    "oracle_best_possible": 109.88574999999999,
+    "learned_greedy": 144.15866666666668,
+    "learned_thompson": 156.19983333333332,
+    "learned_risk_averse": 143.2805,
+    "learned_pairwise_rank": 147.67716666666666
   },
   "headroom_captured_vs_oracle": {
-    "learned_greedy": 0.7721799254195152,
-    "learned_thompson": 0.7721799254195152,
-    "learned_risk_averse": 0.7721799254195152,
-    "learned_pairwise_rank": 0.8781852082038529
+    "learned_greedy": 0.22300814067940344,
+    "learned_thompson": -0.0499738342052114,
+    "learned_risk_averse": 0.24291681544329774,
+    "learned_pairwise_rank": 0.14324119572959101
   },
   "beats_or_ties_heuristic_rate": {
-    "learned_greedy": 1.0,
-    "learned_thompson": 1.0,
-    "learned_risk_averse": 1.0,
-    "learned_pairwise_rank": 1.0
+    "learned_greedy": 0.6666666666666666,
+    "learned_thompson": 0.5,
+    "learned_risk_averse": 0.6666666666666666,
+    "learned_pairwise_rank": 0.6666666666666666
   }
 }

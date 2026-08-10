@@ -1,12 +1,12 @@
 import { NavLink, Route, HashRouter as Router, Routes } from "react-router-dom";
 import "./App.css";
-import Dashboard from "./Dashboard";
-import SettingsPage from "./SettingsPage";
+import DashboardPage from "./DashboardPage";
+import DemoPage from "./DemoPage";
 
 // HashRouter rather than BrowserRouter: the dashboard is served by `vite
 // preview` and by a plain static host in the Docker image, neither of which
 // rewrites unknown paths to index.html. With browser history routing, opening
-// /settings directly or refreshing on it would 404 -- the classic SPA deploy
+// /demo directly or refreshing on it would 404 -- the classic SPA deploy
 // footgun, and not worth a server config for a two-page tool.
 export default function App() {
   return (
@@ -17,17 +17,20 @@ export default function App() {
           <NavLink to="/" end className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
             Dashboard
           </NavLink>
-          <NavLink to="/settings" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
-            Settings
+          <NavLink to="/demo" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
+            Demo
           </NavLink>
         </nav>
       </header>
 
       <Routes>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        {/* An unknown hash lands on the dashboard rather than a blank page. */}
-        <Route path="*" element={<Dashboard />} />
+        {/* The control centre: connect a database, save your own queries,
+            train on them, and tune how the optimizer behaves. */}
+        <Route path="/" element={<DashboardPage />} />
+        {/* The presentation piece, unchanged: paste a query and watch the
+            optimizer work through it. */}
+        <Route path="/demo" element={<DemoPage />} />
+        <Route path="*" element={<DashboardPage />} />
       </Routes>
     </Router>
   );

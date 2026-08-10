@@ -24,7 +24,7 @@ import QueryForm from "./components/QueryForm";
 import ServedVsNative from "./components/ServedVsNative";
 import TrendChart from "./components/TrendChart";
 
-export default function Dashboard() {
+export default function DemoPage() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);

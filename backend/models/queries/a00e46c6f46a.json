@@ -1,0 +1,8 @@
+[
+  {
+    "id": "user:my-orders",
+    "name": "my-orders",
+    "sql": "SELECT o.id,u.name FROM orders o JOIN users u ON o.user_id=u.id WHERE u.country='IN'",
+    "description": "India orders"
+  }
+]

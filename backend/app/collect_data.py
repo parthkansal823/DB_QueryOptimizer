@@ -35,6 +35,8 @@ def collect(
     include_join_methods: bool = True,
     workload: list[dict] | None = None,
     statement_timeout_ms: int = 30_000,
+    on_progress=None,
+    should_stop=None,
 ) -> None:
     """
     `workload` defaults to the synthetic-schema `WORKLOAD`; pass a different
@@ -44,6 +46,12 @@ def collect(
     can run: a forced join order/method on an un-indexed large table (JOB's
     tables run into the tens of millions of rows) can occasionally pick a
     pathological plan, and one hung candidate shouldn't stall the whole run.
+
+    `on_progress(done, total, query_id, rows)` and `should_stop()` exist for
+    callers that are not a terminal -- the dashboard runs this in a background
+    thread, where printing to stdout tells the user nothing and there is no
+    Ctrl-C to interrupt with. Both are optional and default to the previous
+    behaviour exactly.
     """
     workload = workload if workload is not None else WORKLOAD
     start = time.time()
@@ -52,6 +60,13 @@ def collect(
     with get_cursor() as cur:
         cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
         for qi, item in enumerate(workload):
+            # Checked between queries rather than mid-query: the per-query
+            # commit below is what makes stopping here leave a consistent,
+            # durable partial run rather than a half-collected one.
+            if should_stop is not None and should_stop():
+                print(f"Stopped after {qi} of {len(workload)} queries.", flush=True)
+                break
+
             sql = item["sql"]
             query_id = item["id"]
 
@@ -132,6 +147,8 @@ def collect(
                 f"({elapsed:.1f}s elapsed)",
                 flush=True,  # so progress is visible when piped
             )
+            if on_progress is not None:
+                on_progress(qi + 1, len(workload), query_id, total_rows)
 
     print(f"Done. Logged {total_rows} rows in {time.time() - start:.1f}s.")
 

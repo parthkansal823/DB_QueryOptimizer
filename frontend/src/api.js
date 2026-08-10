@@ -98,3 +98,47 @@ export function removeDatabase(name) {
 export function activateDatabase(name) {
   return request(`/databases/${encodeURIComponent(name)}/activate`, { method: "POST" });
 }
+
+// -- the user's own workload ------------------------------------------------
+
+export function fetchSavedQueries() {
+  return request("/queries");
+}
+
+export function validateQuery(sql) {
+  return request("/queries/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sql }),
+  });
+}
+
+export function saveQuery(name, sql, description = "") {
+  return request("/queries", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, sql, description }),
+  });
+}
+
+export function deleteQuery(name) {
+  return request(`/queries/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+// -- training ---------------------------------------------------------------
+
+export function fetchTrainStatus() {
+  return request("/train/status");
+}
+
+export function startTraining(options) {
+  return request("/train/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options),
+  });
+}
+
+export function stopTraining() {
+  return request("/train/stop", { method: "POST" });
+}

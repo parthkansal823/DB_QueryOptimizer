@@ -3,12 +3,15 @@ import {
   activateDatabase,
   addDatabase,
   fetchDatabases,
+  fetchSavedQueries,
   fetchSettings,
   removeDatabase,
   resetSettings,
   testDatabase,
   updateSettings,
 } from "./api";
+import QueryManager from "./components/QueryManager";
+import TrainingPanel from "./components/TrainingPanel";
 
 /**
  * One setting, rendered from the metadata the backend declares for it.
@@ -211,9 +214,10 @@ function DatabasePanel({ databases, onChanged, onError }) {
   );
 }
 
-export default function SettingsPage() {
+export default function DashboardPage() {
   const [settings, setSettings] = useState(null);
   const [databases, setDatabases] = useState(null);
+  const [savedQueries, setSavedQueries] = useState(null);
   const [error, setError] = useState(null);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -222,10 +226,22 @@ export default function SettingsPage() {
     setDatabases(await fetchDatabases());
   }, []);
 
+  const loadQueries = useCallback(async () => {
+    setSavedQueries(await fetchSavedQueries());
+  }, []);
+
+  // A finished training run changes the served model and, if the guard
+  // re-evaluated, which queries are blocked -- so both panels are re-read
+  // rather than left showing pre-training state.
+  const handleTrained = useCallback(() => {
+    loadDatabases().catch(() => {});
+  }, [loadDatabases]);
+
   useEffect(() => {
     fetchSettings().then(setSettings).catch((err) => setError(err.message));
     loadDatabases().catch((err) => setError(err.message));
-  }, [loadDatabases]);
+    loadQueries().catch((err) => setError(err.message));
+  }, [loadDatabases, loadQueries]);
 
   async function handleChange(name, value) {
     // Applied on change rather than behind a Save button: every one of these
@@ -260,17 +276,18 @@ export default function SettingsPage() {
   }
 
   if (error && !settings) {
-    return <section className="card empty-state">Could not load settings: {error}</section>;
+    return <section className="card empty-state">Could not load the dashboard: {error}</section>;
   }
   if (!settings) {
-    return <section className="card empty-state">Loading settings…</section>;
+    return <section className="card empty-state">Loading dashboard…</section>;
   }
 
   return (
     <>
       <header className="app-header">
         <p>
-          Change how the optimizer behaves without restarting it. Every setting applies to the
+          Connect a database, save the queries you care about, train on them, and tune how the
+          optimizer behaves — all without touching the backend. Every setting applies to the
           next query and is remembered across restarts.
         </p>
       </header>
@@ -279,6 +296,19 @@ export default function SettingsPage() {
       {saved && !error && <p className="probe-ok">Saved and applied.</p>}
 
       <DatabasePanel databases={databases} onChanged={loadDatabases} onError={setError} />
+
+      <QueryManager
+        queries={savedQueries?.queries}
+        onChanged={loadQueries}
+        onError={setError}
+      />
+
+      <TrainingPanel
+        nQueries={savedQueries?.queries?.length ?? 0}
+        builtinCount={savedQueries?.builtin_count}
+        onFinished={handleTrained}
+        onError={setError}
+      />
 
       {settings.groups.map((group) => (
         <section className="card" key={group}>

@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app import db_profiles, model_store, retrain, stats
+from app import db, db_profiles, model_store, retrain, saved_queries, stats, training_job, workload
 from app import settings as app_settings
 from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
@@ -516,3 +516,112 @@ def activate_database(name: str):
         guard.blocked = {}
 
     return {**result, "model_fit": db_profiles.schema_matches_model(optimizer)}
+
+
+# -- the user's own workload ------------------------------------------------
+
+
+class SavedQueryRequest(BaseModel):
+    name: str
+    sql: str
+    description: str = ""
+
+
+class ValidateRequest(BaseModel):
+    sql: str
+
+
+@app.get("/queries")
+def list_saved_queries():
+    """The saved workload for whichever database is currently active."""
+    return {
+        "queries": saved_queries.list_queries(db.current_database_url()),
+        "builtin_count": len(workload.WORKLOAD),
+    }
+
+
+@app.post("/queries/validate")
+def validate_saved_query(req: ValidateRequest):
+    """
+    Plan a query without running it, so the UI can say whether it is worth
+    saving before a collection run discovers it is not.
+    """
+    with get_cursor() as cur:
+        return saved_queries.validate(cur, req.sql)
+
+
+@app.post("/queries")
+def save_query(req: SavedQueryRequest):
+    try:
+        queries = saved_queries.save_query(
+            db.current_database_url(), req.name, req.sql, req.description
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"queries": queries}
+
+
+@app.delete("/queries/{name}")
+def delete_saved_query(name: str):
+    return {"queries": saved_queries.delete_query(db.current_database_url(), name)}
+
+
+# -- training from the dashboard --------------------------------------------
+
+
+class TrainRequest(BaseModel):
+    reps: int = 3
+    promote: bool = True
+    include_builtin: bool = False
+    include_join_methods: bool = True
+
+
+@app.get("/train/status")
+def train_status():
+    """Progress of the current or most recent run. Safe to poll."""
+    return training_job.job.snapshot()
+
+
+@app.post("/train/start")
+def train_start(req: TrainRequest):
+    """
+    Collect training data for the saved queries, then fit and (by default)
+    promote a model -- the whole loop, without leaving the dashboard.
+
+    Promotion still goes through the champion/challenger comparison in
+    `app.retrain`, so pressing this cannot install a model that is worse than
+    the one already serving.
+    """
+    queries = saved_queries.as_workload(db.current_database_url())
+    if req.include_builtin:
+        queries = [{"id": q["id"], "sql": q["sql"]} for q in workload.WORKLOAD] + queries
+
+    try:
+        snapshot = training_job.job.start(
+            queries,
+            reps=req.reps,
+            promote=req.promote,
+            include_join_methods=req.include_join_methods,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return snapshot
+
+
+@app.post("/train/stop")
+def train_stop():
+    """
+    Ask the run to stop after the query it is on.
+
+    Rows already collected are committed and kept: a rerun appends to them
+    rather than starting over, so stopping is not the same as discarding.
+    """
+    return training_job.job.stop()
+
+
+@app.post("/model/reload")
+def model_reload():
+    """Pick up a model trained out-of-band, without restarting the backend."""
+    _reload_optimizer()
+    return {"selector_mode": SELECTOR_MODE, "current_version": model_store.current_version()}
