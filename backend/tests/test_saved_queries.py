@@ -11,14 +11,21 @@ def isolated_store(tmp_path, monkeypatch):
 
 
 class _FakeCursor:
-    """Plans a query, or raises the way a real planner would."""
+    """
+    Plans a query, or raises the way a real planner would.
+
+    Only the EXPLAIN fails. Transaction control around it (`SAVEPOINT`,
+    `RELEASE`, `ROLLBACK TO`) succeeds, because that is how a real cursor
+    behaves -- a fake that failed those too would be rejecting statements
+    Postgres accepts and would misreport the savepoint handling as broken.
+    """
 
     def __init__(self, plan=None, error=None):
         self._plan = plan
         self._error = error
 
     def execute(self, sql, params=None):
-        if self._error:
+        if self._error and sql.lstrip().upper().startswith("EXPLAIN"):
             raise RuntimeError(self._error)
 
     def fetchone(self):
@@ -44,6 +51,11 @@ def _plan(*tables, cost=100.0, rows=10):
         "DROP TABLE orders",
         "TRUNCATE orders",
         "select 1; drop table orders",
+        # PostgreSQL's spelling of CREATE TABLE AS. It carries none of the
+        # other keywords, so it read as an ordinary SELECT and would have been
+        # executed under every hint variant, creating a table each run.
+        "SELECT * INTO evil_copy FROM orders",
+        "select o.id into backup from orders o",
     ],
 )
 def test_mutating_queries_are_refused(sql):
@@ -64,6 +76,69 @@ def test_mutating_queries_are_refused(sql):
 )
 def test_read_only_queries_are_allowed(sql):
     assert saved_queries.is_read_only(sql) is True
+
+
+def test_a_failed_validation_leaves_the_transaction_usable():
+    """
+    A rejected EXPLAIN aborts the whole transaction, and catching the exception
+    does not undo that -- every later statement on the cursor fails with
+    InFailedSqlTransaction. Validating a query the user got wrong is the
+    ordinary case here, so it must not poison the connection it ran on.
+    """
+    executed = []
+
+    class _AbortingCursor:
+        """Fails the EXPLAIN, and refuses everything afterwards unless the
+        savepoint was rolled back -- the way Postgres actually behaves."""
+
+        def __init__(self):
+            self.aborted = False
+
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            if sql.startswith("ROLLBACK TO SAVEPOINT"):
+                self.aborted = False
+                return
+            if self.aborted:
+                raise RuntimeError("current transaction is aborted")
+            if sql.startswith("EXPLAIN"):
+                self.aborted = True
+                raise RuntimeError('relation "nope" does not exist')
+
+        def fetchone(self):
+            return ([{"Plan": _plan("orders")}],)
+
+    cur = _AbortingCursor()
+    result = saved_queries.validate(cur, "SELECT * FROM nope")
+
+    assert result["ok"] is False
+    assert any(s.startswith("ROLLBACK TO SAVEPOINT") for s in executed)
+    cur.execute("SELECT 1")  # would raise if the savepoint had not been rolled back
+
+
+def test_a_successful_validation_releases_its_savepoint():
+    """Left open, savepoints accumulate for the life of the transaction."""
+    executed = []
+
+    class _RecordingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            executed.append(sql)
+
+    result = saved_queries.validate(_RecordingCursor(plan=_plan("orders", "users")), "SELECT 1")
+
+    assert result["ok"] is True
+    assert any(s.startswith("RELEASE SAVEPOINT") for s in executed)
+
+
+def test_a_hand_edited_entry_without_a_name_does_not_break_the_list():
+    """The store is a plain JSON file people will edit."""
+    import json, os
+    os.makedirs(saved_queries.QUERIES_DIR, exist_ok=True)
+    with open(saved_queries._path_for(URL), "w") as f:
+        json.dump([{"sql": "SELECT 1"}], f)  # no "name"
+
+    assert saved_queries.save_query(URL, "fine", "SELECT 2")
+    assert saved_queries.delete_query(URL, "fine") is not None
 
 
 def test_a_keyword_hidden_in_a_comment_does_not_smuggle_a_write_through():

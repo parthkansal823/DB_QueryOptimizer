@@ -122,15 +122,90 @@ def test_adapts_to_a_different_schema_with_no_config():
     assert len(to_vector(features, columns)) == len(columns)
 
 
-def test_self_join_collapses_to_one_slot_documented_limitation():
-    """Two aliases for the same table (JOB-style self-join) don't crash --
-    they land on the same feature slot, keyed by table identity."""
+def test_a_self_join_is_distinguishable_from_a_single_scan():
+    """
+    Two aliases for one table (JOB-style `movie_info AS mi1, mi2`) share a
+    feature slot, because slots are keyed by table identity -- that is what
+    keeps the vector fixed-length and transferable across schemas.
+
+    Plain assignment made each occurrence overwrite the last, so a self-join
+    was described by whichever alias happened to come last in the plan and
+    every other occurrence vanished from the vector. The count is what makes
+    the two cases distinguishable at all.
+    """
     cardinalities = {"movie_info": 1_000_000}
-    plan = _candidate(
+    self_join = _candidate(
         _join("Merge Join", "Inner", _scan("mi1", "movie_info"), _scan("mi2", "movie_info"))
     )
+    single = _candidate(_scan("mi1", "movie_info"))
+
+    assert featurize(self_join, cardinalities)["movie_info_occurrences"] == 2.0
+    assert featurize(single, cardinalities)["movie_info_occurrences"] == 1.0
+
+
+def test_a_self_join_keeps_the_most_selective_scan_not_the_last_one():
+    """The selective side is what drives the plan, and which alias the planner
+    happens to put last is not information about the query."""
+    cardinalities = {"movie_info": 1_000_000}
+    # Selective scan first, broad scan last: last-wins would report 0.5.
+    plan = _candidate(
+        _join(
+            "Merge Join", "Inner",
+            _scan("mi1", "movie_info", plan_rows=1_000),
+            _scan("mi2", "movie_info", plan_rows=500_000),
+        )
+    )
+
     features = featurize(plan, cardinalities)
-    assert features["movie_info_present"] == 1.0
+
+    assert features["movie_info_selectivity"] == 0.001
+    assert features["movie_info_join_position"] == 0.5  # earliest occurrence
+
+
+def test_a_self_join_records_an_index_scan_on_any_occurrence():
+    """One indexed side is the thing worth knowing; requiring it of the last
+    alias would hide it whenever the planner ordered them the other way."""
+    cardinalities = {"movie_info": 1_000_000}
+    plan = _candidate(
+        _join(
+            "Merge Join", "Inner",
+            _scan("mi1", "movie_info", node_type="Index Scan"),
+            _scan("mi2", "movie_info", node_type="Seq Scan"),
+        )
+    )
+
+    assert featurize(plan, cardinalities)["movie_info_index_scan"] == 1.0
+
+
+def test_aggregation_does_not_change_a_query_without_self_joins():
+    """The aggregates collapse to the plain value at one occurrence, so the
+    common case is byte-identical to what models were trained on."""
+    plan = _candidate(
+        _join("Hash Join", "Inner",
+              _scan("o", "orders", plan_rows=2_000),
+              _scan("u", "users", node_type="Index Scan", plan_rows=500))
+    )
+
+    features = featurize(plan, CARDINALITIES)
+
+    assert features["orders_occurrences"] == 1.0
+    assert features["orders_join_position"] == 0.5
+    assert features["orders_selectivity"] == 2_000 / 200_000
+    assert features["users_selectivity"] == 500 / 50_000
+    assert features["users_index_scan"] == 1.0
+
+
+def test_an_older_bundle_ignores_features_it_was_not_trained_on():
+    """`occurrences` was added after models had already been trained. A bundle
+    stores its own column list, and `to_vector` reads through it -- so an older
+    model keeps producing the same vector it always did rather than being
+    silently reshaped by a newer featurizer."""
+    plan = _candidate(_join("Hash Join", "Inner", _scan("o", "orders"), _scan("u", "users")))
+    older_columns = [c for c in build_feature_columns(sorted(CARDINALITIES)) if "_occurrences" not in c]
+
+    vector = to_vector(featurize(plan, CARDINALITIES), older_columns)
+
+    assert len(vector) == len(older_columns)
 
 
 def test_a_zero_row_table_does_not_divide_by_zero():

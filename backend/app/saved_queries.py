@@ -42,8 +42,20 @@ _lock = threading.Lock()
 # Anything that could modify the database. These queries are executed
 # repeatedly, under forced join orders, as training data -- a saved `DELETE`
 # would be run over and over against the user's own tables.
+#
+# `into` is here for `SELECT * INTO new_table FROM ...`, which is PostgreSQL's
+# spelling of `CREATE TABLE AS` and carries none of the keywords above -- it
+# read as an ordinary SELECT and would have been executed repeatedly, under
+# every hint variant, creating a table each run. Ordinary read-only SELECTs
+# have no top-level `INTO`, so blocking it costs nothing.
+#
+# This is a blocklist, and a blocklist is a floor rather than a guarantee: a
+# SELECT that calls a user-defined function which writes still gets through,
+# because nothing short of executing it can know that. It stops the accidents,
+# not a determined author -- and the author here is the person whose database
+# it is.
 _MUTATING = re.compile(
-    r"\b(insert|update|delete|drop|truncate|alter|create|grant|revoke|vacuum|copy)\b",
+    r"\b(insert|update|delete|drop|truncate|alter|create|grant|revoke|vacuum|copy|into)\b",
     re.IGNORECASE,
 )
 
@@ -104,11 +116,20 @@ def validate(cur, sql: str) -> dict:
             ),
         }
 
+    # A SAVEPOINT, for the same reason `collect_data` uses one: a rejected
+    # EXPLAIN aborts the whole transaction, and catching the exception does not
+    # undo that. Without this, every statement issued on the cursor afterwards
+    # fails with InFailedSqlTransaction -- so the caller is punished for having
+    # validated a query the user got wrong, which is the ordinary case this
+    # function exists to handle.
+    cur.execute("SAVEPOINT validate_query")
     try:
         cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")
         plan = cur.fetchone()[0][0]["Plan"]
     except Exception as exc:  # noqa: BLE001 - any planner error is a failed validation
+        cur.execute("ROLLBACK TO SAVEPOINT validate_query")
         return {"ok": False, "error": str(exc).strip()}
+    cur.execute("RELEASE SAVEPOINT validate_query")
 
     tables: list[str] = []
 
@@ -148,7 +169,9 @@ def save_query(database_url: str, name: str, sql: str, description: str = "") ->
         raise ValueError("only read-only queries can be saved")
 
     with _lock:
-        queries = [q for q in _read(database_url) if q["name"] != name]
+        # `.get`, not `[...]`: the file is hand-editable, and one entry missing
+        # a name would otherwise make the whole list unreadable.
+        queries = [q for q in _read(database_url) if q.get("name") != name]
         queries.append(
             {
                 # `id` is what `plan_execution_log` groups by, so it has to be
@@ -167,7 +190,9 @@ def save_query(database_url: str, name: str, sql: str, description: str = "") ->
 
 def delete_query(database_url: str, name: str) -> list[dict]:
     with _lock:
-        queries = [q for q in _read(database_url) if q["name"] != name]
+        # `.get`, not `[...]`: the file is hand-editable, and one entry missing
+        # a name would otherwise make the whole list unreadable.
+        queries = [q for q in _read(database_url) if q.get("name") != name]
         _write(database_url, queries)
         return queries
 

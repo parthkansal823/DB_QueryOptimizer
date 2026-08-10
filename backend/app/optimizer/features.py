@@ -17,11 +17,21 @@ cardinalities it was computed from) alongside the model so inference
 (`optimizer/learned.py`) featurizes identically to training, regardless of
 which schema either step ran against.
 
-Known limitation: a query that self-joins the same table under two aliases
-(common in JOB, e.g. `movie_info AS mi1, movie_info AS mi2`) collapses both
-occurrences into that table's one feature slot -- the vector stays
-fixed-length by table *identity*, not by occurrence. Keying per-occurrence
-instead would need positional (not identity) slots; out of scope here.
+Slots are keyed by table *identity*, not by occurrence, which is what keeps
+the vector fixed-length and the model shape transferable between schemas. A
+query that scans one table several times under different aliases -- `movie_info
+AS mi1, movie_info AS mi2`, common in JOB -- therefore shares a slot between
+those occurrences, and they are **aggregated** rather than overwritten: the
+earliest join position, the most selective scan, an index scan on any
+occurrence, and a count. Plain assignment described a self-join by whichever
+alias the planner happened to put last and dropped the rest of the query from
+the vector entirely.
+
+The aggregates collapse to the plain value when a table appears once, so
+queries without self-joins featurize exactly as they did before this existed.
+`occurrences` was added later than the other slots; older bundles carry their
+own `feature_columns` and `to_vector` reads through that list, so they keep
+producing the vectors they were trained on.
 """
 
 from __future__ import annotations
