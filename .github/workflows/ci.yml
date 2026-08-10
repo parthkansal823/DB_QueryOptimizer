@@ -109,4 +109,9 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
+      # Lint and build only ever proved the dashboard *compiled*. The panel
+      # note claiming "nothing else was clearly faster" was valid JSX and
+      # perfectly lintable while contradicting the chart directly beneath it,
+      # which is the class of bug these cover.
+      - run: npm run test
       - run: npm run build

@@ -52,3 +52,49 @@ export function fetchCostModel() {
 export function fetchAdvisor() {
   return request("/advisor");
 }
+
+// -- runtime configuration --------------------------------------------------
+
+export function fetchSettings() {
+  return request("/settings");
+}
+
+export function updateSettings(changes) {
+  return request("/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+}
+
+export function resetSettings() {
+  return request("/settings/reset", { method: "POST" });
+}
+
+export function fetchDatabases() {
+  return request("/databases");
+}
+
+export function testDatabase(url) {
+  return request("/databases/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+}
+
+export function addDatabase(name, url) {
+  return request("/databases", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url }),
+  });
+}
+
+export function removeDatabase(name) {
+  return request(`/databases/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+export function activateDatabase(name) {
+  return request(`/databases/${encodeURIComponent(name)}/activate`, { method: "POST" });
+}

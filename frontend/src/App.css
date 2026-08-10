@@ -521,3 +521,146 @@ code {
   font-size: 0.72rem;
   line-height: 1.35;
 }
+
+/* -- navigation ----------------------------------------------------------- */
+
+.app-nav {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.app-nav nav {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.nav-link {
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+
+.nav-link:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.nav-link.active {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+
+/* -- settings ------------------------------------------------------------- */
+
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(12rem, 20rem) auto;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-row label {
+  font-weight: 600;
+}
+
+.setting-row input[type="number"],
+.setting-row select {
+  justify-self: start;
+  min-width: 12rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.setting-row input[type="checkbox"] {
+  justify-self: start;
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+.setting-help {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  max-width: 65ch;
+}
+
+/* -- databases ------------------------------------------------------------ */
+
+.active-db code {
+  word-break: break-all;
+}
+
+.db-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.75rem 0;
+}
+
+.db-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.db-item.active .db-name {
+  color: var(--accent, inherit);
+  font-weight: 600;
+}
+
+.db-name {
+  min-width: 10rem;
+}
+
+.db-item code {
+  color: var(--text-muted);
+  word-break: break-all;
+  flex: 1 1 18rem;
+}
+
+.db-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.db-add {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+
+.db-add input {
+  flex: 1 1 16rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.probe-ok {
+  color: var(--positive, #3f9b53);
+}
+
+.probe-fail {
+  color: var(--negative, #c2554d);
+}

@@ -3,17 +3,19 @@ import logging
 import os
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app import model_store, retrain, stats
+from app import db_profiles, model_store, retrain, stats
+from app import settings as app_settings
 from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
 from app.logging_store import log_execution, query_fingerprint
 from app.optimizer.decision_cache import DecisionCache
 from app.optimizer.hints import apply_hint, plan_fingerprint
 from app.optimizer.learned import LearnedOptimizer
+from app.optimizer import planner
 from app.optimizer.planner import candidate_hints, optimize_and_execute
 from app.optimizer.regression_guard import RegressionGuard
 from app.optimizer.regret import regret_curve
@@ -394,3 +396,123 @@ def stats_trend():
 
     result["overall"]["selector_mode"] = SELECTOR_MODE
     return result
+
+
+# -- runtime configuration --------------------------------------------------
+
+
+def _apply_settings(values: dict) -> None:
+    """
+    Rebuild the parts of the running system a settings change affects.
+
+    Constructing a fresh optimizer rather than mutating the live one: its
+    thresholds are read in the constructor (including the calibrated gate), so
+    assigning to attributes would apply some of a change and not the rest.
+    """
+    global optimizer, SELECTOR_MODE, decision_cache
+
+    optimizer = LearnedOptimizer(
+        policy=values["selection_policy"],
+        risk_lambda=values["risk_lambda"],
+        confidence_z=values["confidence_z"],
+        min_relative_gain=values["min_relative_gain"],
+    )
+    SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
+
+    guard.tolerance = values["guard_tolerance"]
+    guard.min_observations = values["guard_min_observations"]
+
+    planner.ENABLE_ROWS_CORRECTION = values["enable_rows_correction"]
+
+    # The cache is rebuilt rather than resized: every entry in it was decided
+    # by the policy and thresholds that just changed, so keeping any of them
+    # would serve decisions the new settings would not have made.
+    ttl = values["decision_cache_seconds"]
+    decision_cache = DecisionCache(ttl_seconds=ttl) if ttl > 0 else None
+
+
+@app.get("/settings")
+def get_settings():
+    """Current values plus the metadata the settings UI renders itself from."""
+    return {
+        "fields": app_settings.describe(),
+        "values": app_settings.current(),
+        "groups": list(dict.fromkeys(f["group"] for f in app_settings.FIELDS.values())),
+    }
+
+
+@app.put("/settings")
+def put_settings(changes: dict[str, object]):
+    """Validate, persist and apply a partial settings update."""
+    try:
+        values = app_settings.update(changes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _apply_settings(values)
+    return {"values": values, "applied": True, "selector_mode": SELECTOR_MODE}
+
+
+@app.post("/settings/reset")
+def reset_settings():
+    """Back to environment/declared defaults."""
+    values = app_settings.reset()
+    _apply_settings(values)
+    return {"values": values, "applied": True}
+
+
+@app.get("/databases")
+def list_databases():
+    """Saved connections, which one is live, and whether the model fits it."""
+    return {**db_profiles.list_profiles(), "model_fit": db_profiles.schema_matches_model(optimizer)}
+
+
+class ConnectionRequest(BaseModel):
+    name: str | None = None
+    url: str
+
+
+@app.post("/databases/test")
+def test_database(req: ConnectionRequest):
+    """Probe a connection without saving or switching to it."""
+    return db_profiles.test_connection(req.url)
+
+
+@app.post("/databases")
+def add_database(req: ConnectionRequest):
+    try:
+        return db_profiles.add_profile(req.name or "", req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/databases/{name}")
+def delete_database(name: str):
+    return db_profiles.remove_profile(name)
+
+
+@app.post("/databases/{name}/activate")
+def activate_database(name: str):
+    """
+    Point the optimizer at a saved connection.
+
+    The guard and the decision cache are both rebuilt: their contents are
+    keyed by query against the *previous* database, and carrying them over
+    would block or shortcut queries on evidence from somewhere else entirely.
+    """
+    try:
+        result = db_profiles.activate(name)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if decision_cache is not None:
+        decision_cache.clear()
+    try:
+        with get_cursor() as cur:
+            guard.refresh(cur)
+    except Exception:  # noqa: BLE001 - a fresh database has no history yet
+        guard.blocked = {}
+
+    return {**result, "model_fit": db_profiles.schema_matches_model(optimizer)}

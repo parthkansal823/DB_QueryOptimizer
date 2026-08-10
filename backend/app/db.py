@@ -53,6 +53,33 @@ def reset_pool() -> None:
         _pool = None
 
 
+def current_database_url() -> str:
+    return DATABASE_URL
+
+
+def set_database_url(url: str) -> None:
+    """
+    Point every subsequent connection at a different database.
+
+    The pool is torn down rather than drained: its existing connections are
+    bound to the previous server, so leaving them in place would let requests
+    keep landing on the old database for as long as the pool held them --
+    a switch that silently only half-applied.
+
+    Callers are responsible for what the switch invalidates. A trained model
+    carries the feature columns and table cardinalities of the schema it was
+    built on (`optimizer/features.py`), so pointing at an unrelated database
+    leaves it scoring vectors shaped for tables that are no longer there.
+    `app.onboard` is what makes a new database usable, not this.
+    """
+    global DATABASE_URL
+    with _pool_lock:
+        if _pool is not None:
+            _pool.closeall()
+        globals()["_pool"] = None
+        DATABASE_URL = url
+
+
 @contextmanager
 def get_cursor():
     """Yield a cursor from the pool; commits on success, rolls back on error."""

@@ -4,6 +4,19 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // The components never import React, relying on the automatic JSX runtime.
+  // Vitest's transform pipeline does not pick that up from the React plugin
+  // and falls back to the classic `React.createElement` form, so every render
+  // in a test dies on "React is not defined" while dev and build are fine.
+  esbuild: { jsx: 'automatic' },
+  test: {
+    // jsdom rather than node: these tests assert on what a panel renders, and
+    // the bug they exist to catch was a sentence that contradicted the chart
+    // beside it -- which is only visible once something is rendered.
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: './src/test/setup.js',
+  },
   build: {
     rollupOptions: {
       output: {
