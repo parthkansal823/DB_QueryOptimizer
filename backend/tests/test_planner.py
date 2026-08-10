@@ -1,3 +1,4 @@
+from app.optimizer.decision_cache import DecisionCache
 from app.optimizer import planner
 
 
@@ -152,3 +153,108 @@ def test_no_guard_means_no_extra_caution():
     optimizer = _FakeOptimizer()
     planner.plan_query(cur, SQL, optimizer, query_id="q")
     assert optimizer.last_caution == 1.0
+
+
+# -- decision caching -------------------------------------------------------
+
+
+class _CachingOptimizer(_FakeOptimizer):
+    """A `_FakeOptimizer` that also declares a policy, which is what decides
+    whether its choices may be cached at all."""
+
+    def __init__(self, policy="greedy", **kwargs):
+        super().__init__(**kwargs)
+        self.policy = policy
+
+
+def test_a_cached_decision_skips_the_planning_round_trips():
+    """The point of the cache: choosing cost more than executing (25.2 ms of
+    planning against a 21.8 ms query), and every repeat paid it again to reach
+    the same answer."""
+    cache = DecisionCache()
+    first = _RecordingCursor()
+    planner.plan_query(first, SQL, _CachingOptimizer(), query_id="q1", cache=cache)
+    planned = len(first.queries)
+
+    second = _RecordingCursor()
+    result = planner.plan_query(second, SQL, _CachingOptimizer(), query_id="q1", cache=cache)
+
+    assert planned > 1
+    assert second.queries == [], "a cache hit must issue no EXPLAIN at all"
+    assert result["from_cache"] is True
+
+
+def test_the_cached_hint_is_the_one_that_gets_executed():
+    """A cache that skipped planning but then ran the unhinted query would
+    silently stop optimizing while reporting that it had."""
+    cache = DecisionCache()
+    warm = _RecordingCursor()
+    first = planner.plan_query(warm, SQL, _CachingOptimizer(), query_id="q1", cache=cache)
+
+    cur = _RecordingCursor()
+    result = planner.optimize_and_execute(
+        cur, SQL, _CachingOptimizer(), query_id="q1", cache=cache
+    )
+
+    assert result["hint"] == first["hint"]
+    assert len(cur.analyzed) == 1, "the chosen plan is still executed for real"
+    if first["hint"]:
+        assert cur.analyzed[0].startswith(first["hint"])
+
+
+def test_a_different_query_is_not_served_another_ones_decision():
+    cache = DecisionCache()
+    planner.plan_query(_RecordingCursor(), SQL, _CachingOptimizer(), query_id="q1", cache=cache)
+
+    cur = _RecordingCursor()
+    planner.plan_query(cur, SQL, _CachingOptimizer(), query_id="q2", cache=cache)
+
+    assert cur.queries != [], "q2 has its own decision to make"
+
+
+def test_the_guard_is_checked_before_the_cache():
+    """A query that starts regressing must stop being served its cached
+    deviation immediately, not when the entry happens to age out."""
+    cache = DecisionCache()
+    planner.plan_query(_RecordingCursor(), SQL, _CachingOptimizer(), query_id="q1", cache=cache)
+
+    result = planner.plan_query(
+        _RecordingCursor(), SQL, _CachingOptimizer(), query_id="q1",
+        guard=_Guard({"q1"}), cache=cache,
+    )
+
+    assert result["reason"] == "regression_guard"
+    assert result["hint"] is None
+
+
+def test_a_blocked_query_does_not_pay_for_planning():
+    """The guard needs no candidates to say no, and running the full sweep
+    first spent N planning round trips on a conclusion already known."""
+    cur = _RecordingCursor()
+    planner.plan_query(cur, SQL, _CachingOptimizer(), query_id="bad", guard=_Guard({"bad"}))
+
+    assert len(cur.queries) == 1, "only the baseline plan, no candidate sweep"
+
+
+def test_exploration_policies_are_not_cached():
+    """`thompson` samples a different ensemble member per decision by design.
+    Replaying one frozen sample would leave the exploration machinery in place
+    while quietly disabling it."""
+    cache = DecisionCache()
+    planner.plan_query(
+        _RecordingCursor(), SQL, _CachingOptimizer(policy="thompson"), query_id="q1", cache=cache
+    )
+
+    cur = _RecordingCursor()
+    planner.plan_query(
+        cur, SQL, _CachingOptimizer(policy="thompson"), query_id="q1", cache=cache
+    )
+
+    assert cache.stats()["entries"] == 0
+    assert cur.queries != [], "every thompson decision is drawn fresh"
+
+
+def test_caching_is_off_unless_a_cache_is_supplied():
+    cur = _RecordingCursor()
+    result = planner.plan_query(cur, SQL, _CachingOptimizer(), query_id="q1")
+    assert result.get("from_cache", False) is False

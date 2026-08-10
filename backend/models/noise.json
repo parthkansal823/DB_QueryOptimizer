@@ -1,0 +1,8 @@
+{
+  "reps": 7,
+  "n_queries": 24,
+  "median_relative_spread": 0.32991698111716217,
+  "median_warm_relative_spread": 0.29058433503108005,
+  "max_relative_spread": 1.4754279403644395,
+  "recommended_material_fraction": 0.29058433503108005
+}

@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 
 from app.logging_store import ADHOC_PREFIX, QUERY_KEY_SQL
+from app.noise import load_noise
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -52,15 +53,17 @@ MATERIAL_FRACTION = 0.05
 MATERIAL_MS = 2.0
 
 
-def _materially_faster(faster_ms: float, slower_ms: float) -> bool:
+def _materially_faster(
+    faster_ms: float, slower_ms: float, material_fraction: float = MATERIAL_FRACTION
+) -> bool:
     return (
         slower_ms - faster_ms >= MATERIAL_MS
         and slower_ms > 0
-        and (slower_ms - faster_ms) / slower_ms >= MATERIAL_FRACTION
+        and (slower_ms - faster_ms) / slower_ms >= material_fraction
     )
 
 
-def classify(run: dict) -> str:
+def classify(run: dict, material_fraction: float = MATERIAL_FRACTION) -> str:
     """
     What kind of decision this run was.
 
@@ -74,33 +77,30 @@ def classify(run: dict) -> str:
     native, served, best = run["native_ms"], run["served_ms"], run["best_ms"]
 
     if run["deviated"]:
-        if _materially_faster(served, native):
+        if _materially_faster(served, native, material_fraction):
             return "deviated_win"
-        if _materially_faster(native, served):
+        if _materially_faster(native, served, material_fraction):
             return "deviated_loss"
         return "deviated_wash"
 
-    return "held_missed" if _materially_faster(best, native) else "held_correct"
+    return (
+        "held_missed"
+        if _materially_faster(best, native, material_fraction)
+        else "held_correct"
+    )
 
 
 OUTCOMES = ("deviated_win", "deviated_wash", "deviated_loss", "held_correct", "held_missed")
 
 
-def _decision_quality(runs: list[dict]) -> dict:
-    """
-    Counts per outcome, plus the time each failure mode actually cost.
-
-    `regression_ms` and `missed_ms` are the two numbers a reviewer should read
-    first: one is time this system *added*, the other is time it declined to
-    save. Neither is visible in the headline improvement figure.
-    """
+def _counts(runs: list[dict], material_fraction: float) -> dict:
     counts = dict.fromkeys(OUTCOMES, 0)
     regression_ms = 0.0
     missed_ms = 0.0
     saved_ms = 0.0
 
     for run in runs:
-        outcome = classify(run)
+        outcome = classify(run, material_fraction)
         counts[outcome] += 1
         if outcome == "deviated_win":
             saved_ms += run["native_ms"] - run["served_ms"]
@@ -115,6 +115,41 @@ def _decision_quality(runs: list[dict]) -> dict:
         "regression_ms": regression_ms,
         "missed_ms": missed_ms,
     }
+
+
+def _decision_quality(runs: list[dict], noise_fraction: float | None = None) -> dict:
+    """
+    Counts per outcome, plus the time each failure mode actually cost.
+
+    `regression_ms` and `missed_ms` are the two numbers a reviewer should read
+    first: one is time this system *added*, the other is time it declined to
+    save. Neither is visible in the headline improvement figure.
+
+    ## The noise-floor view
+
+    Every run here is a single execution of each plan, so a "win" is one
+    measurement beating another measurement. `app.noise` establishes how far
+    apart two runs of an *unchanged* plan land -- 29% on this database -- and
+    the 5% default threshold sits well inside that. Most of these outcomes are
+    therefore not distinguishable from having been timed at a luckier moment.
+
+    So when a measured floor is available, the same runs are re-counted against
+    it and reported under `at_noise_floor`. That is the conservative reading:
+    outcomes that survive it are the ones backed by a difference larger than
+    the measurement error. The headline counts are left on the original
+    threshold rather than being silently redefined, because the two answer
+    different questions and quietly swapping them would make historical
+    dashboard numbers incomparable.
+    """
+    quality = _counts(runs, MATERIAL_FRACTION)
+    quality["material_fraction"] = MATERIAL_FRACTION
+
+    if noise_fraction is not None and noise_fraction > MATERIAL_FRACTION:
+        quality["at_noise_floor"] = {
+            **_counts(runs, noise_fraction),
+            "material_fraction": noise_fraction,
+        }
+    return quality
 
 # The `LIMIT` lives in SQL rather than being sliced off in Python. Both mean
 # "the most recent `limit` runs", but slicing meant every call transferred and
@@ -365,9 +400,20 @@ def served_vs_native(cur, limit: int = 2000) -> dict:
     cur.execute(COUNTS_SQL, (COLLECTION_SELECTOR,))
     n_rows, n_collection, n_queries = cur.fetchone()
 
+    noise = load_noise()
+    noise_fraction = noise.get("recommended_material_fraction") if noise else None
+
     return {
         "overall": _summarize(runs),
-        "decision_quality": _decision_quality(runs),
+        "decision_quality": _decision_quality(runs, noise_fraction=noise_fraction),
+        # The resolution limit of every latency figure above. Absent until
+        # `python -m app.noise --apply` has been run, because guessing at it
+        # would be worse than admitting it is unmeasured.
+        "measurement": {
+            "noise_floor_fraction": noise_fraction,
+            "reps": noise.get("reps") if noise else None,
+            "measured": noise is not None,
+        },
         "by_day": _by_day(runs),
         "by_query": _by_query(runs),
         # Every decision in order. A per-day rollup is useless until the

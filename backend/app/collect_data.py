@@ -80,7 +80,17 @@ def collect(
             total_rows += 1
 
             tables = baseline["tables_scanned"]
-            hints = generate_candidates(tables, include_join_methods=include_join_methods)
+            # The join graph must match what serving uses, or training data is
+            # gathered over a different action space than the one the model is
+            # later asked to score -- the train/serve skew README.md warns
+            # about. Without it, roughly half the collected candidates are
+            # cartesian products that no served query will ever consider, so
+            # the capacity spent learning them is wasted.
+            hints = generate_candidates(
+                tables,
+                include_join_methods=include_join_methods,
+                join_graph=baseline.get("join_graph"),
+            )
 
             for hint in hints:
                 hinted_sql = apply_hint(sql, hint)

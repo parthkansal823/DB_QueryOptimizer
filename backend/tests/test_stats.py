@@ -1,7 +1,13 @@
 from datetime import datetime, timedelta, timezone
 
 from app.logging_store import query_fingerprint
-from app.stats import _spearman, classify, cost_vs_latency, served_vs_native
+from app.stats import (
+    _decision_quality,
+    _spearman,
+    classify,
+    cost_vs_latency,
+    served_vs_native,
+)
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -284,3 +290,62 @@ def test_cost_vs_latency_labels_each_plan_by_where_it_came_from():
     assert result["n_points"] == 3
     # Disabled-plan sentinels are filtered in SQL, and the flag says so.
     assert result["excludes_disabled_plans"] is True
+
+
+# -- the measurement noise floor --------------------------------------------
+
+
+def _run_dict(native, served, best, deviated):
+    """One matched run in the dict shape `_decision_quality` consumes (the
+    module-level `run()` helper returns the raw SQL tuple instead)."""
+    return {"native_ms": native, "served_ms": served, "best_ms": best, "deviated": deviated}
+
+
+def test_a_win_smaller_than_the_noise_floor_is_not_counted_as_one():
+    """The headline threshold is 5%, but repeat runs of an unchanged plan on
+    this database disagree by ~29% (`app.noise`). Re-counted against that, a
+    20% "missed win" is a plan that may simply have been timed at a luckier
+    moment -- which is the difference between a real miss and a coin flip."""
+    runs = [_run_dict(native=100.0, served=100.0, best=80.0, deviated=False)]
+
+    quality = _decision_quality(runs, noise_fraction=0.29)
+
+    assert quality["held_missed"] == 1  # 20% clears the 5% headline bar
+    assert quality["at_noise_floor"]["held_missed"] == 0  # but not the noise floor
+    assert quality["at_noise_floor"]["held_correct"] == 1
+    assert quality["at_noise_floor"]["missed_ms"] == 0.0
+
+
+def test_a_win_larger_than_the_noise_floor_still_counts():
+    """The floor must not swallow real findings: a 3x speedup is not jitter."""
+    runs = [_run_dict(native=300.0, served=100.0, best=100.0, deviated=True)]
+
+    quality = _decision_quality(runs, noise_fraction=0.29)
+
+    assert quality["deviated_win"] == 1
+    assert quality["at_noise_floor"]["deviated_win"] == 1
+
+
+def test_headline_counts_are_not_silently_redefined():
+    """The noise view is reported alongside, not in place of, the original
+    counts -- swapping them would make every historical dashboard number
+    incomparable to the one beside it."""
+    runs = [_run_dict(native=100.0, served=100.0, best=80.0, deviated=False)]
+
+    quality = _decision_quality(runs, noise_fraction=0.29)
+
+    assert quality["material_fraction"] == 0.05
+    assert quality["at_noise_floor"]["material_fraction"] == 0.29
+
+
+def test_no_noise_view_when_the_floor_has_not_been_measured():
+    """Absent `models/noise.json` the dashboard says so rather than implying a
+    precision nobody measured."""
+    runs = [_run_dict(100.0, 80.0, 80.0, True)]
+    assert "at_noise_floor" not in _decision_quality(runs, noise_fraction=None)
+
+
+def test_no_noise_view_when_the_floor_is_below_the_headline_threshold():
+    """A floor tighter than 5% would only duplicate the headline counts."""
+    runs = [_run_dict(100.0, 80.0, 80.0, True)]
+    assert "at_noise_floor" not in _decision_quality(runs, noise_fraction=0.01)

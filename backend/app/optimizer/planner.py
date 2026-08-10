@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import time
 
+from app.optimizer.decision_cache import STOCHASTIC_POLICIES
 from app.optimizer.hints import (
     apply_hint,
     corrected_cardinality_hint,
@@ -99,6 +100,7 @@ def plan_query(
     query_id: str | None = None,
     guard=None,
     max_candidates: int = 8,
+    cache=None,
 ) -> dict:
     """
     Decide which plan to run, without running any of them.
@@ -106,8 +108,34 @@ def plan_query(
     Returns the decision plus the hint to apply. The caller executes it --
     keeping "choose" and "run" separate is what lets the same decision be
     cached, logged, or overridden without re-planning.
+
+    With a `cache` supplied, a query whose decision is already known skips the
+    planning round trips entirely (see `decision_cache.py`). The guard is
+    consulted first either way, so a query that has started regressing stops
+    being served its cached deviation immediately.
     """
     started = time.perf_counter()
+
+    # Ahead of any planning, not after it. This check needs no candidates, and
+    # running the full candidate sweep before discovering the query was blocked
+    # spent N planning round trips to reach a conclusion already known -- on
+    # precisely the queries already identified as troublesome.
+    if guard is not None and guard.is_blocked(query_id):
+        return {
+            "hint": None,
+            "chosen_plan": get_plan(cur, sql, analyze=False),
+            "reason": "regression_guard",
+            "n_candidates_planned": 0,
+            "optimizer_overhead_ms": (time.perf_counter() - started) * 1000.0,
+        }
+
+    cached = cache.get(query_id) if cache is not None else None
+    if cached is not None:
+        return {
+            **cached,
+            "optimizer_overhead_ms": (time.perf_counter() - started) * 1000.0,
+            "from_cache": True,
+        }
 
     # Estimate-only: Postgres plans this but does not execute it.
     baseline = get_plan(cur, sql, analyze=False)
@@ -129,15 +157,6 @@ def plan_query(
 
     planning_ms = (time.perf_counter() - started) * 1000.0
 
-    if guard is not None and guard.is_blocked(query_id):
-        return {
-            "hint": None,
-            "chosen_plan": baseline,
-            "reason": "regression_guard",
-            "n_candidates_planned": len(candidates),
-            "optimizer_overhead_ms": planning_ms,
-        }
-
     if not candidates:
         return {
             "hint": None,
@@ -154,7 +173,7 @@ def plan_query(
     decision = dict(optimizer.last_decision)
     vetoed = decision.get("fell_back_to_baseline", False)
 
-    return {
+    result = {
         "hint": None if vetoed else served.get("hint"),
         "chosen_plan": served,
         "reason": "safety_veto" if vetoed else decision.get("policy", "heuristic"),
@@ -164,6 +183,17 @@ def plan_query(
         "optimizer_overhead_ms": planning_ms,
     }
 
+    # `getattr` for the same reason `candidate_hints` uses it above: an
+    # optimizer is a duck here, not a required type.
+    if cache is not None and getattr(optimizer, "policy", None) not in STOCHASTIC_POLICIES:
+        # `chosen_plan` is deliberately dropped: it describes plan estimates
+        # from this moment, and replaying them later would report a stale
+        # EXPLAIN as though it had just been produced. The hint is the decision;
+        # the plan that actually runs is measured fresh by `execute_chosen`.
+        cache.put(query_id, {**result, "chosen_plan": None})
+
+    return result
+
 
 def execute_chosen(cur, sql: str, hint: str | None) -> dict:
     """Run exactly one plan -- the chosen one -- and return its real metrics."""
@@ -172,7 +202,7 @@ def execute_chosen(cur, sql: str, hint: str | None) -> dict:
 
 
 def optimize_and_execute(
-    cur, sql: str, optimizer, query_id: str | None = None, guard=None
+    cur, sql: str, optimizer, query_id: str | None = None, guard=None, cache=None
 ) -> dict:
     """
     Full production round trip: plan every candidate on estimates, pick one,
@@ -180,9 +210,11 @@ def optimize_and_execute(
 
     The returned `optimizer_overhead_ms` vs `execution_ms` split is the
     number that decides whether any of this is worth doing: overhead has to
-    stay small relative to the latency it saves.
+    stay small relative to the latency it saves. A `cache` is what keeps that
+    ratio sane on repeat traffic -- the chosen plan is still executed and
+    measured every time, only the choosing is reused.
     """
-    choice = plan_query(cur, sql, optimizer, query_id=query_id, guard=guard)
+    choice = plan_query(cur, sql, optimizer, query_id=query_id, guard=guard, cache=cache)
     executed = execute_chosen(cur, sql, choice["hint"])
 
     return {

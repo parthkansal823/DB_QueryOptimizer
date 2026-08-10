@@ -11,6 +11,7 @@ from app import model_store, retrain, stats
 from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
 from app.logging_store import log_execution, query_fingerprint
+from app.optimizer.decision_cache import DecisionCache
 from app.optimizer.hints import apply_hint, plan_fingerprint
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer.planner import candidate_hints, optimize_and_execute
@@ -23,6 +24,17 @@ from app.schema_graph import summarize as schema_summary
 optimizer = LearnedOptimizer()
 SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
 guard = RegressionGuard()
+
+# Repeat traffic reuses the decision instead of re-deriving it. Measured on a
+# 4-table join, choosing cost 25.2 ms against an execution of 21.8 ms -- the
+# optimizer was more expensive than the query it optimized, and every repeat
+# paid it again to reach the same answer. Set DECISION_CACHE_SECONDS=0 to
+# disable, which is what a benchmark run wanting every decision made from
+# scratch should do.
+DECISION_CACHE_SECONDS = float(os.getenv("DECISION_CACHE_SECONDS", "300"))
+decision_cache = (
+    DecisionCache(ttl_seconds=DECISION_CACHE_SECONDS) if DECISION_CACHE_SECONDS > 0 else None
+)
 
 log = logging.getLogger("lqo.autolearn")
 
@@ -228,7 +240,9 @@ def optimize_query(req: QueryRequest):
     query_id = query_fingerprint(req.sql)
 
     with get_cursor() as cur:
-        result = optimize_and_execute(cur, req.sql, optimizer, query_id=query_id, guard=guard)
+        result = optimize_and_execute(
+            cur, req.sql, optimizer, query_id=query_id, guard=guard, cache=decision_cache
+        )
         log_execution(
             cur, query_id=query_id, sql_text=req.sql, plan=result["executed_plan"],
             hint=result["hint"], is_baseline=result["hint"] is None,
@@ -243,6 +257,10 @@ def optimize_query(req: QueryRequest):
         "n_candidates_planned": result["n_candidates_planned"],
         "executed_plan": result["executed_plan"],
         "decision": result.get("decision"),
+        # Whether the choosing was reused. Without this, a near-zero
+        # `optimizer_overhead_ms` is unexplained -- it reads as the planner
+        # having become mysteriously fast rather than not having run.
+        "from_cache": result.get("from_cache", False),
     }
 
 
@@ -316,6 +334,10 @@ def model_status():
             "min_observations": guard.min_observations,
             "blocked_queries": blocked,
         },
+        # How much of the planning cost repeat traffic is actually avoiding.
+        # A hit rate near zero means the cache is pure overhead and the TTL or
+        # the traffic pattern is wrong.
+        "decision_cache": decision_cache.stats() if decision_cache is not None else None,
     }
 
 
@@ -349,6 +371,11 @@ def _reload_optimizer() -> None:
     global optimizer, SELECTOR_MODE
     optimizer = LearnedOptimizer(policy=optimizer.policy, risk_lambda=optimizer.risk_lambda)
     SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
+    # Every cached decision was made by the model being replaced. Keeping them
+    # would let a freshly promoted model serve its predecessor's choices and
+    # appear to have changed nothing -- the retrain would look like a no-op.
+    if decision_cache is not None:
+        decision_cache.clear()
 
 
 @app.get("/stats/trend")
