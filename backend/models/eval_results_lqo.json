@@ -1,35 +1,45 @@
 {
   "model_backend": "bootstrapped-ensemble[8x lightgbm]",
   "pairwise_ranker": "trained",
-  "n_rows_raw": 6164,
+  "join_cardinality_corrector": "trained",
+  "conformal_gate": {
+    "alpha": 0.1,
+    "q": 12.506844239327663,
+    "n_calibration": 700,
+    "target_coverage": 0.9,
+    "held_out_coverage": 0.9873949579831933
+  },
+  "uncertainty_scale": 2.506204671405326,
+  "n_rows_raw": 5025,
   "reps_aggregated_to_median": true,
-  "n_rows_total": 720,
-  "n_rows_train": 549,
-  "n_rows_test": 171,
-  "n_features": 41,
-  "test_mae_ms": 71.26407373018715,
-  "test_mean_uncertainty_ms": 35.56919303026144,
-  "n_tables_in_schema": 4,
-  "n_held_out_queries": 8,
+  "n_rows_total": 953,
+  "n_rows_train": 715,
+  "n_rows_test": 238,
+  "n_features": 55,
+  "test_mae_log_ratio": 0.3608967208274881,
+  "test_typical_multiplicative_error": 1.4346152873473175,
+  "test_mean_uncertainty_log_ratio": 0.13790729716743075,
+  "n_tables_in_schema": 6,
+  "n_held_out_queries": 9,
   "avg_latency_ms": {
-    "native": 161.31,
-    "heuristic": 152.89775000000003,
-    "oracle_best_possible": 110.7494375,
-    "learned_greedy": 150.43575,
-    "learned_thompson": 147.492625,
-    "learned_risk_averse": 145.26325,
-    "learned_pairwise_rank": 131.1679375
+    "native": 151.4518888888889,
+    "heuristic": 143.86388888888888,
+    "oracle_best_possible": 107.4956111111111,
+    "learned_greedy": 163.80411111111113,
+    "learned_thompson": 173.64549999999997,
+    "learned_risk_averse": 163.80411111111113,
+    "learned_pairwise_rank": 167.84144444444445
   },
   "headroom_captured_vs_oracle": {
-    "learned_greedy": 0.2150737543713045,
-    "learned_thompson": 0.273283648693584,
-    "learned_risk_averse": 0.317376809247326,
-    "learned_pairwise_rank": 0.5961575783497267
+    "learned_greedy": -0.2810115607301699,
+    "learned_thompson": -0.5049019669798133,
+    "learned_risk_averse": -0.2810115607301699,
+    "learned_pairwise_rank": -0.372860405478676
   },
   "beats_or_ties_heuristic_rate": {
-    "learned_greedy": 0.75,
-    "learned_thompson": 0.875,
-    "learned_risk_averse": 0.875,
-    "learned_pairwise_rank": 0.875
+    "learned_greedy": 0.7777777777777778,
+    "learned_thompson": 0.6666666666666666,
+    "learned_risk_averse": 0.7777777777777778,
+    "learned_pairwise_rank": 0.7777777777777778
   }
 }

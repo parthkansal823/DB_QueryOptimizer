@@ -76,6 +76,22 @@ function DecisionNote({ decision }) {
             <dd>{decision.policy}</dd>
           </>
         )}
+        {/* Which bound authorised (or refused) the deviation. "mean + z x sigma"
+            assumes the ensemble's spread is a calibrated standard deviation;
+            the conformal bound is measured from the model's own out-of-bag
+            residuals at a stated risk level. The two can disagree about the
+            same prediction, so which one ran is part of explaining the
+            decision rather than a detail. */}
+        {decision.gate && (
+          <>
+            <dt>Gate</dt>
+            <dd>
+              {decision.gate === "conformal"
+                ? "conformal (measured bound)"
+                : "fixed z (mean + z x sigma)"}
+            </dd>
+          </>
+        )}
         {speedup != null && (
           <>
             <dt>Predicted speed vs PostgreSQL</dt>

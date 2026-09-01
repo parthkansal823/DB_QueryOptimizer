@@ -599,6 +599,174 @@ winning setting to `models/gate.json`, and `LearnedOptimizer` prefers that
 over its built-in defaults. The threshold is therefore re-derived for each
 dataset instead of being inherited from whatever happened to work here.
 
+## 2.4.3 How the calibrated gate ended up switching itself off
+
+§2.4.2 describes `app.calibrate` as bounding the regression rate first and
+maximising net improvement within that. Deployed, it wrote this to
+`models/gate.json`:
+
+```json
+{"confidence_z": 0.0, "min_relative_gain": 0.0,
+ "expected_deviation_rate": 0.78, "expected_regression_rate": 0.11}
+```
+
+`confidence_z = 0.0` multiplies the model's uncertainty by zero. The gate was
+`predicted_ratio < 1.0` -- deviate whenever the point estimate is any amount
+below native, with no margin and no reference to how sure the model is. The
+dashboard reported it faithfully and nobody read it: "Predicted speed vs
+PostgreSQL: 0.92x (**pessimistically 0.92x**)". The pessimistic figure equalling
+the estimate exactly is what an inert safety mechanism looks like.
+
+It showed up as a served plan predicted at 0.92x that ran at 1.5x native
+(2.04 ms to 3.05 ms). Replaying that decision under both gates:
+
+| gate | pessimistic bound | required | outcome |
+|---|---|---|---|
+| as deployed (z=0, min_gain=0) | 0.92x | < 1.00x | **deviates** |
+| defaults (z=1.0, min_gain=0.05) | 1.10x | < 0.95x | holds native |
+
+Three separate faults produced it.
+
+**The bound never bound.** `max_regression_rate` defaulted to 0.34. Every
+setting on the grid passed, so the constraint the module docstring calls "the
+important one" excluded nothing and the recommendation collapsed to plain
+`max(net_improvement)`.
+
+**Ties in a sum are not ties.** The winning and runner-up settings were
+
+    z=0.00 min_gain=0.00 -> 83% deviate, 10% regress, +35.0%
+    z=0.00 min_gain=0.05 -> 58% deviate,  0% regress, +34.6%
+
+Net improvement is a sum dominated by a handful of expensive queries, so four
+tenths of a percentage point of it is noise. A 0% to 10% regression rate is not.
+The sweep now treats settings within 5% of each other as equivalent and breaks
+the tie on regression rate, then on the worst single regression, then toward
+the stricter gate -- strictness being free among equals and not free later,
+because the sample the gate was chosen on is small.
+
+**It was calibrated in-sample.** The sweep replayed *every* logged query,
+almost all of which the model had trained on, so a gate with no margin was
+scored against predictions the model had already fitted. §2.2.1 documents how
+optimistic that is; this is the same bias steering a safety threshold. The
+bundle now records which queries were held out and the sweep scores only those,
+falling back to the whole set -- and saying so -- when too few exist to
+distinguish settings.
+
+Re-run out-of-sample, the same grid shows what was hidden: `z=0, min_gain=0`
+regresses on **17%** of held-out queries with a worst case of 1.23x, and the
+recommendation moves to `min_gain=0.10` at 0% regressions.
+
+## 2.4.4 Why `confidence_z` did nothing, and what it cost
+
+The sweep above had a stranger symptom: the whole `z` column was identical from
+0.0 to 1.0. The knob could not change a single decision, which is why the
+calibration kept setting it to zero -- correctly, given what it could measure.
+
+The reason is a units error rather than a bug. Measured out-of-bag on this
+model:
+
+| | log-ratio units |
+|---|---|
+| mean \|out-of-bag residual\| | 0.143 |
+| mean out-of-bag sigma | 0.071 |
+| **spearman(sigma, \|residual\|)** | **+0.37** |
+
+The rank correlation is the important one, and it is the good news: the
+ensemble genuinely does know where it is unsure. It just reports it in units
+about **2.4x** smaller than the error it is meant to bound, so a full unit of
+`z` bought less than half a standard deviation of protection -- too little to
+flip any decision, hence the flat column.
+
+`conformal.sigma_scale` measures that factor from the same out-of-bag residuals
+and `learned.py` applies it before the gate reads sigma. `confidence_z` is then
+denominated in standard deviations, and the sweep immediately becomes
+informative: deviation rate falls 83% -> 67% -> 50% across z = 0, 0.25, 0.5,
+where it had previously not moved at all.
+
+This is the mild counterpart to §2.4.5's conformal result. Conformal corrects
+the *tail* and needs q = 10.5, which is rigorous and unusable; the mean-matched
+scale corrects the *centre* at 2.4x, which is approximate and actionable. They
+answer different questions and both are kept.
+
+## 2.4.5 The gate's uncertainty was overconfident by 8x
+
+§2.4.2 measures the *threshold* but leaves the quantity it is applied to
+unexamined. The gate is
+
+    predicted_ratio + z * sigma  <  1 - min_relative_gain
+
+and `sigma` is the spread across the bootstrapped ensemble. Sweeping `z`
+assumes that spread is a calibrated standard deviation. Nothing had checked it.
+
+`optimizer/conformal.py` checks it. Split conformal prediction (Vovk et al.;
+Lei et al., JASA 2018) turns any point predictor into one with a
+distribution-free, finite-sample bound: score held-out examples by how wrong
+the model was, take the (1-alpha) quantile, use it as the multiplier. Ordinary
+split conformal spends training data on calibration, which is the worst thing
+to spend here (§2.3), so the residuals come from the ensemble's own
+**out-of-bag** predictions instead -- each member is fit on a bootstrap
+resample, so ~37% of rows are unseen by any given member, and averaging only
+the members that missed a row gives an honest held-out prediction for every
+training row at no cost in data. That is jackknife+-after-bootstrap (Kim, Xu &
+Barber, NeurIPS 2020), which exists for ensembles built exactly this way.
+
+These figures come from a **separate calibration run** on this machine (936
+raw executions across 17 queries, 237 training rows after median aggregation),
+not from the larger sweep behind 2.4.2's table -- so read the two as answering
+different questions rather than as one series. The direction of the finding is
+not sensitive to that: a smaller sample makes the conformal multiplier *more*
+conservative, not less, so a fuller collection moves `q` down, not up.
+
+229 of 237 training rows (96.6%) produced an out-of-bag residual, so the
+no-cost claim holds. The calibration then returns:
+
+| | value |
+|---|---|
+| alpha | 0.10 |
+| **conformal multiplier q** | **8.51** |
+| calibration rows | 229 |
+| held-out coverage (target 0.90) | 1.00 |
+
+**q = 8.51 against an assumed z = 1.0.** Covering 90% of outcomes takes eight
+and a half sigmas, not one. The reason is in the same eval output:
+
+| | log-ratio units |
+|---|---|
+| mean ensemble spread, held-out | 0.175 |
+| actual mean absolute error | 0.403 |
+
+The members agree with each other about 2.3x more than they agree with
+reality. Bootstrap resampling measures how much the fit moves when the *sample*
+changes; it is blind to model bias and to the irreducible measurement noise
+§2.3 spends most of its length on, and here those dominate. So `mean + 1*sigma`
+was never the 84% bound a normal reading implies -- and the deployed
+`gate.json`, at `z = 0.0`, is not a bound at all.
+
+### Why it is off by default
+
+Applied honestly, the gate stops working. At the model's typical uncertainty a
+90% bound requires a predicted speedup of about 4.2x before deviating, which
+this workload essentially never offers, so the optimizer would hold native on
+almost every query. Turning it on would not make the system safer in any useful
+sense; it would make it inert.
+
+That is worth stating plainly rather than burying, because it is the same
+finding as §2.8.1 in a different guise: the honest version of a mechanism can
+be correct and still not pay. It also converts the limitation this writeup has
+been asserting -- "prediction error is comparable to the available headroom at
+this data scale" -- into something measured, with a coverage guarantee behind
+it, rather than an impression from a table of averages.
+
+The actionable reading is not "use conformal". It is that the deviation rate in
+§2.4.2 rests on an uncertainty estimate that is wrong by most of an order of
+magnitude, and that closing *that* gap -- more data, or an uncertainty estimate
+that models noise rather than resampling -- is the prerequisite for raising the
+deviation rate safely. The sweep in §2.4.2 found a threshold that works; it
+could not have told us the quantity underneath it was miscalibrated.
+
+`GATE_MODE=conformal` selects it; `CONFORMAL_ALPHA` sets the risk level, applied
+when the model trains. Bundles trained before it existed fall back to `fixed_z`.
+
 Live result with the calibrated gate, three runs:
 
 | Run | Headroom captured | Queries optimized |

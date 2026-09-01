@@ -92,6 +92,7 @@ class LearnedOptimizer:
         confidence_z: float = _UNSET,
         min_gain_ms: float = float(os.getenv("MIN_GAIN_MS", DEFAULT_MIN_GAIN_MS)),
         min_relative_gain: float = _UNSET,
+        gate_mode: str = os.getenv("GATE_MODE", "fixed_z"),
         seed: int | None = None,
     ):
         self.model = None
@@ -111,6 +112,17 @@ class LearnedOptimizer:
             DEFAULT_MIN_RELATIVE_GAIN if min_relative_gain is _UNSET else min_relative_gain
         )
         self.gate_calibration: dict | None = None
+        # "fixed_z" keeps the historical bound (mean + z*sigma); "conformal"
+        # uses the calibrated one from the bundle when there is one. Default is
+        # the former so every number already published stays reproducible --
+        # this is a change of method, and the project settles those by
+        # measuring them (`app.experiment`), not by switching the default.
+        self.gate_mode = gate_mode
+        self.conformal = None
+        # Multiplier that turns the ensemble's raw spread into something
+        # denominated in standard deviations; 1.0 for bundles that predate the
+        # measurement, which is exactly the old behaviour.
+        self.uncertainty_scale = 1.0
 
         # A calibrated gate (written by `app.calibrate --apply`) beats the
         # hardcoded defaults, because the right threshold depends on how
@@ -171,14 +183,41 @@ class LearnedOptimizer:
         self.ranker = bundle.get("ranker")
         # Older bundles predate join-level correction; absent is fine.
         self.join_corrector = bundle.get("join_corrector")
+        # Likewise the conformal gate: a bundle without one falls back to the
+        # fixed-z bound rather than refusing to serve.
+        self.conformal = bundle.get("conformal")
+        self.uncertainty_scale = float(bundle.get("uncertainty_scale") or 1.0)
         self.target = bundle.get("target", "actual_total_time_ms")
 
     # -- selection ---------------------------------------------------------
 
-    def select(self, candidate_plans: list[dict]) -> int:
-        """Return the index of the chosen candidate in `candidate_plans`."""
+    def _vectorize(self, candidate_plans: list[dict]) -> list[list[float]]:
+        """Feature vectors for `candidate_plans`, shaped for the loaded bundle."""
+        return [
+            to_vector(featurize(c, self.table_cardinalities), self.feature_columns)
+            for c in candidate_plans
+        ]
+
+    def select(
+        self,
+        candidate_plans: list[dict],
+        vectors: list[list[float]] | None = None,
+        predictions: tuple[list[float], list[float]] | None = None,
+    ) -> int:
+        """
+        Return the index of the chosen candidate in `candidate_plans`.
+
+        `vectors` and `predictions` let a caller that has already featurized
+        and scored these candidates hand that work over rather than have it
+        repeated. `_select_against_native` is the caller that matters: it needs
+        the ensemble's opinion to decide whether deviating is justified, and
+        used to featurize and predict a second time to find out *which*
+        candidate the policy wanted. Both are optional, so the documented
+        contract -- "give me candidate plans, get back an index" -- is
+        unchanged for everyone else.
+        """
         if self.model is not None:
-            return self._select_learned(candidate_plans)
+            return self._select_learned(candidate_plans, vectors, predictions)
         return self._select_heuristic(candidate_plans)
 
     def select_plan(
@@ -263,10 +302,7 @@ class LearnedOptimizer:
         if self.target != "log_ratio_vs_native":
             return self._select_against_native_absolute(candidate_plans, baseline_plan)
 
-        vectors = [
-            to_vector(featurize(c, self.table_cardinalities), self.feature_columns)
-            for c in candidate_plans
-        ]
+        vectors = self._vectorize(candidate_plans)
         means, stds = self.model.predict_mean_std(vectors)
 
         # Which candidate to put forward is the *policy's* decision (greedy,
@@ -275,19 +311,36 @@ class LearnedOptimizer:
         # deviating from native for -- selection and authorisation are
         # separate concerns, and conflating them would silently disable
         # every policy but greedy.
-        best_i = self.select(candidate_plans)
+        #
+        # The vectors and predictions computed just above are handed over
+        # rather than recomputed. This used to featurize every candidate twice
+        # and run the ensemble twice per decision, on the path whose whole
+        # economic case rests on planning being cheap relative to execution.
+        best_i = self.select(candidate_plans, vectors=vectors, predictions=(means, stds))
+        policy_decision = dict(self.last_decision)
         predicted_ratio = math.exp(means[best_i])
-        # Pessimistic ratio: the worst this plan plausibly is, one sigma out.
-        upper_ratio = math.exp(means[best_i] + self.confidence_z * caution * stds[best_i])
+        # Pessimistic ratio: the worst this plan plausibly is. `caution` scales
+        # the bound outward for queries the guard has no history for, under
+        # either gate.
+        upper_log, gate_used = self._upper_bound(means[best_i], stds[best_i], caution)
+        upper_ratio = math.exp(upper_log)
         required_ratio = 1.0 - self.min_relative_gain * caution
 
         chosen = candidate_plans[best_i]
+        # The policy's own record is merged in rather than replaced. Overwriting
+        # it dropped `all_predicted_scores`, `predicted_uncertainty` and
+        # `pairwise_win_rate` on every current model, so the dashboard's "why
+        # this plan" panel had nothing to render but the gate arithmetic -- and
+        # the per-candidate scores that explain the *choice*, as opposed to the
+        # authorisation, were gone from the response entirely.
         self.last_decision = {
+            **policy_decision,
             "policy": self.policy,
             "predicted_speedup_vs_native": predicted_ratio,
             "pessimistic_speedup_vs_native": upper_ratio,
             "required_speedup": required_ratio,
             "predicted_uncertainty_log": stds[best_i],
+            "gate": gate_used,
             "chosen_index": best_i,
             "fell_back_to_baseline": False,
         }
@@ -349,6 +402,32 @@ class LearnedOptimizer:
 
         return scored[best_i]
 
+    def _upper_bound(self, mean: float, std: float, caution: float) -> tuple[float, str]:
+        """
+        How bad this plan plausibly is, in log-ratio space, and which gate said so.
+
+        `fixed_z` is the original bound: `mean + z * sigma`, with `z` a constant
+        and `sigma` the ensemble's spread. It assumes that spread is a
+        calibrated standard deviation and that residuals are roughly normal,
+        and this workload's are neither.
+
+        `conformal` replaces the constant with one measured from the model's own
+        out-of-bag residuals at a stated risk level, which holds whatever shape
+        those residuals turn out to be (`optimizer/conformal.py`). It falls back
+        to `fixed_z` for bundles trained before the gate existed, so a stale
+        pickle degrades instead of failing.
+        """
+        if self.gate_mode == "conformal":
+            gate = self.conformal
+            if gate is not None and getattr(gate, "fitted", False):
+                return gate.upper_bound(mean, std * caution), "conformal"
+        # `uncertainty_scale` is what makes `confidence_z` mean standard
+        # deviations. Without it the bootstrap's spread understated the real
+        # error -- by 2x on this model -- so `z = 1.0` bought half the
+        # protection it claimed, and a threshold sweep concluded `z` did not
+        # matter and set it to zero.
+        return mean + self.confidence_z * caution * std * self.uncertainty_scale, "fixed_z"
+
     # PostgreSQL prices a plan it has been told not to use at `disable_cost`
     # (1e10) rather than removing it. Anything at that scale is a plan the
     # planner considers structurally catastrophic -- typically a cartesian
@@ -385,11 +464,14 @@ class LearnedOptimizer:
         self.last_decision = {"policy": "heuristic_min_cost", "chosen_index": index}
         return index
 
-    def _select_learned(self, candidate_plans: list[dict]) -> int:
-        vectors = [
-            to_vector(featurize(c, self.table_cardinalities), self.feature_columns)
-            for c in candidate_plans
-        ]
+    def _select_learned(
+        self,
+        candidate_plans: list[dict],
+        vectors: list[list[float]] | None = None,
+        predictions: tuple[list[float], list[float]] | None = None,
+    ) -> int:
+        if vectors is None:
+            vectors = self._vectorize(candidate_plans)
 
         if self.policy == "pairwise_rank":
             if self.ranker is None:
@@ -398,8 +480,11 @@ class LearnedOptimizer:
                 # over it, fall back to the estimate-based heuristic.
                 return self._select_heuristic(candidate_plans)
             costs = [p.get("total_cost") or float("inf") for p in candidate_plans]
-            index = self.ranker.select(vectors, tie_break_costs=costs)
+            # Scored once and reused for the pick. Calling `select` and then
+            # `scores` ran the O(n^2) pairwise sweep twice over the same
+            # vectors to reach the same answer.
             scores = self.ranker.scores(vectors)
+            index = self.ranker.select(vectors, tie_break_costs=costs, scores=scores)
             self.last_decision = {
                 "policy": "pairwise_rank",
                 "pairwise_win_rate": scores[index],
@@ -413,6 +498,7 @@ class LearnedOptimizer:
             policy=self.policy,
             risk_lambda=self.risk_lambda,
             rng=self._rng,
+            predictions=predictions,
         )
         self.last_decision = decision
         return index

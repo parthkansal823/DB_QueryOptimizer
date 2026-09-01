@@ -10,7 +10,8 @@ comparing it to the published research.
 It runs on any PostgreSQL database, ships with a dashboard that explains every
 decision it makes, and refuses to act when it isn't confident. Built end to end:
 data collection, feature engineering, model training, a self-retraining loop
-with rollback, two independent safety mechanisms, and 258 tests behind CI.
+with rollback, two independent safety mechanisms, a conformally calibrated
+safety gate, and 492 tests behind CI.
 
 ## Documentation
 
@@ -115,6 +116,7 @@ project to Bao and Neo.
 Query in --> FastAPI backend --> baseline plan (native Postgres EXPLAIN)
                    |
                    +--> candidate join orders + join methods (pg_hint_plan hints)
+                   |    + resource/cost-model settings (work_mem, parallelism)
                    |
                    +--> featurize: per-table slots + plan-TREE structure
                    |
@@ -174,8 +176,9 @@ which works with no model at all:
 docker compose exec backend python -m app.collect_data   # gather training data
 docker compose exec backend python -m app.train          # train models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark      # native vs. learned, full workload
-docker compose exec backend pytest                       # 238 unit tests, no database needed
+docker compose exec backend pytest                       # 481 unit tests, no database needed
 docker compose exec backend pytest -m integration        # 11 more: hints must actually bind
+docker compose exec backend ruff check app tests         # lint, same rules CI runs
 ```
 
 Settle a comparison properly, with paired runs and confidence intervals
@@ -201,6 +204,7 @@ docker compose exec backend python -m app.benchmark --no-guard      # A/B the gu
 Drive the learning loop (the dashboard has buttons for these too):
 
 ```bash
+docker compose exec backend python -m app.diagnostics           # should I believe this model?
 docker compose exec backend python -m app.calibrate --apply    # measure and apply the best confidence gate
 docker compose exec backend python -m app.retrain --status     # deployed version, pending feedback
 docker compose exec backend python -m app.retrain              # retrain if there is enough new data
@@ -223,6 +227,7 @@ decision went the way it did, and the history across every run so far.
 | `GET /stats/cost-model` | How well PostgreSQL's cost estimates predict real time |
 | `GET /stats/regret` | Cumulative regret. Below 1.0 means the optimizer is earning its keep |
 | `GET /model/status` | Deployed version, pending feedback, blocked queries |
+| `GET /model/diagnostics` | **Why** it is behaving that way: is the gate consulting uncertainty, was it calibrated on enough queries, is the uncertainty on the right scale |
 | `POST /model/retrain` / `POST /model/rollback` | Drive the learning loop |
 | `GET /advisor` | Schema-wide fixes, currently unindexed foreign keys |
 
@@ -258,6 +263,7 @@ learned-query-optimizer/
 │       ├── plan_extractor.py     EXPLAIN JSON -> structured metrics
 │       ├── schema_introspection.py  table row counts from pg_class, any schema
 │       ├── advisor.py            index and statistics recommendations
+│       ├── diagnostics.py        model/gate health: why it behaves as it does
 │       ├── workload.py           the 25-query benchmark workload
 │       ├── collect_data.py       offline collection -> plan_execution_log
 │       ├── train.py              trains and evaluates the model
@@ -274,6 +280,7 @@ learned-query-optimizer/
 │           ├── planner.py        the production path: plan N, run 1
 │           ├── regret.py         cumulative regret
 │           ├── cardinality.py   learned q-error + Rows() corrections
+│           ├── conformal.py    calibrated safety bound (out-of-bag conformal)
 │           └── learned.py        plan selection + forward-looking safety veto
 ├── frontend/                 React (Vite) + Recharts dashboard
 └── docs/
@@ -373,9 +380,96 @@ database.
 
 ### Optional settings
 
+Every row below is also editable from the dashboard, and a change is written
+to `models/settings.json`. **That file is now read at startup.** It previously
+was not: the settings panel displayed one configuration while the process ran
+another, so a restart silently reverted every change — including a *stricter*
+safety bar, which came back as the calibrated `0.0` and let the optimizer
+deviate on any predicted win at all.
+
 | Variable | Default | Effect |
 |---|---|---|
 | `SELECTION_POLICY` | `pairwise_rank` | `greedy`, `thompson`, `risk_averse`, `pairwise_rank` |
+| `GATE_MODE` | `fixed_z` | `fixed_z` (mean + z·sigma) or `conformal` (measured bound, see below) |
+| `CONFORMAL_ALPHA` | `0.1` | Risk level for the conformal gate; applied when the model trains |
+| `INCLUDE_JOIN_METHODS` | `0` (off) | Serve forced `HashJoin`/`NestLoop`/`MergeJoin` candidates as well as join orders |
+| `INCLUDE_TUNING` | `1` | Resource/cost-model candidates: parallel workers, `work_mem`, `random_page_cost`, `join_collapse_limit` |
+| `GUARD_TOLERANCE` | `0.10` | How much slower than native a query may average before the guard blocks it |
+| `GUARD_MIN_OBSERVATIONS` | `3` | Served executions needed before the guard will judge a query |
 | `AUTO_RETRAIN_SECONDS` | `0` (off) | Retrain on a background interval; promotion is still gated |
 | `ENABLE_ROWS_CORRECTION` | `1` | Learned `Rows()` cardinality corrections as an extra candidate |
+
+`GUARD_TOLERANCE` and `GUARD_MIN_OBSERVATIONS` were declared settings that
+nothing read; the guard kept its constructor defaults whatever they were set to.
+
+## A safety gate with a guarantee, not a constant
+
+The gate that decides whether to deviate has always had the right shape — bound
+the prediction by its own uncertainty before betting on it — with an arbitrary
+number in the place that decides how much protection it buys:
+
+```
+predicted_ratio + z * sigma  <  1 - min_relative_gain
+```
+
+`z = 1.0` is a familiar quantity, not a measured one, and ensemble spread is a
+useful signal rather than a calibrated standard deviation. Reading
+`mean + 1·sigma` as an 84th percentile assumes Gaussian residuals; this
+workload's are heavy-tailed, which is the case that assumption gets wrong in
+the dangerous direction.
+
+`GATE_MODE=conformal` replaces the constant with **split conformal prediction**
+(Vovk et al.; Lei et al., JASA 2018): score held-out examples by how wrong the
+model was, take the (1−α) quantile, use it as the multiplier. The bound then
+holds at least 1−α of the time whatever shape the residuals have — no normality
+assumption, finite-sample, distribution-free.
+
+Ordinary split conformal spends training data on calibration, which is the
+worst thing to spend here (§2.3 — data scarcity is the binding constraint). So
+the residuals come from the ensemble's own **out-of-bag** predictions: each
+member is fit on a bootstrap resample, so ~37% of rows are unseen by any given
+member, and averaging only the members that missed a row gives an honest
+held-out prediction for *every* training row at zero cost in data. That is
+jackknife+-after-bootstrap (Kim, Xu & Barber, NeurIPS 2020), which exists for
+ensembles built exactly the way `bandit.py` builds this one.
+
+`app.train` reports the achieved coverage on held-out queries, so the guarantee
+is checked rather than asserted.
+
+### What it actually measured, which was not what it was built for
+
+On a calibration run here (936 executions, 17 queries, 237 training rows) the
+calibration comes back with **q = 8.5** — the bound needs
+*eight and a half* sigmas to cover 90% of held-out outcomes, where `z = 1.0`
+had been assumed sufficient. The reason is visible in the same eval output:
+
+| | log-ratio units |
+|---|---|
+| mean ensemble spread on held-out rows | 0.175 |
+| actual mean absolute error | **0.403** |
+
+The ensemble members agree with each other roughly 2.3× more than they agree
+with reality. Bootstrap resampling measures *sampling* variability; it does not
+see model bias or irreducible measurement noise, and both dominate here. So
+`mean + 1·sigma` was never an 84% bound. It was a number that looked like one.
+
+The practical consequence is that conformal mode is **not usable on this
+dataset**: at the model's typical uncertainty a 90% bound demands a predicted
+4.2× speedup before it will deviate, which essentially never occurs, so the
+optimizer would decline almost every query. That is a real answer, not a
+failure of the method — it is the project's own stated limitation ("prediction
+error is comparable to the available headroom at this data scale") converted
+from an assertion into a measurement with a guarantee attached. Kept, off by
+default, and written up as the null result it is, exactly like the `Rows()`
+correction in §2.8.1. `docs/WRITEUP.md` §2.4.5 has the full working.
+
+Two things it is worth for, regardless: 229 of 237 training rows produced an
+out-of-bag residual (96.6%), so the claim that it costs no training data holds;
+and the gap it exposes between believed and actual uncertainty is the thing to
+fix if the deviation rate is ever to be raised safely.
+
+What it does *not* claim: coverage is marginal and assumes exchangeability. A
+workload or schema that stops resembling the training queries breaks that
+assumption, and the guarantee with it — the same assumption the rest of the
+model already runs on, stated rather than buried.
 | `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin the API accepts |

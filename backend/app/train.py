@@ -31,6 +31,7 @@ from app.db import get_cursor
 from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
 from app.optimizer.cardinality import JoinCardinalityCorrector
+from app.optimizer.conformal import ConformalGate, sigma_scale
 from app.optimizer.features import build_feature_columns, featurize, to_vector
 from app.optimizer.ranker import PairwisePlanRanker
 from app.plan_extractor import _extract_join_types, _extract_scan_relations, _extract_tables
@@ -158,7 +159,7 @@ def _load_rows() -> list[dict]:
     with get_cursor() as cur:
         cur.execute(FETCH_SQL, (f"{ADHOC_PREFIX}%",))
         columns = [d[0] for d in cur.description]
-        return [dict(zip(columns, r)) for r in cur.fetchall()]
+        return [dict(zip(columns, r, strict=True)) for r in cur.fetchall()]
 
 
 def _build_model():
@@ -291,11 +292,18 @@ def _evaluate_selection(
     }
 
 
+# Risk level for the conformal safety gate: at most this share of served
+# decisions should have a true log-ratio above the bound. 0.1 mirrors the
+# regression tolerance the guard already runs at.
+DEFAULT_CONFORMAL_ALPHA = float(os.getenv("CONFORMAL_ALPHA", "0.1"))
+
+
 def train(
     model_path: str = MODEL_PATH,
     eval_path: str = EVAL_PATH,
     n_models: int = 8,
     aggregate_reps: bool = True,
+    conformal_alpha: float = DEFAULT_CONFORMAL_ALPHA,
 ) -> dict:
     rows = _load_rows()
     if not rows:
@@ -326,6 +334,31 @@ def train(
     _, backend_name = _build_model()
     ensemble = BootstrappedEnsemble(make_regressor, n_models=n_models).fit(X_train, y_train)
 
+    # Calibrate the safety gate on the ensemble's own out-of-bag residuals, so
+    # `learned.py` can bound a prediction at a stated risk level instead of at
+    # a chosen number of standard deviations. Costs no training data -- see
+    # `optimizer/conformal.py` for why that matters here specifically.
+    conformal = None
+    uncertainty_scale = 1.0
+    try:
+        oob_means, oob_stds = ensemble.oob_mean_std(X_train)
+        usable = [
+            (mean, std, actual)
+            for mean, std, actual in zip(oob_means, oob_stds, y_train, strict=True)
+            if mean is not None
+        ]
+        if usable:
+            oob_m = [row[0] for row in usable]
+            oob_s = [row[1] for row in usable]
+            oob_y = [row[2] for row in usable]
+            conformal = ConformalGate(alpha=conformal_alpha).fit(oob_m, oob_s, oob_y)
+            # Separate from the conformal bound and used by the default gate:
+            # puts `confidence_z` back into real standard deviations, so the
+            # knob `app.calibrate` sweeps actually moves decisions.
+            uncertainty_scale = sigma_scale(oob_m, oob_s, oob_y)
+    except (RuntimeError, ValueError) as exc:  # too few rows, or every row in-bag
+        print(f"[warn] conformal gate not calibrated: {exc}")
+
     # Pairwise ranker (Lero-style), trained on the same rows. Pairs are
     # formed within a query only -- see optimizer/ranker.py.
     train_groups: dict[str, tuple[list, list]] = {}
@@ -353,9 +386,30 @@ def train(
     preds_test = ensemble.predict(X_test)
     # Error is now in log-ratio space. exp(MAE) reads as "typical multiplicative
     # error": 1.15 means predictions are typically off by ~15%.
-    mae = sum(abs(p - y) for p, y in zip(preds_test, y_test)) / len(y_test) if y_test else None
-    _, test_stds = ensemble.predict_mean_std(X_test)
+    mae = (
+        sum(abs(p - y) for p, y in zip(preds_test, y_test, strict=True)) / len(y_test)
+        if y_test
+        else None
+    )
+    test_means, test_stds = ensemble.predict_mean_std(X_test)
     mean_uncertainty = sum(test_stds) / len(test_stds) if test_stds else None
+
+    # The guarantee, checked rather than asserted. Calibration coverage is
+    # optimistic by construction; this is measured on the held-out queries, so
+    # it is the number that says whether the gate is honest on data it has not
+    # seen. Well below 1 - alpha means exchangeability has broken down, which is
+    # exactly what a schema or workload change does.
+    conformal_report = None
+    if conformal is not None and conformal.fitted:
+        conformal_report = {
+            "alpha": conformal.alpha,
+            "q": conformal.q,
+            "n_calibration": conformal.n_calibration,
+            "target_coverage": 1.0 - conformal.alpha,
+            "held_out_coverage": (
+                conformal.coverage(test_means, test_stds, y_test) if y_test else None
+            ),
+        }
 
     rows_by_query: dict[str, list[dict]] = {}
     for row in rows:
@@ -372,6 +426,12 @@ def train(
         "join_cardinality_corrector": (
             "trained" if join_corrector is not None else "not trained"
         ),
+        "conformal_gate": conformal_report or "not calibrated",
+        # >1 means the ensemble's spread understates its real error by this
+        # factor; `learned.py` multiplies sigma by it so `confidence_z` is
+        # denominated in standard deviations rather than in whatever the
+        # bootstrap happened to produce.
+        "uncertainty_scale": uncertainty_scale,
         "n_rows_raw": n_raw_rows,
         "reps_aggregated_to_median": aggregate_reps,
         "n_rows_total": len(rows),
@@ -395,7 +455,13 @@ def train(
                 "model": ensemble,
                 "ranker": ranker,
                 "join_corrector": join_corrector,
+                "conformal": conformal,
+                "uncertainty_scale": uncertainty_scale,
                 "target": "log_ratio_vs_native",
+                # Which queries the model never saw. `app.calibrate` needs this
+                # to choose a gate against honest predictions rather than
+                # against the ones the model fitted.
+                "held_out_queries": sorted(test_ids),
                 "feature_columns": feature_columns,
                 "table_cardinalities": table_cardinalities,
             },

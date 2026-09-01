@@ -42,6 +42,90 @@ from __future__ import annotations
 # win still can. `app.calibrate` sweeps the base thresholds; this scales them.
 UNSEEN_QUERY_CAUTION = 2.0
 
+# -- hint families ----------------------------------------------------------
+#
+# Blocking a whole query is a blunt instrument. A query usually does not regress
+# because "the learned path" is bad on it; it regresses because *one kind of
+# action* is bad on it -- banning hash joins on a query whose join genuinely
+# wants one, say, while reordering that same join would have been fine. The
+# all-or-nothing guard then throws away every good candidate along with the bad
+# one, and the query stops being optimised at all.
+#
+# So the history is also grouped by which family the served hint came from, and
+# a family that has demonstrated a regression on a query is dropped from *that
+# query's* action space while the rest stay available.
+#
+# Order matters in the CASE below: a join-method hint carries a `Leading()`
+# prefix as well as its `HashJoin()` tokens, and `Set(enable_hashjoin off)` is a
+# `Set()` like `Set(work_mem ...)` but a completely different kind of action.
+# The more specific pattern has to be tested first or everything collapses into
+# one bucket.
+HINT_FAMILY_SQL = """
+        CASE
+            WHEN hint LIKE '%%Rows(%%'                THEN 'cardinality'
+            WHEN hint LIKE '%%HashJoin(%%'
+              OR hint LIKE '%%NestLoop(%%'
+              OR hint LIKE '%%MergeJoin(%%'           THEN 'join_method'
+            WHEN hint LIKE '%%Set(enable_%%'          THEN 'operator_toggle'
+            WHEN hint LIKE '%%Set(%%'                 THEN 'resource'
+            WHEN hint LIKE '%%Leading(%%'             THEN 'join_order'
+            ELSE 'other'
+        END
+"""
+
+
+def hint_family(hint: str | None) -> str | None:
+    """
+    Which kind of action a hint represents. Mirrors `HINT_FAMILY_SQL`.
+
+    Kept in step with the SQL by `tests/test_family_guard.py`, which asserts
+    both classify every hint `hints.py` can generate the same way -- a drift
+    between them would block one family in the database and a different one at
+    serving time.
+    """
+    if not hint:
+        return None
+    if "Rows(" in hint:
+        return "cardinality"
+    if "HashJoin(" in hint or "NestLoop(" in hint or "MergeJoin(" in hint:
+        return "join_method"
+    if "Set(enable_" in hint:
+        return "operator_toggle"
+    if "Set(" in hint:
+        return "resource"
+    if "Leading(" in hint:
+        return "join_order"
+    return "other"
+
+
+FAMILY_REGRESSION_SQL = f"""
+    WITH native AS (
+        SELECT query_id, AVG(actual_total_time_ms) AS native_avg
+        FROM plan_execution_log
+        WHERE is_baseline
+          AND query_id IS NOT NULL
+          AND actual_total_time_ms IS NOT NULL
+        GROUP BY query_id
+    ),
+    served AS (
+        SELECT
+            query_id,
+            {HINT_FAMILY_SQL} AS family,
+            AVG(actual_total_time_ms) AS family_avg,
+            COUNT(*)                  AS n_served
+        FROM plan_execution_log
+        WHERE is_chosen
+          AND hint IS NOT NULL
+          AND query_id IS NOT NULL
+          AND actual_total_time_ms IS NOT NULL
+        GROUP BY 1, 2
+    )
+    SELECT s.query_id, s.family, n.native_avg, s.family_avg, s.n_served
+    FROM served s
+    JOIN native n ON n.query_id = s.query_id
+"""
+
+
 OBSERVATION_COUNT_SQL = """
     SELECT query_id, COUNT(*) FILTER (WHERE is_chosen)
     FROM plan_execution_log
@@ -89,6 +173,34 @@ def find_regressed_queries(
     return regressed
 
 
+def find_regressed_families(
+    cur, tolerance: float = 0.10, min_observations: int = 2
+) -> dict[str, dict[str, dict]]:
+    """
+    Per query, which hint families have been slower than native.
+
+    `min_observations` is lower than the whole-query guard's default on
+    purpose: the evidence is being split across families, so requiring the same
+    count per family would mean a family effectively never accumulates enough
+    to be judged. Dropping one family is also a far smaller intervention than
+    refusing to optimise the query at all, so it can be made on less evidence.
+    """
+    cur.execute(FAMILY_REGRESSION_SQL)
+    regressed: dict[str, dict[str, dict]] = {}
+
+    for query_id, family, native_avg, family_avg, n_served in cur.fetchall():
+        if native_avg is None or family_avg is None or n_served < min_observations:
+            continue
+        if family_avg > native_avg * (1.0 + tolerance):
+            regressed.setdefault(query_id, {})[family] = {
+                "native_avg_ms": float(native_avg),
+                "family_avg_ms": float(family_avg),
+                "regression_ratio": float(family_avg / native_avg),
+                "n_observations": int(n_served),
+            }
+    return regressed
+
+
 class RegressionGuard:
     """
     Holds the current blocklist. Refreshed explicitly rather than queried per
@@ -101,15 +213,38 @@ class RegressionGuard:
         self.tolerance = tolerance
         self.min_observations = min_observations
         self.blocked: dict[str, dict] = {}
+        self.blocked_families: dict[str, dict[str, dict]] = {}
         self.observations: dict[str, int] = {}
 
     def refresh(self, cur) -> dict[str, dict]:
         self.blocked = find_regressed_queries(
             cur, tolerance=self.tolerance, min_observations=self.min_observations
         )
+        self.blocked_families = find_regressed_families(cur, tolerance=self.tolerance)
         cur.execute(OBSERVATION_COUNT_SQL)
         self.observations = {qid: int(n) for qid, n in cur.fetchall()}
         return self.blocked
+
+    def is_family_blocked(self, query_id: str | None, hint: str | None) -> bool:
+        """Has this *kind* of hint demonstrably hurt this query before?"""
+        if query_id is None or not hint:
+            return False
+        family = hint_family(hint)
+        return family in self.blocked_families.get(query_id, {})
+
+    def allowed_hints(self, query_id: str | None, hints: list[str]) -> list[str]:
+        """
+        `hints` with the families that have regressed on this query removed.
+
+        Returns the list unchanged when that would empty it: a query every
+        family has failed on is one for `is_blocked` to stop outright, and
+        silently handing the planner nothing to choose between would report
+        itself as "no candidates" -- a different diagnosis from the true one.
+        """
+        if query_id is None:
+            return hints
+        kept = [h for h in hints if not self.is_family_blocked(query_id, h)]
+        return kept or hints
 
     def is_blocked(self, query_id: str | None) -> bool:
         # Ad-hoc queries (no stable id) can't have a history to judge them on.

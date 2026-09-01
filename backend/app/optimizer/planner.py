@@ -57,9 +57,87 @@ from app.plan_extractor import get_plan
 # search is the only route to plans no hint enumerates. Set to "0" to turn off.
 ENABLE_ROWS_CORRECTION = os.getenv("ENABLE_ROWS_CORRECTION", "1") != "0"
 
+# Whether the forced join-*method* family (`HashJoin`/`NestLoop`/`MergeJoin`
+# per join-order prefix, from `hints.generate_join_method_candidates`) is part
+# of the action space a served query gets to choose from.
+#
+# `app.collect_data` has always collected it -- `include_join_methods` defaults
+# to True there -- while neither serving path ever generated it, so the model
+# was trained on a family of plans it could never be offered. That is the
+# harmless direction of a train/serve mismatch (nothing is scored that was
+# never seen) but it meant the join-method stretch goal reached the training
+# set, the README and the writeup without reaching production.
+#
+# Off by default because closing it the other way is not free: it adds
+# `max_method_orders x 3` planning round trips per query -- 12 on the defaults,
+# against an order-plus-hint-set space of 20 -- and `optimizer_overhead_ms` is
+# the number the production path lives or dies by. Turn it on and settle it
+# with `python -m app.experiment`, which is what this project does with
+# questions of this shape, rather than assuming a wider action space is better.
+INCLUDE_JOIN_METHODS = os.getenv("INCLUDE_JOIN_METHODS", "0") != "0"
+
+# Resource and cost-model candidates (`hints.TUNING_SETTINGS`): parallel worker
+# counts, work_mem, random_page_cost, join_collapse_limit. On by default,
+# unlike the join-method family, because it is five candidates rather than
+# twelve and because it reaches plans nothing else in the action space can --
+# no join order or operator toggle can give a hash join more memory or turn a
+# sequential scan parallel.
+INCLUDE_TUNING = os.getenv("INCLUDE_TUNING", "1") != "0"
+
+# Scale the candidate count to how much the query is worth optimising.
+#
+# Every candidate costs one `EXPLAIN` round trip. Measured on this database
+# that is around 2.5 ms, and `decision_cache.py` exists because the full sweep
+# once cost 25.2 ms to choose a plan for a query that executed in 21.8 ms. The
+# cache fixes that for *repeat* traffic by paying the cost once; it does
+# nothing for a query seen once, which is most of what a dashboard sends.
+#
+# So the budget follows the planner's own estimate of how much work the query
+# is: a query Postgres prices at a few hundred cost units cannot repay a
+# twenty-candidate search, and one priced in the tens of thousands easily can.
+#
+# Truncation drops the *last* families generated, which is the right bias
+# rather than a convenient one. `generate_candidates` emits join orders first,
+# then operator toggles, then the resource settings -- and the resource
+# settings are precisely the ones that cannot help a small query. Giving a hash
+# join over two thousand rows more `work_mem`, or four parallel workers, is
+# not going to do anything; reordering its joins might.
+#
+# Serving a subset of what was collected is the harmless direction of a
+# train/serve difference: the model is never asked to score a plan family it
+# has not seen (contrast docs/WRITEUP.md 2.9). Truncation of a deterministic
+# list is deterministic, so a query's action space is still stable across runs.
+ADAPTIVE_CANDIDATE_BUDGET = os.getenv("ADAPTIVE_CANDIDATE_BUDGET", "1") != "0"
+
+# (estimated total cost below which, candidates allowed)
+CANDIDATE_BUDGET_TIERS: tuple[tuple[float, int], ...] = (
+    (200.0, 4),
+    (2_000.0, 10),
+    (20_000.0, 20),
+)
+UNBUDGETED_CANDIDATES = 64
+
+
+def budget_for(total_cost: float | None) -> int:
+    """How many candidates this query's estimated cost justifies planning."""
+    if not ADAPTIVE_CANDIDATE_BUDGET:
+        return UNBUDGETED_CANDIDATES
+    # No estimate to reason about -- do not silently starve the search.
+    if not total_cost or total_cost <= 0:
+        return UNBUDGETED_CANDIDATES
+    for ceiling, allowed in CANDIDATE_BUDGET_TIERS:
+        if total_cost < ceiling:
+            return allowed
+    return UNBUDGETED_CANDIDATES
+
 
 def candidate_hints(
-    optimizer, baseline_plan: dict, tables: list[str], max_candidates: int = 8
+    optimizer,
+    baseline_plan: dict,
+    tables: list[str],
+    max_candidates: int = 8,
+    include_join_methods: bool | None = None,
+    include_tuning: bool | None = None,
 ) -> list[str]:
     """
     The full action space for one query.
@@ -74,10 +152,21 @@ def candidate_hints(
     apart -- `/query/analyze` scoring candidates that `/query/optimize` would
     never generate is the sort of train/serve skew that docs/WRITEUP.md 2.9
     already caught once.
+
+    `include_join_methods` defaults to the `INCLUDE_JOIN_METHODS` module flag
+    (settable from the dashboard) rather than to a literal, so the two serving
+    paths stay in step with each other however it is configured.
     """
+    if include_join_methods is None:
+        include_join_methods = INCLUDE_JOIN_METHODS
+    if include_tuning is None:
+        include_tuning = INCLUDE_TUNING
+
     hints = generate_candidates(
         tables,
         max_order_candidates=max_candidates,
+        include_join_methods=include_join_methods,
+        include_tuning=include_tuning,
         # Read off the baseline plan's own join conditions, so the order
         # candidates skip the cartesian products Postgres would never pick.
         join_graph=baseline_plan.get("join_graph"),
@@ -141,9 +230,19 @@ def plan_query(
     baseline = get_plan(cur, sql, analyze=False)
     tables = baseline["tables_scanned"]
 
+    # Scaled to what the query is worth optimising; see `budget_for`.
+    budget = budget_for(baseline.get("total_cost"))
+    hints = candidate_hints(optimizer, baseline, tables, max_candidates=max_candidates)
+    # Drop the kinds of action that have already lost on this query, before the
+    # budget is applied -- otherwise a blocked family eats budget that a family
+    # with a chance could have used.
+    if guard is not None:
+        hints = guard.allowed_hints(query_id, hints)
+    hints = hints[:budget]
+
     candidates = []
     seen_plans = {plan_fingerprint(baseline)}
-    for hint in candidate_hints(optimizer, baseline, tables, max_candidates=max_candidates):
+    for hint in hints:
         try:
             plan = get_plan(cur, apply_hint(sql, hint), analyze=False)
         except Exception:  # noqa: BLE001 - a rejected hint is not a request failure
@@ -178,6 +277,10 @@ def plan_query(
         "chosen_plan": served,
         "reason": "safety_veto" if vetoed else decision.get("policy", "heuristic"),
         "caution": caution,
+        # What the query's own estimated cost allowed us to try. Without it a
+        # small `n_candidates_planned` is unexplained -- it reads as the action
+        # space having mysteriously shrunk rather than having been budgeted.
+        "candidate_budget": budget,
         "decision": decision,
         "n_candidates_planned": len(candidates),
         "optimizer_overhead_ms": planning_ms,

@@ -7,8 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app import db, db_profiles, model_store, retrain, saved_queries, stats, training_job, workload
+from app import (
+    db, db_profiles, diagnostics, experiment_job, model_store, retrain,
+    saved_queries, stats, training_job, workload,
+)
 from app import settings as app_settings
+from app import hypothetical
 from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
 from app.logging_store import log_execution, query_fingerprint
@@ -23,22 +27,115 @@ from app.plan_extractor import get_plan
 from app.schema_graph import discover_with_inference
 from app.schema_graph import summarize as schema_summary
 
-optimizer = LearnedOptimizer()
-SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
-guard = RegressionGuard()
-
-# Repeat traffic reuses the decision instead of re-deriving it. Measured on a
-# 4-table join, choosing cost 25.2 ms against an execution of 21.8 ms -- the
-# optimizer was more expensive than the query it optimized, and every repeat
-# paid it again to reach the same answer. Set DECISION_CACHE_SECONDS=0 to
-# disable, which is what a benchmark run wanting every decision made from
-# scratch should do.
-DECISION_CACHE_SECONDS = float(os.getenv("DECISION_CACHE_SECONDS", "300"))
-decision_cache = (
-    DecisionCache(ttl_seconds=DECISION_CACHE_SECONDS) if DECISION_CACHE_SECONDS > 0 else None
-)
-
 log = logging.getLogger("lqo.autolearn")
+
+# -- runtime configuration --------------------------------------------------
+#
+# Everything the request path touches -- the optimizer, the regression guard,
+# the decision cache, the Rows() action space -- is built from `app.settings`
+# rather than read out of the environment here.
+#
+# `app.settings` persists every dashboard change to models/settings.json
+# precisely so it survives a restart, but nothing outside `PUT /settings` ever
+# read it back. The panel therefore reported one configuration while the
+# process ran another, and not harmlessly: a user who *raised* the safety bar
+# to 0.4 was served the calibrated gate's 0.0 instead, so the optimizer
+# deviated on any predicted win at all -- the opposite of what the dashboard
+# said was in force. Two of the settings were unreachable from anywhere at all:
+# the guard read neither GUARD_TOLERANCE nor GUARD_MIN_OBSERVATIONS, which
+# `app.settings` has always declared.
+#
+# The guard is mutated in place rather than rebuilt because it carries measured
+# history (`blocked`, `observations`) that a settings change does not
+# invalidate. The optimizer and the cache are rebuilt because everything they
+# hold derives from the values that just changed.
+
+SELECTOR_MODE = "heuristic"
+guard = RegressionGuard()
+decision_cache: DecisionCache | None = None
+
+
+def _optimizer_from(values: dict) -> LearnedOptimizer:
+    """
+    Build an optimizer from settings, forwarding the gate thresholds *only*
+    where someone actually chose them.
+
+    `LearnedOptimizer` lets a measured gate (`models/gate.json`, written by
+    `app.calibrate`) beat its own defaults but never beat an explicitly passed
+    argument. Forwarding every current value would hand it the declared default
+    1.0 as though it had been chosen, silently switching the calibration off
+    for anyone who has never opened the settings panel -- so only genuine
+    overrides are forwarded. See `app.settings.overrides`.
+    """
+    chosen = app_settings.overrides()
+    gate = {
+        name: values[name]
+        for name in ("confidence_z", "min_relative_gain")
+        if name in chosen
+    }
+    return LearnedOptimizer(
+        policy=values["selection_policy"],
+        risk_lambda=values["risk_lambda"],
+        # Not part of `gate` above: which bound to apply is a plain choice with
+        # no calibrated-file default to defer to, unlike the thresholds.
+        gate_mode=values["gate_mode"],
+        **gate,
+    )
+
+
+def _apply_settings(values: dict) -> None:
+    """
+    Rebuild the parts of the running system a settings change affects.
+
+    Constructing a fresh optimizer rather than mutating the live one: its
+    thresholds are read in the constructor (including the calibrated gate), so
+    assigning to attributes would apply some of a change and not the rest.
+    """
+    global optimizer, SELECTOR_MODE, decision_cache
+
+    optimizer = _optimizer_from(values)
+    SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
+
+    guard.tolerance = values["guard_tolerance"]
+    guard.min_observations = values["guard_min_observations"]
+
+    planner.ENABLE_ROWS_CORRECTION = values["enable_rows_correction"]
+    planner.INCLUDE_JOIN_METHODS = values["include_join_methods"]
+    planner.INCLUDE_TUNING = values["include_tuning"]
+    planner.ADAPTIVE_CANDIDATE_BUDGET = values["adaptive_candidate_budget"]
+
+    # The cache is rebuilt rather than resized: every entry in it was decided
+    # by the policy and thresholds that just changed, so keeping any of them
+    # would serve decisions the new settings would not have made. A TTL of 0
+    # disables it, which is what a benchmark wanting every decision made from
+    # scratch should use.
+    ttl = values["decision_cache_seconds"]
+    decision_cache = DecisionCache(ttl_seconds=ttl) if ttl > 0 else None
+
+
+def _reload_optimizer() -> None:
+    """
+    Swap in a newly promoted (or rolled back) model, keeping the configuration.
+
+    Rebuilt from `app.settings` rather than from the outgoing optimizer's
+    attributes. Copying `policy` and `risk_lambda` off the old object silently
+    dropped the safety gate with it, so every retrain-promotion, rollback and
+    /model/reload reset `confidence_z` and `min_relative_gain` to their
+    defaults. Lowering the safety bar is not something a model swap should be
+    able to do as a side effect.
+    """
+    global optimizer, SELECTOR_MODE
+    optimizer = _optimizer_from(app_settings.current())
+    SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
+    # Every cached decision was made by the model being replaced. Keeping them
+    # would let a freshly promoted model serve its predecessor's choices and
+    # appear to have changed nothing -- the retrain would look like a no-op.
+    if decision_cache is not None:
+        decision_cache.clear()
+
+
+# Applied at import, so a restart serves what the dashboard says it serves.
+_apply_settings(app_settings.current())
 
 # The system retrains itself on accumulated feedback on this cadence. Off by
 # default: a background job that silently swaps the served model is exactly
@@ -266,6 +363,10 @@ def optimize_query(req: QueryRequest):
     }
 
 
+class AdvisorRequest(BaseModel):
+    sql: str
+
+
 @app.get("/advisor")
 def advisor():
     """
@@ -275,6 +376,45 @@ def advisor():
     """
     with get_cursor() as cur:
         return {"recommendations": missing_fk_indexes(cur)}
+
+
+@app.post("/advisor/rank")
+def advisor_rank(req: AdvisorRequest):
+    """
+    The same recommendations, ranked by what they would actually be worth.
+
+    `/advisor` can say an index is missing but not how much it would help,
+    because finding out means building it -- slow, lock-taking, and not
+    something a read-only endpoint should do to someone's database. Most
+    missing indexes are missing because nothing needs them, so an unranked
+    list gives no basis for choosing between them.
+
+    HypoPG registers an index in the planner's catalogue only, and `EXPLAIN`
+    then plans as though it existed. What comes back is the estimated cost
+    before and after, and -- the decisive part -- whether the planner would
+    choose it at all. See `app/hypothetical.py` for what that does and does
+    not measure.
+    """
+    with get_cursor() as cur:
+        if not hypothetical.ensure_extension(cur):
+            return {
+                "available": False,
+                "reason": (
+                    "hypopg is not installed in this database, so index "
+                    "recommendations cannot be ranked. Rebuild the Postgres image "
+                    "(postgres/Dockerfile) or CREATE EXTENSION hypopg."
+                ),
+                "recommendations": missing_fk_indexes(cur),
+            }
+
+        candidates = missing_fk_indexes(cur)
+        ranked = hypothetical.rank_candidates(cur, req.sql, candidates)
+
+    return {
+        "available": True,
+        "n_candidates_considered": len(candidates),
+        "recommendations": ranked,
+    }
 
 
 @app.get("/stats/cost-model")
@@ -335,12 +475,33 @@ def model_status():
             "tolerance": guard.tolerance,
             "min_observations": guard.min_observations,
             "blocked_queries": blocked,
+            # Finer-grained than `blocked_queries`: which *kinds* of action have
+            # lost on which query, so a query can keep being optimised by the
+            # families that still work on it.
+            "blocked_families": guard.blocked_families,
         },
         # How much of the planning cost repeat traffic is actually avoiding.
         # A hit rate near zero means the cache is pure overhead and the TTL or
         # the traffic pattern is wrong.
         "decision_cache": decision_cache.stats() if decision_cache is not None else None,
     }
+
+
+@app.get("/model/diagnostics")
+def model_diagnostics():
+    """
+    Why the optimizer is behaving as it is -- as opposed to what it did.
+
+    `/model/status` says what is deployed and `/stats/trend` says how it has
+    performed; neither answers "and should I believe it". That question was
+    first answered with throwaway scripts, after a dashboard showed a plan
+    predicted at 0.92x native running 1.5x slower, and every one of the four
+    findings (a gate with `confidence_z = 0`, calibrated in-sample, on five
+    queries, over an uncertainty understated 2.4x) was invisible from the
+    running system. See `app/diagnostics.py`.
+    """
+    with get_cursor() as cur:
+        return diagnostics.diagnose(cur=cur)
 
 
 @app.post("/model/retrain")
@@ -369,17 +530,6 @@ def model_rollback():
     return {"action": "rollback", "promoted": target}
 
 
-def _reload_optimizer() -> None:
-    global optimizer, SELECTOR_MODE
-    optimizer = LearnedOptimizer(policy=optimizer.policy, risk_lambda=optimizer.risk_lambda)
-    SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
-    # Every cached decision was made by the model being replaced. Keeping them
-    # would let a freshly promoted model serve its predecessor's choices and
-    # appear to have changed nothing -- the retrain would look like a no-op.
-    if decision_cache is not None:
-        decision_cache.clear()
-
-
 @app.get("/stats/trend")
 def stats_trend():
     """
@@ -396,39 +546,6 @@ def stats_trend():
 
     result["overall"]["selector_mode"] = SELECTOR_MODE
     return result
-
-
-# -- runtime configuration --------------------------------------------------
-
-
-def _apply_settings(values: dict) -> None:
-    """
-    Rebuild the parts of the running system a settings change affects.
-
-    Constructing a fresh optimizer rather than mutating the live one: its
-    thresholds are read in the constructor (including the calibrated gate), so
-    assigning to attributes would apply some of a change and not the rest.
-    """
-    global optimizer, SELECTOR_MODE, decision_cache
-
-    optimizer = LearnedOptimizer(
-        policy=values["selection_policy"],
-        risk_lambda=values["risk_lambda"],
-        confidence_z=values["confidence_z"],
-        min_relative_gain=values["min_relative_gain"],
-    )
-    SELECTOR_MODE = "learned" if optimizer.model is not None else "heuristic"
-
-    guard.tolerance = values["guard_tolerance"]
-    guard.min_observations = values["guard_min_observations"]
-
-    planner.ENABLE_ROWS_CORRECTION = values["enable_rows_correction"]
-
-    # The cache is rebuilt rather than resized: every entry in it was decided
-    # by the policy and thresholds that just changed, so keeping any of them
-    # would serve decisions the new settings would not have made.
-    ttl = values["decision_cache_seconds"]
-    decision_cache = DecisionCache(ttl_seconds=ttl) if ttl > 0 else None
 
 
 @app.get("/settings")
@@ -618,6 +735,47 @@ def train_stop():
     rather than starting over, so stopping is not the same as discarding.
     """
     return training_job.job.stop()
+
+
+# -- settling a comparison properly -----------------------------------------
+
+
+class ExperimentRequest(BaseModel):
+    comparison: str = "guard"
+    policy: str = "pairwise_rank"
+    arm_a: str = "risk_averse"
+    arm_b: str = "pairwise_rank"
+    runs: int = 10
+    limit: int | None = None
+
+
+@app.get("/experiment/status")
+def experiment_status():
+    """Progress and result of the current or most recent comparison."""
+    return experiment_job.job.snapshot()
+
+
+@app.post("/experiment/start")
+def experiment_start(req: ExperimentRequest):
+    """
+    Start a paired A/B comparison in the background.
+
+    `app.experiment` is the only thing here that settles a question properly --
+    interleaved arms, a bootstrap interval, a sign test, and the word
+    *unresolved* when the interval spans zero. It was also the only thing that
+    needed a terminal, which made the rigorous comparison the inconvenient one.
+    docs/WRITEUP.md 2.4 records the cost of that: a headline result with a
+    sample size of three.
+    """
+    try:
+        return experiment_job.job.start(
+            comparison=req.comparison, policy=req.policy,
+            arm_a=req.arm_a, arm_b=req.arm_b, runs=req.runs, limit=req.limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/model/reload")

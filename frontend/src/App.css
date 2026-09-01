@@ -777,3 +777,31 @@ code {
   color: var(--text-muted);
   white-space: pre-wrap;
 }
+
+/* Model-health findings (backend app/diagnostics.py). Severity is carried by a
+   left border rather than by background colour, so the list stays readable
+   against either theme and a long explanation is not fighting a tint. */
+.findings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.finding {
+  border-left: 3px solid var(--border, #d0d7de);
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.06);
+  font-size: 0.92rem;
+}
+
+.finding div {
+  margin-top: 4px;
+  opacity: 0.85;
+}
+
+.finding-high { border-left-color: #d1242f; }
+.finding-medium { border-left-color: #bf8700; }
+.finding-low { border-left-color: #6e7781; }

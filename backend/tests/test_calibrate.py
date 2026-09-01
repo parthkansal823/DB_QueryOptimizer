@@ -1,6 +1,6 @@
 import math
 
-from app.calibrate import evaluate_setting, sweep
+from app.calibrate import evaluate_setting
 
 
 class _Ensemble:

@@ -13,3 +13,10 @@ RUN git clone --branch PG16 --depth 1 https://github.com/ossc-db/pg_hint_plan.gi
     && cd /tmp/pg_hint_plan \
     && make && make install \
     && rm -rf /tmp/pg_hint_plan
+
+# HypoPG: hypothetical indexes. Registers an index in the planner's catalogue
+# only -- no pages written, no lock taken, nothing outliving the session -- so
+# `EXPLAIN` can be asked what an index *would* do without building it. That is
+# what turns app/advisor.py's "these indexes are missing" into "this one would
+# cut the plan's cost by 78% and the planner would actually use it".
+RUN git clone --branch REL1_4_STABLE --depth 1 https://github.com/HypoPG/hypopg.git /tmp/hypopg     && cd /tmp/hypopg     && make && make install     && rm -rf /tmp/hypopg

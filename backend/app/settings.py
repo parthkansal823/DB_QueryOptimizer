@@ -58,6 +58,22 @@ FIELDS: dict[str, dict] = {
         "env": "RISK_LAMBDA",
         "default": 1.0,
     },
+    "gate_mode": {
+        "type": "enum",
+        "options": ["fixed_z", "conformal"],
+        "label": "Safety gate",
+        "group": "Safety gate",
+        "help": (
+            "How the bound on a predicted speedup is worked out. `fixed_z` is "
+            "mean + z x sigma, which assumes ensemble spread is a calibrated "
+            "standard deviation. `conformal` measures the multiplier from the "
+            "model's own out-of-bag residuals at a stated risk level, and holds "
+            "whatever shape those residuals have. Needs a model trained since "
+            "the gate was added; older bundles fall back to `fixed_z`."
+        ),
+        "env": "GATE_MODE",
+        "default": "fixed_z",
+    },
     "confidence_z": {
         "type": "float", "min": 0.0, "max": 5.0, "step": 0.05,
         "label": "Confidence required to deviate (z)",
@@ -83,6 +99,19 @@ FIELDS: dict[str, dict] = {
         "env": "MIN_RELATIVE_GAIN",
         "default": 0.05,
     },
+    "conformal_alpha": {
+        "type": "float", "min": 0.01, "max": 0.5, "step": 0.01,
+        "label": "Conformal risk level (alpha)",
+        "group": "Safety gate",
+        "help": (
+            "With `conformal` selected, at most this share of served decisions "
+            "should have a true ratio worse than the bound. 0.1 mirrors the "
+            "regression guard's own tolerance. Applied when the model is "
+            "trained, so changing it takes effect on the next retrain."
+        ),
+        "env": "CONFORMAL_ALPHA",
+        "default": 0.1,
+    },
     "enable_rows_correction": {
         "type": "bool",
         "label": "Learned cardinality corrections",
@@ -92,6 +121,47 @@ FIELDS: dict[str, dict] = {
             "and lets its own planner choose, rather than forcing a plan shape."
         ),
         "env": "ENABLE_ROWS_CORRECTION",
+        "default": True,
+    },
+    "include_tuning": {
+        "type": "bool",
+        "label": "Resource and cost-model candidates",
+        "group": "Action space",
+        "help": (
+            "Tries parallel worker counts, a larger work_mem, a lower "
+            "random_page_cost and a pinned join order. These change what the "
+            "executor is given rather than the plan's shape, so they reach "
+            "speedups no join order or operator toggle can -- a hash join that "
+            "no longer spills to disk, or a scan that runs in parallel."
+        ),
+        "env": "INCLUDE_TUNING",
+        "default": True,
+    },
+    "include_join_methods": {
+        "type": "bool",
+        "label": "Forced join methods",
+        "group": "Action space",
+        "help": (
+            "Adds HashJoin/NestLoop/MergeJoin candidates alongside join orders. "
+            "`app.collect_data` has always trained on these; until now neither "
+            "serving path offered them. Costs about 12 extra planning round "
+            "trips per query, so compare it with `python -m app.experiment` "
+            "rather than assuming a wider action space wins."
+        ),
+        "env": "INCLUDE_JOIN_METHODS",
+        "default": False,
+    },
+    "adaptive_candidate_budget": {
+        "type": "bool",
+        "label": "Scale candidates to query cost",
+        "group": "Performance",
+        "help": (
+            "Plan fewer candidates for queries PostgreSQL already prices as "
+            "cheap. Every candidate costs an EXPLAIN round trip (~2.5 ms here), "
+            "which a query executing in a few milliseconds cannot repay. Off "
+            "means every query gets the full action space."
+        ),
+        "env": "ADAPTIVE_CANDIDATE_BUDGET",
         "default": True,
     },
     "decision_cache_seconds": {
@@ -129,6 +199,18 @@ FIELDS: dict[str, dict] = {
 
 _lock = threading.Lock()
 _values: dict | None = None
+
+# Which fields a user has actually chosen, as opposed to inheriting from the
+# environment or the declared default.
+#
+# The distinction is not cosmetic. `learned.LearnedOptimizer` lets a *measured*
+# gate (`models/gate.json`, written by `app.calibrate`) beat its defaults but
+# never beat an explicitly passed argument -- "measured beats guessed, explicit
+# beats both". Applying every current value as an explicit argument would
+# therefore hand it the declared default 1.0 as though someone had chosen it,
+# silently switching the calibration off for anyone who has simply never opened
+# the settings panel. `overrides()` is what keeps the two apart.
+_explicit: set[str] = set()
 
 
 def _coerce(name: str, value):
@@ -178,17 +260,19 @@ def defaults() -> dict:
     return {name: _from_env(name, field) for name, field in FIELDS.items()}
 
 
-def _load() -> dict:
+def _load() -> tuple[dict, set[str]]:
+    """The persisted settings, plus the names that came from the stored file."""
     values = defaults()
+    explicit: set[str] = set()
     if not os.path.exists(SETTINGS_PATH):
-        return values
+        return values, explicit
     try:
         with open(SETTINGS_PATH) as f:
             stored = json.load(f)
     except (OSError, ValueError):
-        return values  # a damaged settings file falls back to defaults, not a crash
+        return values, explicit  # a damaged settings file falls back to defaults, not a crash
     if not isinstance(stored, dict):
-        return values
+        return values, explicit
 
     for name, value in stored.items():
         # Silently drop anything no longer declared, so removing a field does
@@ -198,17 +282,31 @@ def _load() -> dict:
                 values[name] = _coerce(name, value)
             except ValueError:
                 continue
-    return values
+            explicit.add(name)
+    return values, explicit
 
 
 def current() -> dict:
     """The active settings, loaded from disk on first use."""
-    global _values
+    global _values, _explicit
     if _values is None:
         with _lock:
             if _values is None:
-                _values = _load()
+                _values, _explicit = _load()
     return dict(_values)
+
+
+def overrides() -> dict:
+    """
+    Only the settings someone actually chose, keyed as `current()` keys them.
+
+    Callers that forward a setting to something with its own notion of a
+    default -- the calibrated gate in `learned.LearnedOptimizer` is the one
+    that matters here -- should pass a field only when it appears in this dict.
+    See the note on `_explicit` above for why passing everything is wrong.
+    """
+    values = current()
+    return {name: values[name] for name in sorted(_explicit) if name in values}
 
 
 def update(changes: dict) -> dict:
@@ -220,24 +318,42 @@ def update(changes: dict) -> dict:
     """
     coerced = {name: _coerce(name, value) for name, value in changes.items()}
 
-    global _values
+    global _values, _explicit
     with _lock:
         if _values is None:
-            _values = _load()
+            _values, _explicit = _load()
         _values.update(coerced)
+        # Writing a field *is* choosing it, which is what separates it from a
+        # value inherited from the environment -- see `overrides()`.
+        _explicit |= set(coerced)
         snapshot = dict(_values)
+        chosen = set(_explicit)
 
+    # Only the chosen fields are persisted, not the whole snapshot.
+    #
+    # Writing every current value made the file indistinguishable from one in
+    # which the user had set all eight, so after a restart `overrides()`
+    # reported everything as chosen and the calibrated gate lost control of
+    # thresholds nobody had touched. Storing the choices alone is also what
+    # makes the file safe to hand-edit: a field present in it *is* a decision,
+    # and a field absent from it inherits from the environment as usual.
+    #
+    # A file written by an older build holds all eight fields and is therefore
+    # read back as "all chosen". That matches how the previous code behaved
+    # once settings had been applied, and one further save or a reset rewrites
+    # it in this form.
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
     with open(SETTINGS_PATH, "w") as f:
-        json.dump(snapshot, f, indent=2)
+        json.dump({name: snapshot[name] for name in sorted(chosen)}, f, indent=2)
     return snapshot
 
 
 def reset() -> dict:
     """Drop overrides and go back to environment/declared defaults."""
-    global _values
+    global _values, _explicit
     with _lock:
         _values = defaults()
+        _explicit = set()
         snapshot = dict(_values)
     if os.path.exists(SETTINGS_PATH):
         os.remove(SETTINGS_PATH)

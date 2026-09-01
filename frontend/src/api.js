@@ -25,6 +25,22 @@ export function fetchModelStatus() {
   return request("/model/status");
 }
 
+export function fetchModelDiagnostics() {
+  return request("/model/diagnostics");
+}
+
+export function fetchExperimentStatus() {
+  return request("/experiment/status");
+}
+
+export function startExperiment(body) {
+  return request("/experiment/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 export function triggerRetrain() {
   return request("/model/retrain?force=true", { method: "POST" });
 }

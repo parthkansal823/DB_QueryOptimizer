@@ -1,4 +1,4 @@
-"""
+r"""
 Stretch goal: run Phase 1 data collection against the real JOB/IMDB dataset
 (`data/job/`) instead of the synthetic schema. Reuses `app.collect_data`'s
 `collect()` unchanged -- only the workload (real JOB query files instead of

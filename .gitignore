@@ -21,3 +21,7 @@ data/job/queries/
 backend/models/registry.json
 backend/models/versions/
 backend/models/_challenger*
+# Runtime configuration set from the dashboard. Per-machine, like the registry
+# above -- committing one machine's thresholds would apply them to everyone
+# else's checkout at import, now that they are actually read at startup.
+backend/models/settings.json

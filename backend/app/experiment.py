@@ -1,4 +1,4 @@
-"""
+r"""
 Paired A/B experiments with confidence intervals.
 
 `docs/WRITEUP.md` 2.4 makes this project's most interesting claim -- that a

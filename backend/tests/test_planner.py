@@ -77,6 +77,11 @@ class _Guard:
     def caution_multiplier(self, query_id):
         return self.caution
 
+    def allowed_hints(self, query_id, hints):
+        # This fake blocks whole queries, not families; the family filter is
+        # covered in tests/test_family_guard.py.
+        return hints
+
 
 SQL = "SELECT o.id FROM orders o JOIN users u ON o.user_id = u.id"
 

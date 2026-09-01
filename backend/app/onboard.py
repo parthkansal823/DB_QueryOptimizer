@@ -1,4 +1,4 @@
-"""
+r"""
 One command to point this optimizer at *any* PostgreSQL database.
 
     DATABASE_URL=postgresql://user:pass@host:5432/yourdb \\

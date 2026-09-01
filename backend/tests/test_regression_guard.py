@@ -3,17 +3,18 @@ from app.optimizer.regression_guard import RegressionGuard, find_regressed_queri
 
 class _FakeCursor:
     """
-    Serves the regression query and the observation-count query separately.
+    Serves each of `refresh`'s queries separately.
 
-    `refresh` issues two now: one to find regressed queries, one to count how
-    many times each query has been served (which drives
-    `caution_multiplier`). A fake returning the same rows to both would feed
-    4-tuples into a 2-tuple unpack.
+    `refresh` issues three: the whole-query regression sweep, the per-family
+    one, and the observation counts that drive `caution_multiplier`. They
+    return differently shaped rows, so a fake answering them all identically
+    would feed 4-tuples into a 2-tuple unpack.
     """
 
-    def __init__(self, rows, observations=None):
+    def __init__(self, rows, observations=None, families=()):
         self._rows = rows
         self._observations = observations
+        self._families = list(families)
         self._last = rows
 
     def execute(self, query, params=None):
@@ -25,6 +26,8 @@ class _FakeCursor:
                 # history, so existing tests keep their original meaning.
                 else [(r[0], r[3]) for r in self._rows]
             )
+        elif "family" in query:
+            self._last = self._families
         else:
             self._last = self._rows
 

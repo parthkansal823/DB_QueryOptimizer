@@ -116,3 +116,47 @@ describe("other decisions", () => {
     expect(container).toBeTruthy();
   });
 });
+
+
+describe("which gate authorised the decision", () => {
+  it("names the conformal bound when that is what ran", () => {
+    render(
+      <PlanComparison
+        baseline={baseline}
+        chosenPlan={null}
+        selectorMode="learned"
+        decision={{ ...declined, gate: "conformal" }}
+      />,
+    );
+
+    expect(screen.getByText(/conformal \(measured bound\)/)).toBeInTheDocument();
+  });
+
+  it("names the fixed-z bound when that is what ran", () => {
+    render(
+      <PlanComparison
+        baseline={baseline}
+        chosenPlan={null}
+        selectorMode="learned"
+        decision={{ ...declined, gate: "fixed_z" }}
+      />,
+    );
+
+    expect(screen.getByText(/mean \+ z x sigma/)).toBeInTheDocument();
+  });
+
+  it("says nothing about a gate when the response carries none", () => {
+    // Older bundles and the cold-start heuristic report no gate at all, and an
+    // empty row reads as a missing value rather than an absent concept.
+    render(
+      <PlanComparison
+        baseline={baseline}
+        chosenPlan={null}
+        selectorMode="learned"
+        decision={declined}
+      />,
+    );
+
+    expect(screen.queryByText("Gate")).not.toBeInTheDocument();
+  });
+});

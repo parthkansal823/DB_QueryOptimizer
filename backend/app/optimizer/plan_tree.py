@@ -44,6 +44,14 @@ TREE_FEATURES = [
     "log_total_cost",
     "startup_cost_fraction",
     "deepest_join_depth",
+    # -- added later; see `_advanced` for why each earns a slot ------------
+    "log_max_join_est_rows",
+    "join_rows_reduction",
+    "cost_concentration",
+    "log_max_hash_build_rows",
+    "n_parallel_aware",
+    "weighted_nestloop_depth",
+    "log_root_width",
 ] + [f"n_{family}" for family in OPERATOR_FAMILIES]
 
 
@@ -129,4 +137,89 @@ def encode_plan_tree(raw_plan: dict) -> dict[str, float]:
         if family:
             features[f"n_{family}"] += 1.0
 
+    features.update(_advanced(raw_plan, nodes))
     return features
+
+
+def _advanced(raw_plan: dict, nodes: list) -> dict[str, float]:
+    """
+    The signals the original encoding could not express.
+
+    Two of these exist because the action space grew. `hints.TUNING_SETTINGS`
+    now offers parallel worker counts and a larger `work_mem`, and those
+    candidates change a plan in ways the features above are blind to: a
+    parallel plan and its serial twin scan the same tables in the same order at
+    a similar estimated cost, and so did a hash join that fits in memory and one
+    that spills to disk. Feeding the model two near-identical vectors with
+    different latencies is not a hard learning problem, it is an impossible one
+    -- so a widened action space needs a widened feature space or it just adds
+    noise.
+
+    The rest target the failure this project exists for. PostgreSQL misestimates
+    correlated predicates, and the damage shows up as an *intermediate* result
+    that is much larger than either the inputs or the final output. That is a
+    property of the join nodes specifically, and `log_max_est_rows` above cannot
+    see it because it is dominated by the leaf scan of the biggest table.
+
+    Estimate-side only, like everything else here: a plan has to be scoreable
+    before it is run (see `optimizer/planner.py`).
+    """
+    out: dict[str, float] = {}
+
+    join_rows = [
+        float(n.get("Plan Rows") or 0.0) for n, _ in nodes if "Join Type" in n
+    ]
+    root_rows = float(raw_plan.get("Plan Rows") or 0.0)
+
+    # The biggest intermediate the plan has to build. This is the quantity join
+    # ordering is actually chosen to minimise, and it is not the same as the
+    # largest node in the tree.
+    out["log_max_join_est_rows"] = math.log1p(max(join_rows) if join_rows else 0.0)
+
+    # How much of that biggest intermediate survives to the output. Near 1.0
+    # means the plan built roughly what it returns; near 0 means it built
+    # something large and then threw almost all of it away, which is the
+    # signature of joining in the wrong order.
+    largest = max(join_rows) if join_rows else 0.0
+    out["join_rows_reduction"] = (root_rows + 1.0) / (largest + 1.0) if largest else 1.0
+
+    # Does one operator decide the plan's fate, or is the cost spread out? A
+    # concentrated plan lives or dies on a single estimate being right.
+    node_costs = [float(n.get("Total Cost") or 0.0) for n, _ in nodes]
+    total_cost = float(raw_plan.get("Total Cost") or 0.0)
+    # The root's own Total Cost is cumulative, so it is excluded -- otherwise
+    # this is 1.0 for every plan ever.
+    child_costs = [c for c in node_costs[1:]] if len(node_costs) > 1 else []
+    out["cost_concentration"] = (max(child_costs) / total_cost) if child_costs and total_cost > 0 else 0.0
+
+    # Rows on the build side of a hash join: what has to fit in `work_mem`
+    # before the join can proceed, and therefore what decides whether it spills
+    # to disk in batches. Directly the quantity the work_mem candidate moves.
+    hash_build_rows = [
+        float(n.get("Plan Rows") or 0.0)
+        for n, _ in nodes
+        if n.get("Node Type") == "Hash"
+    ]
+    out["log_max_hash_build_rows"] = math.log1p(
+        max(hash_build_rows) if hash_build_rows else 0.0
+    )
+
+    # Whether this plan is parallel at all. `n_gather` above counts Gather
+    # nodes, but a plan can be parallel-aware below a Gather it shares with its
+    # serial twin, and the worker-count candidates turn exactly this on and off.
+    out["n_parallel_aware"] = float(
+        sum(1 for n, _ in nodes if n.get("Parallel Aware"))
+    )
+
+    # A nested loop re-scans its inner side once per outer row, so one sitting
+    # deep in the tree -- under several other joins -- is far more dangerous
+    # than one at the root. A plain count cannot say that.
+    out["weighted_nestloop_depth"] = float(
+        sum(depth + 1 for n, depth in nodes if n.get("Node Type") == "Nested Loop")
+    )
+
+    # Bytes per output row: two plans returning the same number of rows are not
+    # the same amount of work if one of them carries five times the width.
+    out["log_root_width"] = math.log1p(float(raw_plan.get("Plan Width") or 0.0))
+
+    return out

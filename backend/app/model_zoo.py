@@ -95,7 +95,7 @@ def evaluate_model(name: str, data: dict) -> dict | None:
     model.fit(data["X_train"], data["y_train"])
     preds = model.predict(data["X_test"])
 
-    mae = sum(abs(p - y) for p, y in zip(preds, data["y_test"])) / len(data["y_test"])
+    mae = sum(abs(p - y) for p, y in zip(preds, data["y_test"], strict=True)) / len(data["y_test"])
 
     # Ranking + end-to-end quality on held-out queries.
     correct_top1 = 0

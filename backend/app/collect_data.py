@@ -33,6 +33,7 @@ DEFAULT_REPS = 3
 def collect(
     reps: int = DEFAULT_REPS,
     include_join_methods: bool = True,
+    include_tuning: bool = True,
     workload: list[dict] | None = None,
     statement_timeout_ms: int = 30_000,
     on_progress=None,
@@ -104,6 +105,7 @@ def collect(
             hints = generate_candidates(
                 tables,
                 include_join_methods=include_join_methods,
+                include_tuning=include_tuning,
                 join_graph=baseline.get("join_graph"),
             )
 
@@ -164,10 +166,16 @@ if __name__ == "__main__":
         action="store_true",
         help="collect join-order candidates only (skip the join-method stretch goal)",
     )
+    parser.add_argument(
+        "--no-tuning",
+        action="store_true",
+        help="skip the resource/cost-model candidates (parallelism, work_mem, ...)",
+    )
     parser.add_argument("--timeout-ms", type=int, default=30_000, help="per-candidate statement_timeout")
     args = parser.parse_args()
     collect(
         reps=args.reps,
         include_join_methods=not args.no_join_methods,
+        include_tuning=not args.no_tuning,
         statement_timeout_ms=args.timeout_ms,
     )

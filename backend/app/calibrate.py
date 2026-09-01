@@ -25,6 +25,28 @@ which is precisely the per-query instability that makes learned optimizers
 undeployable (docs/WRITEUP.md §2.4). Bounding the regression rate first,
 then maximising within that, encodes the priority correctly.
 
+## Two ways that went wrong in practice
+
+**The bound was set so wide it never bound anything.** At a 34% ceiling every
+setting on the grid qualified, so the recommendation collapsed back to plain
+"maximise net improvement". On a real sweep it then preferred
+
+    z=0.00 min_gain=0.00 -> 83% deviate, 10% regress, +35.0%
+    z=0.00 min_gain=0.05 -> 58% deviate,  0% regress, +34.6%
+
+paying a 0% -> 10% regression rate for four tenths of a percentage point of net
+gain, and wrote that to `models/gate.json` as the deployed configuration. A
+gate with `z=0` also multiplies the model's uncertainty by zero, so the
+dashboard's "pessimistically" figure equalled the prediction exactly and the
+safety mechanism was, in effect, switched off.
+
+**Ties in net improvement are not ties.** Net improvement is a sum over
+queries and is dominated by a handful of large ones, so two settings can differ
+by less than the measurement noise while differing enormously in how often they
+hurt an individual query. `_dominates` therefore treats settings whose net
+improvement is within `TIE_FRACTION` as equivalent and breaks the tie on
+regression rate, which is the quantity the project actually cares about.
+
 Usage:
     python -m app.calibrate            # sweep, report, recommend
     python -m app.calibrate --apply    # also write the result to models/gate.json
@@ -37,7 +59,6 @@ import json
 import math
 import os
 
-from app.db import get_cursor
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
 from app.train import _aggregate_repetitions, _load_rows, _row_to_candidate
@@ -77,6 +98,10 @@ def evaluate_setting(
 
     n_queries = n_deviated = n_regressed = 0
     native_total = served_total = 0.0
+    # How bad the worst single deviation was, as a ratio of native. A rate
+    # says how often; this says whether "occasionally slower" means 5% or 6x,
+    # and those are not the same risk.
+    worst_regression_ratio = 1.0
 
     for rows in grouped.values():
         baselines = [r for r in rows if r["is_baseline"]]
@@ -105,7 +130,10 @@ def evaluate_setting(
             best_i, _ = select_index(model, vectors, policy=policy)
 
         if ratio_target:
-            pessimistic = math.exp(means[best_i] + confidence_z * stds[best_i])
+            # Same rescaling the served gate applies, or the sweep would be
+            # choosing `z` in different units from the ones it is spent in.
+            scale = float(bundle.get("uncertainty_scale") or 1.0)
+            pessimistic = math.exp(means[best_i] + confidence_z * stds[best_i] * scale)
             deviate = pessimistic < (1.0 - min_relative_gain)
         else:
             # Legacy absolute-latency bundles: compare against native's own
@@ -119,6 +147,8 @@ def evaluate_setting(
             served = latencies[best_i]
             if served > native_ms:
                 n_regressed += 1
+                if native_ms > 0:
+                    worst_regression_ratio = max(worst_regression_ratio, served / native_ms)
         else:
             served = native_ms
         served_total += served
@@ -137,34 +167,113 @@ def evaluate_setting(
         "net_improvement_pct": ((native_total - served_total) / native_total * 100)
         if native_total
         else 0.0,
+        "worst_regression_ratio": worst_regression_ratio,
     }
 
 
-def sweep(policy: str = "greedy", max_regression_rate: float = 0.34) -> dict:
+# Two settings whose net improvement differs by less than this are treated as
+# equal, and the safer one wins. Net improvement is a sum dominated by a few
+# expensive queries; a fraction of a percent of it is noise, and trading a
+# measured regression rate for noise is the mistake this exists to stop.
+TIE_FRACTION = 0.05
+
+
+def _dominates(candidate: dict, incumbent: dict | None) -> bool:
+    """
+    Is `candidate` the better gate?
+
+    More net improvement wins, *unless* the two are within `TIE_FRACTION` of
+    each other, in which case the one that regresses less often wins, and a
+    milder worst case breaks a remaining tie. Plain `max(...)` on net
+    improvement is what let a 0% regression rate be traded for 0.4% of gain.
+    """
+    if incumbent is None:
+        return True
+
+    best_net = max(abs(candidate["net_improvement_ms"]), abs(incumbent["net_improvement_ms"]))
+    close = abs(candidate["net_improvement_ms"] - incumbent["net_improvement_ms"]) <= (
+        TIE_FRACTION * best_net
+    )
+    if not close:
+        return candidate["net_improvement_ms"] > incumbent["net_improvement_ms"]
+
+    if candidate["regression_rate"] != incumbent["regression_rate"]:
+        return candidate["regression_rate"] < incumbent["regression_rate"]
+    if candidate["worst_regression_ratio"] != incumbent["worst_regression_ratio"]:
+        return candidate["worst_regression_ratio"] < incumbent["worst_regression_ratio"]
+
+    # Genuinely indistinguishable on this sample: prefer the stricter gate.
+    # Strictness is free here -- the net improvement and the regression rate are
+    # the same either way -- and it is not free later, because the sample the
+    # gate was chosen on is small and the next query need not resemble it. A
+    # setting with `confidence_z = 0` ignores the model's uncertainty entirely,
+    # so it has nothing to fall back on when it meets a query the sweep never
+    # saw; among equals, the one that still consults sigma is the safer bet.
+    return (candidate["confidence_z"], candidate["min_relative_gain"]) > (
+        incumbent["confidence_z"], incumbent["min_relative_gain"]
+    )
+
+
+def sweep(policy: str = "greedy", max_regression_rate: float = 0.05) -> dict:
+    """
+    Grid-sweep the gate and recommend a setting.
+
+    `max_regression_rate` defaults to 0.05, not 0.34. The old ceiling admitted
+    every setting on the grid, so the constraint the module docstring describes
+    as "the important one" never actually excluded anything.
+    """
     grouped = _grouped_rows()
     bundle = _load_bundle()
 
+    held_out = _held_out_queries(bundle, grouped)
+    scored = {qid: rows for qid, rows in grouped.items() if qid in held_out} if held_out else grouped
+
     results = [
-        evaluate_setting(grouped, bundle, z, g, policy=policy)
+        evaluate_setting(scored, bundle, z, g, policy=policy)
         for z in CONFIDENCE_Z_GRID
         for g in MIN_RELATIVE_GAIN_GRID
     ]
 
     # Only consider settings that actually optimize something -- a gate that
     # never fires has a perfect (vacuous) regression rate.
-    viable = [
-        r for r in results
-        if r["regression_rate"] <= max_regression_rate and r["deviation_rate"] > 0.0
-    ]
-    best = max(viable, key=lambda r: r["net_improvement_ms"], default=None)
+    best = None
+    for result in results:
+        if result["deviation_rate"] <= 0.0 or result["regression_rate"] > max_regression_rate:
+            continue
+        if _dominates(result, best):
+            best = result
 
     return {
         "policy": policy,
         "max_regression_rate": max_regression_rate,
         "n_settings_tested": len(results),
+        # Which queries the gate was chosen on, and whether the model had
+        # already seen them. A gate tuned on the queries the model trained on
+        # is tuned against memorised predictions, and docs/WRITEUP.md 2.2.1
+        # already documents how optimistic that is.
+        "evaluated_on": "held_out_queries" if held_out else "all_queries_in_sample",
+        "n_queries_scored": len(scored),
         "recommended": best,
         "all_settings": sorted(results, key=lambda r: -r["net_improvement_ms"]),
     }
+
+
+def _held_out_queries(bundle: dict, grouped: dict[str, list[dict]]) -> set[str]:
+    """
+    The queries the model did not train on, if the bundle recorded them.
+
+    Calibrating on every logged query means most of the sweep is scored against
+    predictions the model fitted, where a gate with no safety margin looks
+    perfectly safe -- and then does not behave that way on the ad-hoc queries a
+    dashboard sends it. Bundles trained before this was recorded fall back to
+    the whole set, and `sweep` reports which happened.
+    """
+    recorded = set(bundle.get("held_out_queries") or ())
+    usable = {qid for qid in recorded if qid in grouped}
+    # Below a handful of queries the rates are too coarse to choose between
+    # settings, and an in-sample sweep over everything is the lesser evil --
+    # reported as such rather than silently substituted.
+    return usable if len(usable) >= 4 else set()
 
 
 def apply_gate(setting: dict, path: str = GATE_PATH) -> None:
@@ -177,6 +286,7 @@ def apply_gate(setting: dict, path: str = GATE_PATH) -> None:
                 "calibrated_on_n_queries": setting["n_queries"],
                 "expected_deviation_rate": setting["deviation_rate"],
                 "expected_regression_rate": setting["regression_rate"],
+                "expected_worst_regression_ratio": setting["worst_regression_ratio"],
             },
             f,
             indent=2,
@@ -194,17 +304,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", default="greedy",
                         choices=["greedy", "thompson", "risk_averse", "pairwise_rank"])
-    parser.add_argument("--max-regression-rate", type=float, default=0.34)
+    parser.add_argument("--max-regression-rate", type=float, default=0.05)
     parser.add_argument("--apply", action="store_true", help="write the recommendation to models/gate.json")
     args = parser.parse_args()
 
     report = sweep(policy=args.policy, max_regression_rate=args.max_regression_rate)
 
-    print(f"{'z':>5} {'min_gain':>9} {'deviate%':>9} {'regress%':>9} {'net_ms':>10} {'net%':>7}")
+    print(
+        f"scored on {report['n_queries_scored']} queries ({report['evaluated_on']})\n"
+    )
+    print(
+        f"{'z':>5} {'min_gain':>9} {'deviate%':>9} {'regress%':>9} "
+        f"{'worst':>7} {'net_ms':>10} {'net%':>7}"
+    )
     for r in report["all_settings"][:14]:
         print(
             f"{r['confidence_z']:>5.2f} {r['min_relative_gain']:>9.2f} "
             f"{r['deviation_rate'] * 100:>8.0f}% {r['regression_rate'] * 100:>8.0f}% "
+            f"{r['worst_regression_ratio']:>6.2f}x "
             f"{r['net_improvement_ms']:>10.1f} {r['net_improvement_pct']:>6.1f}%"
         )
 

@@ -7,3 +7,4 @@ numpy==2.1.1
 python-dotenv==1.0.1
 lightgbm==4.5.0
 pytest==8.3.3
+ruff==0.16.2

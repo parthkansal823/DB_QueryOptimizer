@@ -30,6 +30,15 @@ jobs:
         working-directory: backend
         run: pip install -r requirements.txt
 
+      # The rules were already the project's own, but they lived in
+      # `.trunk/configs/ruff.toml`, which `.gitignore` excludes -- so they ran
+      # on one machine and nowhere else. The frontend job has been gated on
+      # `oxlint` from the start; the backend was gated on nothing. Config now
+      # lives in `backend/ruff.toml`.
+      - name: Lint
+        working-directory: backend
+        run: ruff check app tests
+
       # No database service here on purpose. The unit suite must stay runnable
       # without infrastructure -- it was not, until the connection pool stopped
       # being built at import time, and this job is what keeps it that way.

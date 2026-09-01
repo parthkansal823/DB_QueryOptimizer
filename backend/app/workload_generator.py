@@ -190,11 +190,15 @@ def _pick_projection(graph: SchemaGraph, table: str) -> str:
     return columns[0] if columns else "*"
 
 
+def _normalized(sql: str) -> str:
+    return " ".join(sql.split())
+
+
 def generate_workload(
     cur,
     graph: SchemaGraph,
     n_queries: int = 25,
-    join_widths: tuple[int, ...] = (2, 3, 4),
+    join_widths: tuple[int, ...] | None = None,
     seed: int = 42,
 ) -> list[dict]:
     """
@@ -202,25 +206,65 @@ def generate_workload(
 
     Returns the same shape `workload.py` uses, so every downstream consumer
     (`collect_data`, `train`, `benchmark`) works unchanged.
+
+    ## Why this draws repeatedly from the same table subsets
+
+    It used to produce **at most one query per connected subset of tables**,
+    which silently capped the workload at the number of such subsets. On the
+    six-table synthetic schema that is about fourteen, so asking for 120
+    queries returned 12 and there was nothing to say why.
+
+    That cap is not a real one. A subset of tables admits many genuinely
+    different queries -- `build_predicate` picks a column and a literal sampled
+    from the actual data, so drawing again over the same tables gives different
+    filters, different selectivities and a different plan space. Throwing that
+    away was leaving most of the available diversity unused.
+
+    Query *count* is what was scarce, and it is what everything downstream is
+    short of: `app.calibrate` chooses the safety gate from held-out queries and
+    was working with six of them, where a regression rate moves in steps of 17%.
+    Rows do not help with that; distinct queries do.
+
+    Deduplicated on normalised SQL, so a redraw that happens to reproduce an
+    earlier query does not fill the quota twice. `seed` still makes the whole
+    workload reproducible.
     """
     rng = random.Random(seed)
+    # Widths are capped by the schema rather than hardcoded: a 6-table schema
+    # can support 5-way joins, and those are where the interesting plan spaces
+    # are (docs/WRITEUP.md 2.9 built its correlation traps out of 5- and
+    # 6-way joins).
+    if join_widths is None:
+        widest = min(5, max(2, len(graph.tables)))
+        join_widths = tuple(range(2, widest + 1))
+
     workload: list[dict] = []
+    seen: set[str] = set()
     per_width = max(1, n_queries // len(join_widths))
 
     for width in join_widths:
         if len(graph.tables) < width:
             continue
-        subsets = graph.connected_subsets(width, limit=per_width * 4)
+        subsets = graph.connected_subsets(width, limit=max(per_width * 4, 32))
+        if not subsets:
+            continue
         rng.shuffle(subsets)
 
         made = 0
-        for subset in subsets:
+        # Bounded so a subset that cannot yield anything new -- a table with one
+        # filterable column, say -- cannot spin here.
+        for attempt in range(per_width * 8):
             if made >= per_width or len(workload) >= n_queries:
                 break
+            subset = subsets[attempt % len(subsets)]
             built = _build_query(cur, graph, subset, rng)
             if built is None:
                 continue
             sql, tags = built
+            key = _normalized(sql)
+            if key in seen:
+                continue
+            seen.add(key)
             workload.append(
                 {
                     "id": f"auto_{width}w_{len(workload):02d}_" + "_".join(tags[:1]),

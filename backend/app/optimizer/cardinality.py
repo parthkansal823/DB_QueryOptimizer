@@ -171,7 +171,7 @@ class CardinalityCorrector:
 
         if not rows:
             return {}
-        return dict(zip(aliases, (float(v) for v in self.model.predict(rows))))
+        return dict(zip(aliases, (float(v) for v in self.model.predict(rows)), strict=True))
 
     def corrected_rows(self, plan: dict) -> dict[str, float]:
         """alias -> the row count this model thinks the scan will really return."""

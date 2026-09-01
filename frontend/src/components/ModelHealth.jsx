@@ -21,7 +21,43 @@ function VersionRow({ version }) {
   );
 }
 
-export default function ModelHealth({ status, onRetrain, onRollback, busy }) {
+// Findings from /model/diagnostics.
+//
+// The rest of this panel answers "what is deployed" and the trend chart answers
+// "how has it done". Neither answers "and should I believe it", which is the
+// question you have when a served plan predicted at 0.92x native turns out 1.5x
+// slower. Every finding here is one that had actually shipped and was invisible
+// from the dashboard: a gate multiplying the model's uncertainty by zero,
+// calibrated in-sample, on five queries. See backend app/diagnostics.py.
+function Findings({ diagnostics }) {
+  if (!diagnostics) return null;
+  const findings = diagnostics.warnings ?? [];
+
+  if (findings.length === 0) {
+    return (
+      <p className="decision-note" style={{ marginBottom: 16 }}>
+        No problems found with the model or its safety gate.
+      </p>
+    );
+  }
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <h3 style={{ marginBottom: 8 }}>Findings</h3>
+      <ul className="findings-list">
+        {findings.map((f) => (
+          <li key={f.code} className={`finding finding-${f.severity}`}>
+            <span className="badge badge-native">{f.severity}</span>{" "}
+            <strong>{f.code.replace(/_/g, " ")}</strong>
+            <div>{f.detail}</div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default function ModelHealth({ status, diagnostics, onRetrain, onRollback, busy }) {
   const [message, setMessage] = useState(null);
 
   if (!status) return <div className="empty-state">Could not load model status.</div>;
@@ -36,6 +72,7 @@ export default function ModelHealth({ status, onRetrain, onRollback, busy }) {
 
   return (
     <div>
+      <Findings diagnostics={diagnostics} />
       <div className="stat-row" style={{ marginBottom: 16 }}>
         <div className="stat-tile">
           <div className="label">Serving</div>

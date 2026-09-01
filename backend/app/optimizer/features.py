@@ -36,6 +36,8 @@ producing the vectors they were trained on.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from app.optimizer.plan_tree import TREE_FEATURES, encode_plan_tree
 
 BASE_FEATURES = [
@@ -59,8 +61,26 @@ def build_feature_columns(known_tables: list[str]) -> list[str]:
     (what's *in* it). Only the last block is schema-dependent, which is why
     the same model shape transfers across datasets.
     """
-    per_table = [f"{table}_{suffix}" for table in sorted(known_tables) for suffix in PER_TABLE_SUFFIXES]
-    return BASE_FEATURES + TREE_FEATURES + per_table
+    return list(_columns_for(tuple(sorted(known_tables))))
+
+
+@lru_cache(maxsize=8)
+def _columns_for(known_tables: tuple[str, ...]) -> tuple[str, ...]:
+    """
+    The same list, memoised on the table set it is derived from.
+
+    `featurize` rebuilds this for *every candidate plan it is handed*, and the
+    result depends only on which tables exist -- which does not change between
+    the candidates for one query, or between the queries in one run. On JOB's
+    21-table schema that is 105 interpolated strings per candidate, thrown away
+    and rebuilt for the next one, on the path whose cost decides whether the
+    production optimizer pays for itself.
+
+    A tuple is returned so a caller cannot mutate the cached list; the public
+    function above hands out a fresh copy.
+    """
+    per_table = [f"{table}_{suffix}" for table in known_tables for suffix in PER_TABLE_SUFFIXES]
+    return tuple(BASE_FEATURES + TREE_FEATURES + per_table)
 
 
 def _scan_info_by_alias(plan: dict) -> dict[str, dict]:
@@ -95,8 +115,8 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
     was trained with (the pickled bundle carries it) to keep inference
     vectors shaped like training vectors.
     """
-    known_tables = sorted(table_cardinalities)
-    feature_columns = build_feature_columns(known_tables)
+    known_tables = tuple(sorted(table_cardinalities))
+    feature_columns = _columns_for(known_tables)
 
     tables_scanned = candidate_plan.get("tables_scanned", [])
     scan_relations = candidate_plan.get("scan_relations", {})

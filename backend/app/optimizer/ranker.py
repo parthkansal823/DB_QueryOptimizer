@@ -60,7 +60,7 @@ class PairwisePlanRanker:
 
     @staticmethod
     def _difference(a: list[float], b: list[float]) -> list[float]:
-        return [x - y for x, y in zip(a, b)]
+        return [x - y for x, y in zip(a, b, strict=True)]
 
     def build_pairs(self, groups: list[tuple[list[list[float]], list[float]]]):
         """
@@ -121,16 +121,29 @@ class PairwisePlanRanker:
             probs = list(self.model.predict(comparisons))
 
         wins = [0.0] * n
-        for (i, j), p_i_faster in zip(index_pairs, probs):
+        for (i, j), p_i_faster in zip(index_pairs, probs, strict=True):
             wins[i] += p_i_faster
             wins[j] += 1.0 - p_i_faster
 
         total = n - 1
         return [w / total for w in wins]
 
-    def select(self, vectors: list[list[float]], tie_break_costs: list[float] | None = None) -> int:
-        """Index of the highest-scoring candidate."""
-        scores = self.scores(vectors)
+    def select(
+        self,
+        vectors: list[list[float]],
+        tie_break_costs: list[float] | None = None,
+        scores: list[float] | None = None,
+    ) -> int:
+        """
+        Index of the highest-scoring candidate.
+
+        `scores` lets a caller that already has them -- `learned.py` reports the
+        full score vector on every decision, so it does -- avoid a second pass.
+        Scoring is O(n^2) in the candidate count (every pair is a classifier
+        call), so on a 20-candidate query the duplicate pass was 190 avoidable
+        comparisons per served query.
+        """
+        scores = self.scores(vectors) if scores is None else scores
         best = max(scores)
         winners = [i for i, s in enumerate(scores) if s >= best - 1e-9]
         if len(winners) == 1 or tie_break_costs is None:

@@ -3,8 +3,11 @@ import {
   analyzeQuery,
   fetchAdvisor,
   fetchCostModel,
+  fetchExperimentStatus,
+  fetchModelDiagnostics,
   fetchModelStatus,
   fetchSchema,
+  startExperiment,
   fetchTrend,
   optimizeQuery,
   triggerRetrain,
@@ -14,6 +17,7 @@ import CostModelChart from "./components/CostModelChart";
 import CumulativeChart from "./components/CumulativeChart";
 import DecisionQuality from "./components/DecisionQuality";
 import LatencyChart from "./components/LatencyChart";
+import ExperimentPanel from "./components/ExperimentPanel";
 import ModelHealth from "./components/ModelHealth";
 import OptimizedQuery from "./components/OptimizedQuery";
 import Recommendations from "./components/Recommendations";
@@ -31,6 +35,8 @@ export default function DemoPage() {
   const [trend, setTrend] = useState(null);
   const [trendError, setTrendError] = useState(null);
   const [modelStatus, setModelStatus] = useState(null);
+  const [modelDiagnostics, setModelDiagnostics] = useState(null);
+  const [experiment, setExperiment] = useState(null);
   const [modelBusy, setModelBusy] = useState(false);
   const [schema, setSchema] = useState(null);
   const [production, setProduction] = useState(null);
@@ -48,11 +54,36 @@ export default function DemoPage() {
     }
   }
 
+  async function loadExperiment() {
+    try {
+      setExperiment(await fetchExperimentStatus());
+    } catch {
+      setExperiment(null);
+    }
+  }
+
+  async function handleStartExperiment(body) {
+    setExperiment(await startExperiment(body));
+    // A comparison is minutes to hours, so poll rather than await it.
+    const timer = setInterval(async () => {
+      const next = await fetchExperimentStatus();
+      setExperiment(next);
+      if (!next.is_running) clearInterval(timer);
+    }, 5000);
+  }
+
   async function loadModelStatus() {
     try {
       setModelStatus(await fetchModelStatus());
     } catch {
       setModelStatus(null);
+    }
+    // Fetched separately so a backend too old to serve it still renders the
+    // rest of the panel rather than blanking it.
+    try {
+      setModelDiagnostics(await fetchModelDiagnostics());
+    } catch {
+      setModelDiagnostics(null);
     }
   }
 
@@ -74,6 +105,7 @@ export default function DemoPage() {
     loadSchema();
     loadAdvisor();
     loadCostModel();
+    loadExperiment();
   }, []);
 
   async function handleProductionRun() {
@@ -173,9 +205,15 @@ export default function DemoPage() {
       )}
 
       <section className="card">
+        <h2>Settle a comparison</h2>
+        <ExperimentPanel status={experiment} onStart={handleStartExperiment} busy={modelBusy} />
+      </section>
+
+      <section className="card">
         <h2>Model health</h2>
         <ModelHealth
           status={modelStatus}
+          diagnostics={modelDiagnostics}
           busy={modelBusy}
           onRetrain={() => runModelAction(triggerRetrain)}
           onRollback={() => runModelAction(triggerRollback)}

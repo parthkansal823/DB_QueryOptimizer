@@ -245,9 +245,19 @@ def generate_candidates(
     include_join_methods: bool = False,
     max_method_orders: int = 4,
     include_hint_sets: bool = True,
+    include_tuning: bool = False,
     join_graph: dict[str, list[str]] | None = None,
 ) -> list[str]:
-    """Order-only candidates, plus (opt-in) order x method, plus hint sets."""
+    """
+    Order-only candidates, plus (opt-in) order x method, plus hint sets, plus
+    (opt-in) resource and cost-model settings.
+
+    `include_tuning` is separate from `include_hint_sets` because the two are
+    different kinds of action. A hint set removes an operator from the
+    planner's menu; a tuning setting changes what the executor is given to work
+    with, and can beat every plan shape on the menu without changing the shape
+    at all.
+    """
     candidates = generate_join_order_candidates(
         tables, max_candidates=max_order_candidates, join_graph=join_graph
     )
@@ -255,6 +265,8 @@ def generate_candidates(
         candidates += generate_join_method_candidates(tables, max_orders=max_method_orders)
     if include_hint_sets:
         candidates += generate_hint_sets()
+    if include_tuning:
+        candidates += generate_tuning_candidates()
     return candidates
 
 
@@ -291,6 +303,53 @@ HINT_SETS: tuple[tuple[str, ...], ...] = (
     ("enable_mergejoin", "enable_seqscan"),
     ("enable_material",),
 )
+
+
+# -- Resource and cost-model settings --------------------------------------
+#
+# Every family above changes the *shape* of the plan: which order, which join
+# operator, which scan. None of them changes what the executor is given to work
+# with, and on this database two of those levers move latency more than plan
+# shape does.
+#
+# **Parallelism.** Postgres will only consider a parallel plan when the table is
+# large enough and `max_parallel_workers_per_gather` allows it, and the decision
+# is made on estimates this project exists because it distrusts. Forcing workers
+# on turns a sequential scan of a large table into a parallel one; forcing them
+# off removes Gather nodes whose startup cost is not repaid on a small result.
+# Neither is reachable through any `Leading()` or operator toggle.
+#
+# **work_mem.** A hash join whose hash table does not fit spills to disk in
+# batches, and a sort that does not fit becomes an external merge. Both are
+# large, cliff-edged latency effects that the planner prices only through its
+# estimate of the input size -- the estimate that is wrong. Raising work_mem is
+# the single most common fix for a slow analytical query in practice, and the
+# planner cannot choose it for itself.
+#
+# `random_page_cost` retunes the cost model toward index scans (the standard
+# adjustment for storage that is not a spinning disk), and the collapse limits
+# change how much of the join tree the planner is willing to reorder at all --
+# `join_collapse_limit 1` pins the order written in the query, which is a
+# genuinely different action from any `Leading()` hint because it also stops
+# subquery pull-up.
+#
+# Values are given as plain numbers so no quoting is involved: `work_mem` is in
+# kilobytes, so 65536 is 64MB. These are `Set()` hints, which pg_hint_plan
+# applies for the statement only, so nothing here leaks into the session.
+TUNING_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("max_parallel_workers_per_gather", "4"),
+    ("max_parallel_workers_per_gather", "0"),
+    ("work_mem", "65536"),
+    ("random_page_cost", "1.1"),
+    ("join_collapse_limit", "1"),
+)
+
+
+def generate_tuning_candidates(
+    settings: tuple[tuple[str, str], ...] = TUNING_SETTINGS,
+) -> list[str]:
+    """One candidate per resource / cost-model setting worth trying."""
+    return [f"/*+ Set({guc} {value}) */" for guc, value in settings]
 
 
 def generate_hint_sets(hint_sets: tuple[tuple[str, ...], ...] = HINT_SETS) -> list[str]:

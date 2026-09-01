@@ -253,7 +253,7 @@ def _spearman(xs: list[float], ys: list[float]) -> float | None:
 
     rx, ry = _rank(xs), _rank(ys)
     mx, my = sum(rx) / n, sum(ry) / n
-    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
     vx = sum((a - mx) ** 2 for a in rx)
     vy = sum((b - my) ** 2 for b in ry)
     return cov / (vx * vy) ** 0.5 if vx and vy else None
@@ -395,7 +395,7 @@ def served_vs_native(cur, limit: int = 2000) -> dict:
     """
     cur.execute(RUNS_SQL, (COLLECTION_SELECTOR, limit))
     columns = [c[0] for c in cur.description]
-    runs = [dict(zip(columns, row)) for row in cur.fetchall()]
+    runs = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
     cur.execute(COUNTS_SQL, (COLLECTION_SELECTOR,))
     n_rows, n_collection, n_queries = cur.fetchone()

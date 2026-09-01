@@ -30,12 +30,29 @@ from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 
 
+# A single candidate must not be able to stall the whole run.
+#
+# `app.collect_data` has always capped this; `app.benchmark` did not, and the
+# omission is not theoretical: a `Set(enable_hashjoin off) Set(enable_mergejoin
+# off)` candidate on a 4-way join forces nested loops over the lot and was
+# still executing after **eleven minutes**, with the other 20 queries behind it
+# and no output, because there was nothing to stop it.
+#
+# The savepoint around each candidate already turns a failure into a skip, so a
+# cancelled statement lands in exactly the path a rejected hint uses. Capping
+# the time therefore converts an unbounded hang into a candidate the run
+# reports itself as having skipped -- which is also the honest answer, since a
+# plan that takes minutes is not one this optimizer would ever want to serve.
+DEFAULT_STATEMENT_TIMEOUT_MS = 30_000
+
+
 def run(
     policy: str = "greedy",
     risk_lambda: float = 1.0,
     use_guard: bool = True,
     quiet: bool = False,
     limit: int | None = None,
+    statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
 ) -> dict:
     """Run the workload and return the run's metrics.
 
@@ -55,6 +72,7 @@ def run(
     n_guarded = 0
 
     with get_cursor() as cur:
+        cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
         guard = RegressionGuard()
         if use_guard:
             blocked = guard.refresh(cur)
@@ -172,5 +190,16 @@ if __name__ == "__main__":
     parser.add_argument("--policy", choices=list(POLICIES) + ["pairwise_rank"], default="greedy")
     parser.add_argument("--risk-lambda", type=float, default=1.0)
     parser.add_argument("--no-guard", action="store_true", help="disable the per-query regression guard")
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=DEFAULT_STATEMENT_TIMEOUT_MS,
+        help="per-candidate statement_timeout; a slower candidate is skipped, not waited for",
+    )
     args = parser.parse_args()
-    run(policy=args.policy, risk_lambda=args.risk_lambda, use_guard=not args.no_guard)
+    run(
+        policy=args.policy,
+        risk_lambda=args.risk_lambda,
+        use_guard=not args.no_guard,
+        statement_timeout_ms=args.timeout_ms,
+    )

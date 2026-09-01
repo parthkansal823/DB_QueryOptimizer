@@ -205,31 +205,43 @@ def _baseline(plan):
     return {"raw_plan": plan}
 
 
+def _without_corrector(plan):
+    """
+    The action space a query gets when no cardinality corrector is trained.
+
+    Taken from `candidate_hints` rather than from `generate_candidates` with
+    default arguments: the two differ whenever a hint family's serving default
+    differs from its function default, and these tests are about what the
+    *corrector* adds, not about which families are switched on.
+    """
+    from app.optimizer.planner import candidate_hints
+
+    return candidate_hints(_Optimizer(), _baseline(plan), ["a", "b"])
+
+
 def test_without_a_corrector_the_action_space_is_unchanged():
     from app.optimizer.hints import generate_candidates
     from app.optimizer.planner import candidate_hints
 
     plan = _join([_scan("a", 100), _scan("b", 100)], 10)
     assert candidate_hints(_Optimizer(), _baseline(plan), ["a", "b"]) == generate_candidates(
-        ["a", "b"]
+        ["a", "b"], include_tuning=True
     )
 
 
 def test_a_trained_corrector_adds_exactly_one_candidate():
-    from app.optimizer.hints import generate_candidates
     from app.optimizer.planner import candidate_hints
 
     plan = _join([_scan("a", 100), _scan("b", 100)], 10)
     hints = candidate_hints(_Optimizer(_corrector(math.log(10))), _baseline(plan), ["a", "b"])
-    assert len(hints) == len(generate_candidates(["a", "b"])) + 1
+    assert len(hints) == len(_without_corrector(plan)) + 1
     assert hints[-1] == "/*+ Rows(a b *10) */"
 
 
 def test_a_confident_but_tiny_correction_adds_nothing():
     """The extra candidate costs a plan cycle; it has to be worth one."""
-    from app.optimizer.hints import generate_candidates
     from app.optimizer.planner import candidate_hints
 
     plan = _join([_scan("a", 100), _scan("b", 100)], 10)
     hints = candidate_hints(_Optimizer(_corrector(math.log(1.05))), _baseline(plan), ["a", "b"])
-    assert hints == generate_candidates(["a", "b"])
+    assert hints == _without_corrector(plan)

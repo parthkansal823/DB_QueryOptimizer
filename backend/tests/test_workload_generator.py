@@ -107,3 +107,109 @@ def test_generation_is_deterministic_for_a_fixed_seed():
 def test_widths_larger_than_the_schema_are_skipped():
     g = _graph()  # only 2 tables
     assert generate_workload(_FakeCursor(), g, n_queries=5, join_widths=(4,)) == []
+
+
+# -- query count was capped by the number of table subsets -------------------
+
+
+class _CountingGraph:
+    """A schema graph whose connected subsets are fixed and few."""
+
+    def __init__(self, subsets):
+        self.tables = ["a", "b", "c", "d", "e", "f"]
+        self._subsets = subsets
+
+    def connected_subsets(self, width, limit=None):
+        return [s for s in self._subsets if len(s) == width][: limit or None]
+
+    def join_condition(self, left, right):  # pragma: no cover - unused here
+        return None
+
+
+def test_more_queries_than_table_subsets_can_be_generated(monkeypatch):
+    """
+    The cap this removes. One query per connected subset silently limited the
+    six-table schema to about a dozen queries, so asking for 120 returned 12 --
+    and query count is exactly what `app.calibrate` is short of, since it
+    chooses the safety gate from held-out queries.
+    """
+    from app import workload_generator
+
+    graph = _CountingGraph([["a", "b"], ["b", "c"]])
+    drawn = iter(range(10_000))
+    monkeypatch.setattr(
+        workload_generator,
+        "_build_query",
+        lambda cur, g, tables, rng: (f"SELECT {next(drawn)} FROM x", ["t"]),
+    )
+
+    workload = workload_generator.generate_workload(
+        None, graph, n_queries=40, join_widths=(2,)
+    )
+
+    assert len(workload) == 40  # far more than the two available subsets
+
+
+def test_repeated_draws_that_collide_do_not_fill_the_quota_twice(monkeypatch):
+    """A redraw reproducing an earlier query is not a new query."""
+    from app import workload_generator
+
+    graph = _CountingGraph([["a", "b"]])
+    monkeypatch.setattr(
+        workload_generator,
+        "_build_query",
+        lambda cur, g, tables, rng: ("SELECT 1 FROM x", ["t"]),
+    )
+
+    workload = workload_generator.generate_workload(
+        None, graph, n_queries=20, join_widths=(2,)
+    )
+
+    assert len(workload) == 1
+
+
+def test_a_subset_that_yields_nothing_does_not_spin(monkeypatch):
+    from app import workload_generator
+
+    graph = _CountingGraph([["a", "b"]])
+    monkeypatch.setattr(
+        workload_generator, "_build_query", lambda cur, g, tables, rng: None
+    )
+
+    assert workload_generator.generate_workload(
+        None, graph, n_queries=50, join_widths=(2,)
+    ) == []
+
+
+def test_join_widths_follow_the_schema_rather_than_a_hardcoded_tuple(monkeypatch):
+    """A six-table schema supports 5-way joins, and those are where the
+    interesting plan spaces are -- the correlation traps in the writeup are
+    built out of 5- and 6-way joins."""
+    from app import workload_generator
+
+    graph = _CountingGraph([["a", "b", "c", "d", "e"]])
+    monkeypatch.setattr(
+        workload_generator,
+        "_build_query",
+        lambda cur, g, tables, rng: (f"SELECT {len(tables)} FROM x", ["t"]),
+    )
+
+    workload = workload_generator.generate_workload(None, graph, n_queries=10)
+
+    assert any(q["join_width"] == 5 for q in workload)
+
+
+def test_generation_is_still_reproducible(monkeypatch):
+    from app import workload_generator
+
+    graph = _CountingGraph([["a", "b"], ["b", "c"]])
+
+    def build(cur, g, tables, rng):
+        return f"SELECT {rng.random()} FROM x", ["t"]
+
+    monkeypatch.setattr(workload_generator, "_build_query", build)
+
+    first = workload_generator.generate_workload(None, graph, n_queries=15, join_widths=(2,))
+    second = workload_generator.generate_workload(None, graph, n_queries=15, join_widths=(2,))
+
+    assert [q["sql"] for q in first] == [q["sql"] for q in second]

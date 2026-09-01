@@ -132,7 +132,8 @@ def test_a_successful_validation_releases_its_savepoint():
 
 def test_a_hand_edited_entry_without_a_name_does_not_break_the_list():
     """The store is a plain JSON file people will edit."""
-    import json, os
+    import json
+    import os
     os.makedirs(saved_queries.QUERIES_DIR, exist_ok=True)
     with open(saved_queries._path_for(URL), "w") as f:
         json.dump([{"sql": "SELECT 1"}], f)  # no "name"

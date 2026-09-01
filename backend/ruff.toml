@@ -1,0 +1,26 @@
+# Backend lint rules.
+#
+# These were already the project's rules, but they lived in
+# `.trunk/configs/ruff.toml`, which `.gitignore` excludes -- so a fresh clone
+# had no Python linting at all, and neither did CI. The frontend has been
+# gated on `oxlint` since it was added; the backend was gated on nothing.
+# Moving the config here makes it versioned, reviewable, and enforceable by
+# `.github/workflows/ci.yml`.
+#
+# Same selection as before, expressed in the `lint` section rather than at the
+# top level, which newer ruff deprecates.
+
+target-version = "py311"
+
+[lint]
+# B  -- bugbear: the mistakes that still run. `zip()` without `strict=`
+#       silently truncating to the shorter sequence is the one that matters
+#       here, given how much of this code zips a prediction against its input.
+# D3 -- docstring escapes, since this codebase carries its reasoning in
+#       docstrings and a stray backslash quietly mangles one.
+# E/F -- pycodestyle errors and pyflakes.
+select = ["B", "D3", "E", "F"]
+
+# Line length is a formatter's job, not a linter's, and this codebase runs to
+# long explanatory comments by design.
+ignore = ["E501"]
