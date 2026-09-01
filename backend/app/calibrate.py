@@ -65,7 +65,12 @@ from app.train import _aggregate_repetitions, _load_rows, _row_to_candidate
 
 GATE_PATH = "models/gate.json"
 
-CONFIDENCE_Z_GRID = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+# Finer at the bottom than it looks. `learned.py` multiplies sigma by the
+# measured `uncertainty_scale` before spending `z` on it, and that factor is
+# around 4 on this data -- so z = 0.25 is already a full standard deviation and
+# the old grid's first step jumped from "no margin at all" to "one sigma". The
+# useful region turned out to live between them.
+CONFIDENCE_Z_GRID = [0.0, 0.05, 0.1, 0.15, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
 MIN_RELATIVE_GAIN_GRID = [0.0, 0.02, 0.05, 0.10, 0.20]
 
 
@@ -76,11 +81,41 @@ def _load_bundle(path: str = "models/plan_selector.pkl") -> dict:
         return pickle.load(f)
 
 
-def _grouped_rows() -> dict[str, list[dict]]:
+def _grouped_rows(exclude_prefix: str | None = None) -> dict[str, list[dict]]:
+    """
+    Logged rows grouped by query, optionally dropping a family of query ids.
+
+    ## Why a gate has to be calibrated on the traffic it will serve
+
+    The threshold this module picks is a statement about one quantity: how the
+    model's error compares to the headroom actually available. Measured here,
+    those differ sharply by where the queries came from:
+
+        auto-generated (app.onboard)   121 queries, 12.3% mean headroom
+        built-in workload               32 queries, 40.5% mean headroom
+
+    and the model's typical error is around 24%. On the first group the error
+    exceeds the headroom, so declining to act is correct. On the second there is
+    three times more to win than the model is typically wrong by, and acting is
+    correct.
+
+    A single sweep over both is dominated by whichever group is larger, and
+    picks a threshold right for neither. That is what happened: a gate
+    calibrated over 121 auto-generated and 32 built-in queries vetoed 22 of 24
+    built-in ones, where following the model would have captured 80.5% of the
+    available headroom.
+
+    So the population is a parameter. Generated queries are excellent *training*
+    data -- they took the model's typical error from 43% to 24% -- and a poor
+    basis for choosing a threshold that will be spent somewhere else.
+    """
     rows = _aggregate_repetitions(_load_rows())
     grouped: dict[str, list[dict]] = {}
     for row in rows:
-        grouped.setdefault(row["query_id"], []).append(row)
+        query_id = row["query_id"]
+        if exclude_prefix and str(query_id).startswith(exclude_prefix):
+            continue
+        grouped.setdefault(query_id, []).append(row)
     return grouped
 
 
@@ -90,6 +125,7 @@ def evaluate_setting(
     confidence_z: float,
     min_relative_gain: float,
     policy: str = "greedy",
+    max_regression_ratio: float = 1.25,
 ) -> dict:
     model = bundle["model"]
     feature_columns = bundle["feature_columns"]
@@ -130,11 +166,20 @@ def evaluate_setting(
             best_i, _ = select_index(model, vectors, policy=policy)
 
         if ratio_target:
-            # Same rescaling the served gate applies, or the sweep would be
-            # choosing `z` in different units from the ones it is spent in.
-            scale = float(bundle.get("uncertainty_scale") or 1.0)
-            pessimistic = math.exp(means[best_i] + confidence_z * stds[best_i] * scale)
-            deviate = pessimistic < (1.0 - min_relative_gain)
+            # Raw spread, matching what the served gate now spends `z` on --
+            # see `learned._upper_bound` for why the measured scale is not
+            # multiplied in at either end.
+            #
+            # Two conditions, mirroring `learned._select_against_native`: an
+            # expected win from the point estimate, and a bounded downside from
+            # the uncertainty. Sweeping the old single condition would tune a
+            # threshold the served gate no longer applies.
+            expected = math.exp(means[best_i])
+            pessimistic = math.exp(means[best_i] + confidence_z * stds[best_i])
+            deviate = (
+                expected < (1.0 - min_relative_gain)
+                and pessimistic < max_regression_ratio
+            )
         else:
             # Legacy absolute-latency bundles: compare against native's own
             # predicted latency instead of a ratio.
@@ -195,6 +240,10 @@ def _dominates(candidate: dict, incumbent: dict | None) -> bool:
         TIE_FRACTION * best_net
     )
     if not close:
+        # A materially larger win wins. Both settings have already passed the
+        # worst-case bound in `sweep`, so neither can be hiding a catastrophic
+        # regression, and preferring the smaller win purely for a lower
+        # regression *count* is how 333 ms got traded away to avoid 52 ms.
         return candidate["net_improvement_ms"] > incumbent["net_improvement_ms"]
 
     if candidate["regression_rate"] != incumbent["regression_rate"]:
@@ -214,15 +263,37 @@ def _dominates(candidate: dict, incumbent: dict | None) -> bool:
     )
 
 
-def sweep(policy: str = "greedy", max_regression_rate: float = 0.05) -> dict:
+def sweep(
+    policy: str = "greedy",
+    max_regression_rate: float = 0.25,
+    max_worst_regression: float = 1.25,
+    exclude_prefix: str | None = None,
+) -> dict:
     """
     Grid-sweep the gate and recommend a setting.
 
-    `max_regression_rate` defaults to 0.05, not 0.34. The old ceiling admitted
-    every setting on the grid, so the constraint the module docstring describes
-    as "the important one" never actually excluded anything.
+    ## Two bounds, because "how often" and "how badly" are different questions
+
+    The docstring above quotes the reason this constraint exists: *a single
+    user-facing query getting 3x slower outweighs a diffuse average win*. The
+    operative words are **3x slower**. Bounding only the regression *rate*
+    encodes a different claim -- that regressions are equally bad whatever
+    their size -- and on real data that claim is expensive.
+
+    Measured on the built-in workload, following the model everywhere captures
+    80.5% of the available headroom. A gate admitting no more than 5% of
+    deviations regressing captured 13.3%. The difference is 21 queries the gate
+    declined, of which **12 would have won 333 ms and 3 would have lost 52 ms**
+    -- six times more thrown away than protected, and not one of the three
+    losses was anywhere near the 3x the rule was written to prevent.
+
+    So `max_worst_regression` is the real safety bound: no single query may end
+    up more than this much slower than native. `max_regression_rate` stays as a
+    much looser sanity check on frequency. Together they say "a few small
+    losses are an acceptable price for many wins; one large loss is not", which
+    is what the project actually believes.
     """
-    grouped = _grouped_rows()
+    grouped = _grouped_rows(exclude_prefix=exclude_prefix)
     bundle = _load_bundle()
 
     held_out = _held_out_queries(bundle, grouped)
@@ -238,7 +309,11 @@ def sweep(policy: str = "greedy", max_regression_rate: float = 0.05) -> dict:
     # never fires has a perfect (vacuous) regression rate.
     best = None
     for result in results:
-        if result["deviation_rate"] <= 0.0 or result["regression_rate"] > max_regression_rate:
+        if result["deviation_rate"] <= 0.0:
+            continue
+        if result["worst_regression_ratio"] > max_worst_regression:
+            continue
+        if result["regression_rate"] > max_regression_rate:
             continue
         if _dominates(result, best):
             best = result
@@ -246,6 +321,8 @@ def sweep(policy: str = "greedy", max_regression_rate: float = 0.05) -> dict:
     return {
         "policy": policy,
         "max_regression_rate": max_regression_rate,
+        "max_worst_regression": max_worst_regression,
+        "excluded_prefix": exclude_prefix,
         "n_settings_tested": len(results),
         # Which queries the gate was chosen on, and whether the model had
         # already seen them. A gate tuned on the queries the model trained on
@@ -304,11 +381,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", default="greedy",
                         choices=["greedy", "thompson", "risk_averse", "pairwise_rank"])
-    parser.add_argument("--max-regression-rate", type=float, default=0.05)
+    parser.add_argument("--max-regression-rate", type=float, default=0.25)
+    parser.add_argument(
+        "--max-worst-regression", type=float, default=1.25,
+        help="no single query may end up more than this much slower than native",
+    )
+    parser.add_argument(
+        "--exclude-prefix", default=None,
+        help=(
+            "skip query ids starting with this when choosing the gate, e.g. "
+            "'auto_' to calibrate on your own workload rather than on generated "
+            "queries whose available headroom is much smaller"
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="write the recommendation to models/gate.json")
     args = parser.parse_args()
 
-    report = sweep(policy=args.policy, max_regression_rate=args.max_regression_rate)
+    report = sweep(
+        policy=args.policy,
+        max_regression_rate=args.max_regression_rate,
+        max_worst_regression=args.max_worst_regression,
+        exclude_prefix=args.exclude_prefix,
+    )
 
     print(
         f"scored on {report['n_queries_scored']} queries ({report['evaluated_on']})\n"

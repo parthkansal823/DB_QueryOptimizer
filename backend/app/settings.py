@@ -112,6 +112,21 @@ FIELDS: dict[str, dict] = {
         "env": "CONFORMAL_ALPHA",
         "default": 0.1,
     },
+    "max_regression_ratio": {
+        "type": "float", "min": 1.0, "max": 5.0, "step": 0.05,
+        "label": "Worst case allowed when deviating",
+        "group": "Safety gate",
+        "help": (
+            "How much slower than PostgreSQL the pessimistic case may be and "
+            "still be worth betting on. 1.25 = 'even if the model is wrong by "
+            "its own uncertainty, no more than 25% slower'. This is a ceiling "
+            "on risk, not a demand that the worst case also win -- requiring "
+            "that refused a measured 5.9x speedup because its worst case was a "
+            "13% loss."
+        ),
+        "env": "MAX_REGRESSION_RATIO",
+        "default": 1.25,
+    },
     "enable_rows_correction": {
         "type": "bool",
         "label": "Learned cardinality corrections",

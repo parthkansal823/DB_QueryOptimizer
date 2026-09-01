@@ -79,6 +79,7 @@ def _optimizer_from(values: dict) -> LearnedOptimizer:
         # Not part of `gate` above: which bound to apply is a plain choice with
         # no calibrated-file default to defer to, unlike the thresholds.
         gate_mode=values["gate_mode"],
+        max_regression_ratio=values["max_regression_ratio"],
         **gate,
     )
 

@@ -119,8 +119,12 @@ def test_an_unfitted_calibration_object_also_falls_back():
 
 
 def test_a_larger_measured_multiplier_makes_the_gate_stricter():
-    """The whole point: `q` is measured, so a model whose residuals turn out
-    wide is held to a bar that reflects that."""
+    """
+    `q` is measured, so a model whose residuals turn out wide is held to a bar
+    that reflects that. It now acts through the *downside* ceiling rather than
+    by demanding the worst case also win, so both of these have a real expected
+    gain and differ only in how far out their plausible worst case sits.
+    """
     lenient = _optimizer(math.log(0.7), spread=0.1, gate_mode="conformal",
                          conformal=_calibrated(0.5))
     strict = _optimizer(math.log(0.7), spread=0.1, gate_mode="conformal",
@@ -131,7 +135,10 @@ def test_a_larger_measured_multiplier_makes_the_gate_stricter():
 
     assert lenient_served["hint"] is not None
     assert strict_served["hint"] is None
-    assert strict.last_decision["reason"] == "no_confident_gain_over_native"
+    # A wide measured `q` fails the *downside* question, not the expected-win
+    # one -- the plan still looks like a gain, it is just no longer a bounded
+    # bet. Saying which of the two failed is the point of splitting them.
+    assert strict.last_decision["reason"] == "downside_not_bounded"
 
 
 def test_an_unreachable_risk_level_refuses_to_deviate():

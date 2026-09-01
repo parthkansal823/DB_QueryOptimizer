@@ -1,8 +1,8 @@
 {
-  "confidence_z": 0.0,
-  "min_relative_gain": 0.1,
-  "calibrated_on_n_queries": 6,
-  "expected_deviation_rate": 0.8333333333333334,
+  "confidence_z": 2.0,
+  "min_relative_gain": 0.2,
+  "calibrated_on_n_queries": 11,
+  "expected_deviation_rate": 0.36363636363636365,
   "expected_regression_rate": 0.0,
   "expected_worst_regression_ratio": 1.0
 }

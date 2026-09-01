@@ -805,3 +805,9 @@ code {
 .finding-high { border-left-color: #d1242f; }
 .finding-medium { border-left-color: #bf8700; }
 .finding-low { border-left-color: #6e7781; }
+
+/* A pick that measurably beat PostgreSQL. The losing case reuses
+   .decision-veto, which is already the 'this did not go well' voice. */
+.decision-win {
+  color: #1a7f37;
+}

@@ -127,6 +127,55 @@ function DecisionNote({ decision }) {
   );
 }
 
+// Did the plan the optimizer picked actually turn out faster?
+//
+// /query/analyze runs every candidate, so by the time this renders the answer
+// is known -- and the panel was not saying it. A pick that ran slower than
+// PostgreSQL was presented as "LEARNED PICK / CHOSEN" beside a larger number,
+// leaving the reader to compare two figures and draw the conclusion
+// themselves. That is the same failure `app/stats.py` was written for: a
+// dashboard that reports a decision without reporting how it went.
+//
+// Deliberately a *measured* statement, not a predicted one. The decision note
+// above says what the model expected; this says what happened.
+function Outcome({ baseline, chosenPlan }) {
+  const native = baseline?.actual_total_time_ms;
+  const served = chosenPlan?.actual_total_time_ms;
+  if (native == null || served == null) return null;
+
+  const ratio = served / native;
+  // Below this the two runs are not distinguishable from each other on a
+  // single execution -- see the noise floor in docs/METRICS.md.
+  if (Math.abs(1 - ratio) < 0.05) {
+    return (
+      <p className="decision-note">
+        <strong>Outcome:</strong> the chosen plan and PostgreSQL&rsquo;s ran within 5% of
+        each other, which is inside this database&rsquo;s measurement noise. Neither was
+        meaningfully faster.
+      </p>
+    );
+  }
+
+  if (ratio > 1) {
+    return (
+      <p className="decision-veto">
+        <strong>This pick was slower.</strong> It ran in {served.toFixed(2)} ms against
+        PostgreSQL&rsquo;s {native.toFixed(2)} ms &mdash; {((ratio - 1) * 100).toFixed(0)}%
+        worse. The model predicted a win and was wrong; the safety gate let it through
+        because the predicted gain cleared the bar.
+      </p>
+    );
+  }
+
+  return (
+    <p className="decision-note decision-win">
+      <strong>This pick was faster.</strong> {served.toFixed(2)} ms against
+      PostgreSQL&rsquo;s {native.toFixed(2)} ms &mdash; {((1 - ratio) * 100).toFixed(0)}%
+      less time.
+    </p>
+  );
+}
+
 export default function PlanComparison({ baseline, chosenPlan, selectorMode, decision }) {
   return (
     <>
@@ -144,6 +193,7 @@ export default function PlanComparison({ baseline, chosenPlan, selectorMode, dec
           }
         />
       </div>
+      <Outcome baseline={baseline} chosenPlan={chosenPlan} />
       <DecisionNote decision={decision} />
     </>
   );

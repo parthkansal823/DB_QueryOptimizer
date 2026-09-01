@@ -67,6 +67,14 @@ DEFAULT_MIN_GAIN_MS = 2.0
 # before deviating from native. 0.05 = "must look at least 5% faster".
 DEFAULT_MIN_RELATIVE_GAIN = float(os.getenv("MIN_RELATIVE_GAIN", "0.05"))
 
+# How much slower than native the *pessimistic* case may be and still be worth
+# betting on. 1.25 = "even if the model is wrong by its own uncertainty, this
+# should not end up more than 25% slower".
+#
+# This is the second half of a rule that used to have only one. See
+# `_select_against_native` for what the single-condition version threw away.
+DEFAULT_MAX_REGRESSION_RATIO = float(os.getenv("MAX_REGRESSION_RATIO", "1.25"))
+
 # Distinguishes "caller passed nothing" from "caller passed the default".
 _UNSET = object()
 
@@ -92,6 +100,7 @@ class LearnedOptimizer:
         confidence_z: float = _UNSET,
         min_gain_ms: float = float(os.getenv("MIN_GAIN_MS", DEFAULT_MIN_GAIN_MS)),
         min_relative_gain: float = _UNSET,
+        max_regression_ratio: float = DEFAULT_MAX_REGRESSION_RATIO,
         gate_mode: str = os.getenv("GATE_MODE", "fixed_z"),
         seed: int | None = None,
     ):
@@ -111,6 +120,7 @@ class LearnedOptimizer:
         self.min_relative_gain = (
             DEFAULT_MIN_RELATIVE_GAIN if min_relative_gain is _UNSET else min_relative_gain
         )
+        self.max_regression_ratio = max_regression_ratio
         self.gate_calibration: dict | None = None
         # "fixed_z" keeps the historical bound (mean + z*sigma); "conformal"
         # uses the calibrated one from the bundle when there is one. Default is
@@ -290,14 +300,43 @@ class LearnedOptimizer:
         a prediction is directly a speedup claim rather than two absolute
         numbers whose difference has to survive subtraction.
 
-        The test is "confidently below 1.0x native":
+        ## Two questions, not one
 
-            predicted_ratio + z * sigma < 1 - min_relative_gain
+        The test used to be a single condition -- the *pessimistic* case had to
+        clear the bar:
 
-        which reads as: even allowing for how unsure the model is, this plan
-        should still beat native by the required margin. Older bundles that
-        predicted absolute milliseconds are detected and handled the old way,
-        so a stale pickle degrades rather than silently misbehaving.
+            predicted_ratio + z * sigma  <  1 - min_relative_gain
+
+        which reads as "even if the model is wrong, this still wins". That is a
+        much stronger demand than it looks, and it threw away the best bets the
+        system had. A measured example: a six-table join where the model
+        predicted **0.20x** native and the truth was 0.16x -- a 5.9x speedup,
+        with the point estimate almost exactly right. The ensemble happened to
+        disagree with itself on that query, so the pessimistic figure came out
+        at 1.13x, and the rule refused. It refused a five-fold win because the
+        worst case was a 13% loss.
+
+        The economics of that trade are simply wrong, and the fix is to stop
+        asking one question of two different things. What matters is:
+
+            is there an expected win?    predicted_ratio  <  1 - min_relative_gain
+            is the downside bounded?     pessimistic      <  max_regression_ratio
+
+        The first is about the *size* of the opportunity and belongs on the
+        point estimate. The second is about *risk*, belongs on the uncertainty,
+        and is a ceiling on how bad things get -- not a demand that they be
+        good. That is also what Bao actually claims a learned optimizer must
+        guarantee: never *much* worse than the optimizer it replaces. Never
+        worse at all is a different, unachievable promise.
+
+        Both cases from the dashboard come out right under it. The 5.9x win
+        deviates (0.20 clears the gain bar, 1.13 is inside the ceiling); a
+        candidate predicted at 0.89x whose pessimistic case is 1.32x is held,
+        because that one really is a coin flip on a small edge.
+
+        Older bundles that predicted absolute milliseconds are detected and
+        handled the old way, so a stale pickle degrades rather than silently
+        misbehaving.
         """
         if self.target != "log_ratio_vs_native":
             return self._select_against_native_absolute(candidate_plans, baseline_plan)
@@ -341,13 +380,30 @@ class LearnedOptimizer:
             "required_speedup": required_ratio,
             "predicted_uncertainty_log": stds[best_i],
             "gate": gate_used,
+            # The ceiling the pessimistic case has to stay under. Reported so a
+            # reader can see which of the two conditions a held plan failed.
+            "max_regression_ratio": self.max_regression_ratio,
             "chosen_index": best_i,
             "fell_back_to_baseline": False,
         }
 
-        if upper_ratio >= required_ratio:
+        # Is there an expected win? A question about the size of the
+        # opportunity, asked of the point estimate.
+        if predicted_ratio >= required_ratio:
             self.last_decision["fell_back_to_baseline"] = True
-            self.last_decision["reason"] = "no_confident_gain_over_native"
+            self.last_decision["reason"] = "no_expected_gain_over_native"
+            self.last_decision["chosen_index"] = None
+            return baseline_plan
+
+        # Is the downside bounded? A question about risk, asked of the
+        # uncertainty -- a ceiling on how bad this can get, not a demand that
+        # the worst case also be a win.
+        # Divided, not multiplied: `caution` above 1 means *less* trust, so it
+        # has to lower the ceiling. Multiplying raised it, which would have
+        # made an unseen query the easiest one to gamble on.
+        if upper_ratio >= self.max_regression_ratio / caution:
+            self.last_decision["fell_back_to_baseline"] = True
+            self.last_decision["reason"] = "downside_not_bounded"
             self.last_decision["chosen_index"] = None
             return baseline_plan
 
@@ -421,12 +477,27 @@ class LearnedOptimizer:
             gate = self.conformal
             if gate is not None and getattr(gate, "fitted", False):
                 return gate.upper_bound(mean, std * caution), "conformal"
-        # `uncertainty_scale` is what makes `confidence_z` mean standard
-        # deviations. Without it the bootstrap's spread understated the real
-        # error -- by 2x on this model -- so `z = 1.0` bought half the
-        # protection it claimed, and a threshold sweep concluded `z` did not
-        # matter and set it to zero.
-        return mean + self.confidence_z * caution * std * self.uncertainty_scale, "fixed_z"
+        # `uncertainty_scale` is measured and reported (`app.diagnostics`) but
+        # deliberately *not* multiplied in here.
+        #
+        # It was, and it double-counted. The factor is derived from out-of-bag
+        # residuals over training rows, where the ensemble's spread is tiny
+        # (median 0.012 in log space). At serving time the spread on an unseen
+        # query is an order of magnitude larger (~0.15) -- the ensemble already
+        # widens itself where it has no evidence, which is the whole point of
+        # it. Multiplying a factor measured against the small distribution onto
+        # the large one inflated the bound twice: a candidate predicted at 0.80x
+        # native came out pessimistically 1.27x, and the gate vetoed 22 of 24
+        # queries on a workload where following the model captures 80% of the
+        # available headroom.
+        #
+        # `confidence_z` is calibrated empirically against the serving-shaped
+        # spread anyway (`app.calibrate`), so the scale bought nothing except a
+        # second, mismatched inflation. What it is genuinely worth is the
+        # diagnosis it makes visible -- that the ensemble is roughly 4x
+        # overconfident -- which is a reason to distrust `sigma` as a
+        # probability, not a number to multiply serving decisions by.
+        return mean + self.confidence_z * caution * std, "fixed_z"
 
     # PostgreSQL prices a plan it has been told not to use at `disable_cost`
     # (1e10) rather than removing it. Anything at that scale is a plan the

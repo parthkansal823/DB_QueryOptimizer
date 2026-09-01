@@ -160,3 +160,88 @@ describe("which gate authorised the decision", () => {
     expect(screen.queryByText("Gate")).not.toBeInTheDocument();
   });
 });
+
+describe("what actually happened", () => {
+  // /query/analyze runs every candidate, so by the time this renders the answer
+  // is known. The panel used to present a pick that ran slower as "LEARNED PICK
+  // / CHOSEN" beside a larger number and leave the reader to compare the two --
+  // the same failure app/stats.py exists for.
+  const slower = { ...baseline, actual_total_time_ms: 12.5 };
+  const faster = { ...baseline, actual_total_time_ms: 5.2 };
+  const native = { ...baseline, actual_total_time_ms: 8.64 };
+
+  it("says plainly when the chosen plan ran slower", () => {
+    render(
+      <PlanComparison
+        baseline={native}
+        chosenPlan={slower}
+        selectorMode="learned"
+        decision={{ fell_back_to_baseline: false, policy: "pairwise_rank" }}
+      />,
+    );
+
+    const note = screen.getByText(/This pick was slower/);
+    // The measured numbers have to be in the sentence, not left for the reader
+    // to find by comparing the two panels above it.
+    expect(note.parentElement.textContent).toMatch(/12\.50 ms/);
+    expect(note.parentElement.textContent).toMatch(/8\.64 ms/);
+    expect(note.parentElement.textContent).toMatch(/45% worse/);
+  });
+
+  it("says so when it ran faster", () => {
+    render(
+      <PlanComparison
+        baseline={native}
+        chosenPlan={faster}
+        selectorMode="learned"
+        decision={{ fell_back_to_baseline: false, policy: "pairwise_rank" }}
+      />,
+    );
+
+    expect(screen.getByText(/This pick was faster/)).toBeInTheDocument();
+  });
+
+  it("does not call a difference inside the noise floor a win", () => {
+    render(
+      <PlanComparison
+        baseline={native}
+        chosenPlan={{ ...baseline, actual_total_time_ms: 8.5 }}
+        selectorMode="learned"
+        decision={{ fell_back_to_baseline: false, policy: "pairwise_rank" }}
+      />,
+    );
+
+    expect(screen.getByText(/measurement noise/)).toBeInTheDocument();
+    expect(screen.queryByText(/This pick was faster/)).not.toBeInTheDocument();
+  });
+
+  it("says nothing about an outcome when no plan was chosen", () => {
+    render(
+      <PlanComparison
+        baseline={native}
+        chosenPlan={null}
+        selectorMode="learned"
+        decision={declined}
+      />,
+    );
+
+    expect(screen.queryByText(/This pick was/)).not.toBeInTheDocument();
+  });
+
+  it("refuses to call a 4.75% difference a regression", () => {
+    // The numbers from the reported screenshot: 8.64 ms against 9.05 ms. That
+    // is inside this database's measurement noise, so calling it a regression
+    // would be as wrong as calling it a win.
+    render(
+      <PlanComparison
+        baseline={native}
+        chosenPlan={{ ...baseline, actual_total_time_ms: 9.05 }}
+        selectorMode="learned"
+        decision={{ fell_back_to_baseline: false, policy: "pairwise_rank" }}
+      />,
+    );
+
+    expect(screen.getByText(/measurement noise/)).toBeInTheDocument();
+    expect(screen.queryByText(/This pick was slower/)).not.toBeInTheDocument();
+  });
+});

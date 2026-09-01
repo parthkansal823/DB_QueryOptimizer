@@ -239,5 +239,8 @@ def test_a_vetoed_decision_still_explains_what_the_model_thought():
 
     decision = optimizer.last_decision
     assert decision["fell_back_to_baseline"] is True
-    assert decision["reason"] == "no_confident_gain_over_native"
+    # The rule now says which of its two questions failed: this candidate had
+    # no expected win at all, as distinct from having one with an unbounded
+    # downside.
+    assert decision["reason"] == "no_expected_gain_over_native"
     assert decision["all_predicted_scores"] == [-0.01]

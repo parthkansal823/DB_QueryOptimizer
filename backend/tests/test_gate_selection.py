@@ -118,13 +118,40 @@ def test_the_tie_window_is_relative_not_absolute():
 # -- the bound that is supposed to bind -------------------------------------
 
 
-def test_the_default_regression_ceiling_actually_excludes_things():
-    """At 0.34 every setting on a real grid qualified, so the constraint the
-    docstring calls 'the important one' never excluded anything."""
+def test_the_safety_bound_is_on_how_bad_not_only_how_often():
+    """
+    The docstring's own justification is "a single query getting **3x slower**".
+    Bounding only the rate says instead that regressions are equally bad
+    whatever their size, and that is expensive: measured on the built-in
+    workload, a 5% rate ceiling declined 21 queries of which 12 would have won
+    333 ms and 3 would have lost 52 ms -- none of them close to 3x.
+    """
     import inspect
 
-    default = inspect.signature(calibrate.sweep).parameters["max_regression_rate"].default
-    assert default <= 0.1
+    params = inspect.signature(calibrate.sweep).parameters
+    assert "max_worst_regression" in params
+    assert params["max_worst_regression"].default < 2.0
+    # Still tighter than the 0.34 that admitted every setting on the grid.
+    assert params["max_regression_rate"].default < 0.34
+
+
+def test_a_catastrophic_regression_is_excluded_however_good_the_average(monkeypatch):
+    """The bound that actually protects: one query 6x slower disqualifies a
+    setting no matter how much it saves elsewhere."""
+    everything = [f"q{i}" for i in range(12)]
+    monkeypatch.setattr(calibrate, "_grouped_rows", lambda **kw: _grouped(everything))
+    monkeypatch.setattr(calibrate, "_load_bundle", lambda *a, **k: _bundle(None))
+    monkeypatch.setattr(
+        calibrate, "evaluate_setting",
+        lambda *a, **k: {
+            "confidence_z": 0.0, "min_relative_gain": 0.0, "n_queries": 12,
+            "deviation_rate": 1.0, "regression_rate": 0.05,
+            "net_improvement_ms": 9999.0, "net_improvement_pct": 90.0,
+            "worst_regression_ratio": 6.0,
+        },
+    )
+
+    assert calibrate.sweep(max_worst_regression=1.25)["recommended"] is None
 
 
 # -- what it is measured on -------------------------------------------------
@@ -168,7 +195,7 @@ def _grouped(query_ids):
 
 
 def _sweep(monkeypatch, query_ids, held_out):
-    monkeypatch.setattr(calibrate, "_grouped_rows", lambda: _grouped(query_ids))
+    monkeypatch.setattr(calibrate, "_grouped_rows", lambda **kw: _grouped(query_ids))
     monkeypatch.setattr(calibrate, "_load_bundle", lambda *a, **k: _bundle(held_out))
     return calibrate.sweep(max_regression_rate=1.0)
 

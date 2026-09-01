@@ -107,7 +107,7 @@ def test_sweep_excludes_settings_that_never_deviate(monkeypatch):
     must not be recommended."""
     from app import calibrate
 
-    monkeypatch.setattr(calibrate, "_grouped_rows", lambda: _rows(100.0, [50.0]))
+    monkeypatch.setattr(calibrate, "_grouped_rows", lambda **kw: _rows(100.0, [50.0]))
     # Predicts a huge win but with enormous uncertainty, so only the very
     # loosest settings will act.
     monkeypatch.setattr(calibrate, "_load_bundle", lambda *a, **k: _bundle([math.log(0.5)], [5.0]))
@@ -120,7 +120,7 @@ def test_sweep_excludes_settings_that_never_deviate(monkeypatch):
 def test_sweep_respects_the_regression_bound(monkeypatch):
     from app import calibrate
 
-    monkeypatch.setattr(calibrate, "_grouped_rows", lambda: _rows(100.0, [180.0]))
+    monkeypatch.setattr(calibrate, "_grouped_rows", lambda **kw: _rows(100.0, [180.0]))
     monkeypatch.setattr(calibrate, "_load_bundle", lambda *a, **k: _bundle([math.log(0.5)], [0.0]))
 
     # Every deviation regresses, so with a 0% bound nothing is recommendable.

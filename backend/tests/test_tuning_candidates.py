@@ -238,28 +238,50 @@ def _plan(cost, hint="/*+ Leading(o u) */"):
     }
 
 
-def test_rescaling_widens_the_pessimistic_bound():
-    lenient = _optimizer(1.0, math.log(0.85), 0.10)
-    scaled = _optimizer(3.0, math.log(0.85), 0.10)
+def test_the_measured_scale_is_not_multiplied_into_the_serving_bound():
+    """
+    It was, and it double-counted.
 
-    lenient.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
+    The factor comes from out-of-bag residuals over *training* rows, where the
+    ensemble's spread is tiny (median 0.012 in log space). At serving time the
+    spread on an unseen query is an order of magnitude larger -- the ensemble
+    already widens itself where it has no evidence. Multiplying the first onto
+    the second inflated the bound twice: a candidate predicted at 0.80x native
+    came out pessimistically 1.27x, and the gate vetoed 22 of 24 queries on a
+    workload where following the model captures 80% of the available headroom.
+    """
+    plain = _optimizer(1.0, math.log(0.85), 0.10)
+    scaled = _optimizer(4.0, math.log(0.85), 0.10)
+
+    plain.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
     scaled.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
 
     assert (
         scaled.last_decision["pessimistic_speedup_vs_native"]
-        > lenient.last_decision["pessimistic_speedup_vs_native"]
+        == plain.last_decision["pessimistic_speedup_vs_native"]
     )
 
 
-def test_a_scaled_bound_can_refuse_what_an_unscaled_one_allowed():
-    """The screenshot case in one assertion: same prediction, same spread, and
-    the difference between deviating and holding is whether sigma was in real
-    units."""
-    lenient = _optimizer(1.0, math.log(0.85), 0.08)
-    scaled = _optimizer(4.0, math.log(0.85), 0.08)
+def test_the_bound_still_widens_with_the_ensemble_s_own_spread():
+    """What was supposed to happen, and does -- via sigma itself rather than a
+    factor measured against a different distribution."""
+    confident = _optimizer(1.0, math.log(0.85), 0.01)
+    unsure = _optimizer(1.0, math.log(0.85), 0.30)
 
-    assert lenient.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))["hint"]
-    assert scaled.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))["hint"] is None
+    confident.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
+    unsure.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
+
+    assert (
+        unsure.last_decision["pessimistic_speedup_vs_native"]
+        > confident.last_decision["pessimistic_speedup_vs_native"]
+    )
+
+
+def test_the_scale_is_still_measured_and_carried():
+    """It is a real diagnosis -- the ensemble is roughly 4x overconfident --
+    and `app.diagnostics` reports it. Not multiplying it into decisions is a
+    separate matter from not measuring it."""
+    assert _optimizer(4.0, math.log(0.85), 0.1).uncertainty_scale == 4.0
 
 
 def test_bundles_without_a_measured_scale_behave_exactly_as_before():
