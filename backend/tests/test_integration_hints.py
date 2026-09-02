@@ -358,3 +358,113 @@ def test_catalog_indexes_are_keyed_the_way_a_hint_needs_them(cur):
     assert "o" in by_alias
     assert "orders" not in by_alias
     assert "orders_pkey" in by_alias["o"]
+
+
+@pytest.fixture
+def hint_debug_cur(cur):
+    """
+    `cur` with pg_hint_plan's debug output on, restored afterwards.
+
+    The cursor is module-scoped and shared, so leaving `client_min_messages` at
+    `info` would hand every later test a stream of notices it did not ask for.
+    """
+    from app.optimizer.hint_binding import enable_hint_debug
+
+    enable_hint_debug(cur)
+    try:
+        yield cur
+    finally:
+        cur.execute("SET pg_hint_plan.debug_print = off")
+        cur.execute("RESET pg_hint_plan.message_level")
+        cur.execute("RESET client_min_messages")
+        del cur.connection.notices[:]
+
+
+class TestEveryCandidateBinds:
+    """
+    Assert that every hint the optimizer generates is actually applied.
+
+    This is the generalisation of the bug in the module docstring above. That
+    one was total -- pg_hint_plan ignoring everything -- and was caught by
+    checking that hinted plans differ from native. This check is finer: it asks
+    pg_hint_plan directly which directives it applied, which separates the two
+    cases a cost comparison cannot. `SeqScan(o)` and `SeqScan(orders)` both cost
+    3979.3 on the four-table query; the first bound and did nothing, the second
+    never bound. Only the debug output tells them apart.
+
+    Writing this found a real defect: `generate_join_method_candidates` sampled
+    join orders without the join graph, so `Leading(p o oi u)` produced
+    `HashJoin(p o)` for two relations sharing no join predicate. pg_hint_plan
+    filed it under `not used hint:` and planned that join freely -- a candidate
+    labelled "hash join throughout" whose first join was not forced. 9 of 92
+    candidates, all from that family, now 0.
+    """
+
+    FOUR_TABLE_SQL = (
+        "SELECT o.id, u.name, p.name FROM orders o "
+        "JOIN users u ON u.id = o.user_id "
+        "JOIN order_items oi ON oi.order_id = o.id "
+        "JOIN products p ON p.id = oi.product_id "
+        "WHERE o.status = 'delivered' LIMIT 100"
+    )
+    ALIASES = ["o", "u", "oi", "p"]
+    JOIN_GRAPH = {"o": ["u", "oi"], "u": ["o"], "oi": ["o", "p"], "p": ["oi"]}
+
+    def _candidates(self, **overrides):
+        from app.optimizer.hints import generate_candidates
+
+        options = dict(
+            max_order_candidates=4,
+            include_join_methods=True,
+            include_tuning=True,
+            include_bushy=True,
+            include_scan_methods=True,
+            include_negative_scans=True,
+            include_negative_joins=True,
+            include_memoize=True,
+            include_parallel=True,
+            include_enable_settings=True,
+            include_extended_toggles=True,
+            include_cost_model=True,
+            join_graph=self.JOIN_GRAPH,
+        )
+        options.update(overrides)
+        return generate_candidates(self.ALIASES, **options)
+
+    def test_every_family_binds(self, hint_debug_cur):
+        from app.optimizer.hint_binding import check_binding
+
+        notices = hint_debug_cur.connection.notices
+
+        failures = []
+        candidates = self._candidates()
+        assert len(candidates) > 50, "the point is to cover every family"
+
+        for hint in candidates:
+            report = check_binding(
+                hint_debug_cur,
+                f"{hint} EXPLAIN (FORMAT JSON) {self.FOUR_TABLE_SQL}",
+                notices,
+            )
+            if not report.bound:
+                failures.append(f"{hint}\n    " + "\n    ".join(report.problems))
+
+        assert not failures, (
+            f"{len(failures)} of {len(candidates)} candidates did not bind:\n"
+            + "\n".join(failures)
+        )
+
+    def test_a_hint_naming_a_table_instead_of_its_alias_is_caught(self, hint_debug_cur):
+        """
+        The check has to be able to fail, and this is the exact shape of the
+        `Parallel(order_items 4 hard)` bug: cost 7870 unchanged, no error.
+        """
+        from app.optimizer.hint_binding import check_binding
+
+        report = check_binding(
+            hint_debug_cur,
+            f"/*+ SeqScan(orders) */ EXPLAIN (FORMAT JSON) {self.FOUR_TABLE_SQL}",
+            hint_debug_cur.connection.notices,
+        )
+        assert not report.bound
+        assert report.not_used == ["SeqScan(orders)"]

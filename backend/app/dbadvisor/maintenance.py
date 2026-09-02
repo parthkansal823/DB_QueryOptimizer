@@ -135,7 +135,9 @@ def index_only_scan_readiness(cur, schema: str = "public") -> list[dict]:
     """
     cur.execute(VISIBILITY_SQL, (schema,))
     findings = []
-    for relname, relpages, relallvisible, live, last_vacuum, last_autovacuum in cur.fetchall():
+    # `_live` is selected and deliberately not used -- the comment below says
+    # why, and keeping it in the row makes the contrast it draws checkable.
+    for relname, relpages, relallvisible, _live, last_vacuum, last_autovacuum in cur.fetchall():
         relpages = _int(relpages)
         # Sized by pages, not by `n_live_tup`. Both come from the same VACUUM,
         # but `relpages` is in `pg_class` while `n_live_tup` comes from the

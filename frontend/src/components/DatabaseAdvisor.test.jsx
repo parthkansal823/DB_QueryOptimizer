@@ -230,7 +230,14 @@ describe("workload findings", () => {
     );
 
     expect(screen.getByText(/this optimizer's own candidate sweep/)).toBeInTheDocument();
-    expect(screen.getByText(/118,088 temp blocks written/)).toBeInTheDocument();
+    // The component formats this with `toLocaleString()` and no explicit
+    // locale, so the grouping is whatever the machine's ICU default is:
+    // "118,088" on CI's en-US runner, "1,18,088" on an en-IN one. Hard-coding
+    // either makes the suite pass in one place and fail in the other, which is
+    // worse than not testing it -- a developer cannot trust a red run. So the
+    // expectation is formatted the same way the component formats it.
+    const blocks = (118088).toLocaleString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(screen.getByText(new RegExp(`${blocks} temp blocks written`))).toBeInTheDocument();
   });
 
   it("repeats the caveat that a row folds every plan variant together", () => {

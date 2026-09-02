@@ -900,7 +900,7 @@ The rest of the 3156 pages — client interfaces, procedural languages,
 replication, data types, SQL syntax reference — was swept for planner-relevant
 material and has none that bears on this project.
 
-## C9. `EXPLAIN (SETTINGS)` — the direct test that a `Set()` hint bound — PG16 ✓
+## C9. A readback for "did the hint bind?" — PG16 ✓ built
 
 From the EXPLAIN reference page (manual p. 1999), checked against every EXPLAIN
 this project issues:
@@ -910,71 +910,95 @@ this project issues:
 | `plan_extractor.get_plan` — the main path | `FORMAT JSON`, plus `ANALYZE, BUFFERS` when analyzing |
 | `main.py` `/query/analyze` | `FORMAT JSON, VERBOSE` |
 
-Against the full option list — `ANALYZE, VERBOSE, COSTS, SETTINGS,
-GENERIC_PLAN, BUFFERS, SERIALIZE, WAL, TIMING, SUMMARY, MEMORY, FORMAT` —
-`SERIALIZE` (C1) and `MEMORY` are PG17+, `WAL` is irrelevant to a read-only
-`SELECT` workload, `COSTS`/`TIMING`/`SUMMARY` default to what is wanted, and
-`VERBOSE` is already used where it earns its cost. One remaining option is worth
-having.
+Of the twelve options, `SERIALIZE` (C1) and `MEMORY` are PG17+, `WAL` is
+irrelevant to a read-only `SELECT` workload, `COSTS`/`TIMING`/`SUMMARY` already
+default to what is wanted, and `VERBOSE` is already used where it earns its cost
+(`main.py:377`, for the output column list that covering-index advice needs).
 
-> **SETTINGS** — Include information on configuration parameters. Specifically,
-> include options affecting query planning **with value different from the
-> built-in default**. This parameter defaults to FALSE.
+That left **`SETTINGS`**, which looked like the answer to this project's most
+expensive bug class: a hint that is ignored is indistinguishable from a hint that
+did nothing. It has happened four ways — the `Parallel(order_items 4 hard)` alias
+bug (7870 vs 1774), `DisableIndex` not existing in pg_hint_plan 1.6.3, stacked
+hint comments where only the first is read, and `Set(bogus_guc off)` being
+dropped rather than raised.
 
-Available since PG12, so it works on this server.
+### `SETTINGS` does not work for this. Measured.
 
-**Why it matters here specifically.** The single most expensive recurring bug
-class in this project is the *silent* one: a hint that was ignored is
-indistinguishable from a hint that ran and changed nothing. It has now happened
-three separate ways —
+    SET enable_seqscan = off          -> Settings {'enable_seqscan': 'off'}
+    /*+ Set(enable_seqscan off) */    -> Settings {}
 
-* `Parallel(order_items 4 hard)` addressed a table by name where the query used
-  the alias `oi`. Cost 7870, silently unchanged; `Parallel(oi 4 hard)` cost 1774.
-* `DisableIndex` does not exist in pg_hint_plan 1.6.3. Rejected at `INFO`
-  severity, which the default `client_min_messages` discards.
-* Stacked hint comments: pg_hint_plan reads only the **first** `/*+ ... */` and
-  discards the rest without complaint (fixed by merging in `apply_hint`).
+Both drove the cost to the same `1.0000039e10`, so the hint plainly bound; only
+the session `SET` was visible. The option is fine — pg_hint_plan's mechanism is
+invisible to it. And it would only ever have covered the `Set()` family.
 
-A large slice of the action space is `Set(...)` hints —
-`hints.ENABLE_SETTINGS`, `EXTENDED_HINT_SETS`, `COST_MODEL_SETTINGS`, and the
-resource/cost-model family that WRITEUP 2.18 measured as the most valuable of
-the three. Every one of them is exposed to exactly this failure, and nothing
-currently checks that the GUC actually took effect. `EXPLAIN (SETTINGS)` reports
-the planner GUCs that differ from their built-in defaults at plan time, which is
-a direct readback of whether the hint bound — no severity juggling, no cost
-comparison against a control, in the plan JSON the project already parses.
+### What does work: pg_hint_plan's own debug output
 
-**The check this buys.** For a candidate whose hint is `Set(enable_seqscan off)`,
-the plan's `Settings` object should contain `enable_seqscan: off`. If it does
-not, the hint did not bind, and the candidate is not what it claims to be. That
-turns an entire silent failure class into an assertion — and it can run in
-`prefilter.py`, which already exists to discard candidates that provably cannot
-differ from the baseline.
+With `pg_hint_plan.debug_print = on`, `message_level = notice` and
+`client_min_messages = info`, every hinted statement emits one NOTICE sorting
+its directives into four buckets — `used` / `not used` / `duplication` /
+`error`. Measured against all four failures:
 
-**Caveat to verify before relying on it.** pg_hint_plan applies `Set()` for the
-duration of planning. Whether that is still visible to `EXPLAIN (SETTINGS)` at
-output time is a question about pg_hint_plan's implementation, not about the
-manual, and it must be measured before this is built on. If it turns out not to
-be visible, that is itself worth recording: it would mean there is no readback
-for `Set()` binding at all, and the fallback is a control comparison.
+| case | reported as |
+|---|---|
+| `SeqScan(o)` — correct alias | `used hint: SeqScan(o)` |
+| `SeqScan(orders)` — table name | **`not used hint`** |
+| `Set(bogus_guc off)` | **`error hint`** + INFO `unrecognized configuration parameter` |
+| `DisableIndex(o)` | INFO `hint syntax error` / `Unrecognized hint keyword` |
+| two `/*+ ... */` comments | only the first appears; the second is in no bucket |
+
+This is strictly better than `SETTINGS`: it covers every family, and it
+separates the two cases a cost comparison cannot. `SeqScan(o)` and
+`SeqScan(orders)` both cost 3979.3 on the four-table query — one bound and did
+nothing, the other never bound.
+
+Note the severity trap that hid `DisableIndex` for so long: syntax errors arrive
+at **INFO**, not at the configured `message_level`, and the default
+`client_min_messages` of `WARNING` discards them.
+
+**Built:** `optimizer/hint_binding.py` (`enable_hint_debug`, `parse_notices`,
+`check_binding`, `BindingReport.bound` / `.problems`), `test_hint_binding.py`
+(19 unit tests, every message string captured verbatim from the live server),
+and `TestEveryCandidateBinds` in `test_integration_hints.py`, which asserts that
+every candidate the optimizer generates is actually applied.
+
+It is a diagnostic, not a hot path — a NOTICE per statement plus a round trip to
+enable — so it belongs in tests and investigation, not in `/query/optimize`.
+
+### It immediately found a real defect
+
+`generate_join_method_candidates` names the growing prefixes of a join order, so
+`Leading(p o oi u)` becomes `HashJoin(p o)`, `HashJoin(p o oi)`, ... It sampled
+orders via `_sample_orders` with **no reference to the join graph**, while
+`generate_join_order_candidates` had taken one for exactly this reason — its
+docstring notes that an order introducing a table with no shared join predicate
+forces a cross product priced at `disable_cost`.
+
+So a prefix could name two relations that share no predicate. pg_hint_plan does
+not reject it: it files the directive under `not used hint:` and plans that join
+freely. The candidate still runs, still gets a latency, and is still labelled
+"hash join throughout" while its first join was never forced — a **mislabelled
+training row**, which is worse than the merely wasted candidate the order-only
+generator avoids.
+
+Measured on a four-table chain: **9 of 92** candidates, every one from that
+family. The fix extracts the connected-order selection into `_choose_orders` and
+routes both generators through it; `generate_join_method_candidates` now takes a
+`join_graph`, and both `planner.py:243` and `collect_data.py:144` already pass
+one from the baseline plan. **9 of 92 → 0 of 93.**
 
 Two others from the same page, noted and not pursued:
 
-* **`VERBOSE`** — already in use, and correctly scoped. `main.py:377` passes it
-  on `/query/analyze` because covering-index opportunities need the query's
-  output column list, which only `VERBOSE` reports; the comment there notes it
-  is one extra planning round trip that the analyze path can afford (it already
-  issues around thirty) and `/query/optimize` cannot. It also *"always label[s]
-  variables in expressions with their range table alias"* — the information the
-  `Parallel(oi ...)` bug turned on — but `catalog.py::indexes_by_alias` already
-  gets that from `scan_relations` without the round trip, and `VERBOSE` would
-  roughly double the size of every plan JSON stored in `plan_execution_log`.
+* **`VERBOSE`** — already in use and correctly scoped, per the table above. It
+  also *"always label[s] variables in expressions with their range table alias"*,
+  which is the information the `Parallel(oi ...)` bug turned on, but
+  `catalog.py::indexes_by_alias` already gets that from `scan_relations` without
+  the round trip, and `VERBOSE` would roughly double every plan JSON stored in
+  `plan_execution_log`.
 * **`GENERIC_PLAN`** (PG16) — plans a statement containing `$1` placeholders
   without values. It pairs with A3 (`plan_cache_mode`) and would let the advisor
-  show how a prepared statement plans versus how the literal-value query plans.
-  Cannot be combined with `ANALYZE`, so it is a second EXPLAIN per query, and
-  nothing in this workload is currently parameterized.
-
+  contrast a prepared statement's plan with the literal-value one. Cannot be
+  combined with `ANALYZE`, so it is a second EXPLAIN per query, and nothing in
+  this workload is currently parameterized.
 
 ---
 
@@ -995,6 +1019,8 @@ Two others from the same page, noted and not pursued:
 | **D7** — HOT-update pressure | `dbadvisor/maintenance.py::hot_update_pressure` | 15,000 updates to an indexed column → **0 HOT updates** |
 | **C7** — parallel shortfall | `plan_extractor.py::parallel_shortfall` | With `max_parallel_workers = 0`: 4 planned, **0 launched**, correctly flagged |
 | **§69.2.3** — measured correlation | `dbadvisor/extended_stats.py::measured_correlation` | `('SG','Singapore')` occurs **22×** more often than per-column statistics predict — read from `pg_mcv_list_items`, no probe query |
+| **C9** — hint-binding readback | `optimizer/hint_binding.py` | `EXPLAIN (SETTINGS)` cannot see pg_hint_plan's `Set()` (measured: same `1.0000039e10` cost, empty `Settings`); pg_hint_plan's own debug buckets catch all four silent-failure modes |
+| **C9** — disconnected method prefixes | `hints.py::_choose_orders` | `generate_join_method_candidates` sampled orders without the join graph, so `HashJoin(p o)` on an unjoined pair was filed `not used` and the candidate mislabelled. **9 of 92 → 0 of 93** |
 
 ## Corrections to earlier entries in this document
 

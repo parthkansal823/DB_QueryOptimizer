@@ -1773,6 +1773,112 @@ Three things, none specific to this project:
   states a result, and every reader downstream -- including the retraining
   trigger -- believes it. `null` is the honest value and costs nothing.
 
+
+## 2.20 Asking the planner instead of inferring from cost
+
+Four times now this project has been bitten by the same thing, and §2.0 was the
+worst of them: pg_hint_plan silently ignoring every hint, which made every
+"candidate" byte-identical to native and every measured improvement timing
+noise. The others:
+
+* `Parallel(order_items 4 hard)` named the table where the query said `oi`.
+  Cost 7870, unchanged. `Parallel(oi 4 hard)` cost 1774.
+* `DisableIndex` does not exist in pg_hint_plan 1.6.3 — the PG18 manual
+  documents a newer one.
+* Two `/*+ ... */` comments: only the first is read, the rest vanish.
+
+Every one is the same shape. **A hint that is not applied is a SQL comment**:
+no error, no warning, and a plan identical to the one you would have got anyway.
+The defence so far has been indirect — compare the hinted plan's cost against
+native and assume a difference means the hint bound. That test has a hole big
+enough to drive all four bugs through, because it cannot distinguish
+
+* a hint that bound and legitimately changed nothing, from
+* a hint that never bound at all.
+
+Both leave the cost untouched. On the four-table query, `SeqScan(o)` and
+`SeqScan(orders)` both cost **3979.3**.
+
+### The obvious readback does not work
+
+`EXPLAIN (SETTINGS)` reports planner GUCs differing from their built-in
+defaults, which sounded like a direct answer for the `Set()` family — by
+measured value the most useful family in the action space (§2.19). It is not:
+
+| | cost | `Settings` |
+|---|---|---|
+| `SET enable_seqscan = off` | 1.0000039e10 | `{'enable_seqscan': 'off'}` |
+| `/*+ Set(enable_seqscan off) */` | 1.0000039e10 | `{}` |
+
+Identical cost effect, so the hint plainly bound. The option works; pg_hint_plan
+applies the GUC in a way that is invisible to it. Worth recording as a negative
+result, because it is the first thing anyone would reach for.
+
+### Asking pg_hint_plan directly
+
+pg_hint_plan will simply say. With `debug_print` on it emits one NOTICE per
+statement sorting the directives into `used` / `not used` / `duplication` /
+`error`, and that covers every family rather than just `Set()`:
+
+| case | reported as |
+|---|---|
+| `SeqScan(o)` — correct alias | `used hint` |
+| `SeqScan(orders)` — table name | **`not used hint`** |
+| `Set(bogus_guc off)` | **`error hint`** |
+| `DisableIndex(o)` | `hint syntax error` / `Unrecognized hint keyword` |
+| two hint comments | only the first appears; the second is in no bucket |
+
+There is a severity trap inside this, and it is why `DisableIndex` looked like
+silence for so long: hint **syntax errors arrive at `INFO`**, not at the
+configured `message_level`, and the default `client_min_messages` of `WARNING`
+discards INFO. The extension was reporting the problem the whole time to a
+channel nobody was listening on.
+
+`optimizer/hint_binding.py` parses this into a `BindingReport` with a `bound`
+property and a `problems` list. Its `bound` is deliberately false when **no**
+debug output arrived: the failure mode being defended against is a missing
+message, so "I could not tell" must never read as "it bound".
+
+### What it found in the first hour
+
+Pointed at the full action space — 92 candidates over every family — **9 did
+not bind**, and all 9 came from one family.
+
+`generate_join_method_candidates` names the growing prefixes of a join order:
+`Leading(p o oi u)` becomes `HashJoin(p o)`, `HashJoin(p o oi)`, and so on. It
+sampled its orders with no reference to the join graph. `generate_join_order_candidates`
+had taken a join graph for exactly this reason, and its docstring spells out
+why: an order that introduces a table sharing no join predicate forces a cross
+product, priced at `disable_cost`.
+
+The method generator never got the same treatment, so it could emit
+`HashJoin(p o)` for two relations with no predicate between them — `p` and `o`
+are two hops apart in `o–oi–p`. pg_hint_plan filed it under `not used hint:`
+and planned that join however it liked.
+
+That is worse than the wasted candidate the order-only generator avoids. The
+candidate still executes, still gets a latency, and is still labelled *"hash
+join throughout"* while its first join was chosen freely. It is a **mislabelled
+training row** — and mislabelled in a way correlated with the family, which is
+precisely the kind of contamination §2.18 traced from the training set to a gate
+that could not fire.
+
+The fix extracts the connected-order selection both generators should have
+shared into `_choose_orders`. **9 of 92 → 0 of 93.**
+
+### The general lesson
+
+The check that had been in place — "the hinted plan differs from native, so the
+hint worked" — is an *inference* from a side effect. The extension knew the
+answer and would have said so for the cost of one GUC. Four bugs, one of them
+invalidating an entire round of results, came from inferring what could have
+been asked.
+
+Where a component can report its own behaviour, read that report. Do not
+reconstruct it from downstream effects, however reasonable the reconstruction
+looks — the reconstruction is silent exactly when it is wrong.
+
+
 ## 3. Stretch goals
 
 **Join-method selection.** `generate_join_method_candidates`

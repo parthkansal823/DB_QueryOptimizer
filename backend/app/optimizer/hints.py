@@ -158,6 +158,25 @@ def generate_join_order_candidates(
     if len(tables) <= 1:
         return []
 
+    chosen = _choose_orders(tables, max_candidates, join_graph)
+    return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
+
+
+def _choose_orders(
+    tables: list[str],
+    max_candidates: int,
+    join_graph: dict[str, list[str]] | None = None,
+) -> list[tuple[str, ...]]:
+    """
+    The join orders to build candidates from -- connected ones where possible.
+
+    Shared by the order-only and the order x method generators. It used to be
+    inlined in the former, which is how the latter came to sample orders blindly
+    and emit method hints on prefixes that share no join predicate. Measured
+    against pg_hint_plan's own debug output, 9 of 92 candidates on a four-table
+    chain had their first method hint silently discarded for that reason -- see
+    `optimizer/hint_binding.py`.
+    """
     rng = _rng_for(tables)
 
     if join_graph:
@@ -179,10 +198,9 @@ def generate_join_order_candidates(
         # A graph that yields nothing -- a genuine cross join, or conditions the
         # parser could not read -- falls through rather than returning nothing.
         if chosen:
-            return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
+            return chosen
 
-    chosen = _sample_orders(tables, max_candidates, rng)
-    return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
+    return _sample_orders(tables, max_candidates, rng)
 
 
 # -- Bushy join trees -------------------------------------------------------
@@ -739,7 +757,10 @@ def _method_hint_for_order(order: tuple[str, ...], method: str) -> str:
 
 
 def generate_join_method_candidates(
-    tables: list[str], max_orders: int = 4, methods: tuple[str, ...] = JOIN_METHODS
+    tables: list[str],
+    max_orders: int = 4,
+    methods: tuple[str, ...] = JOIN_METHODS,
+    join_graph: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """
     Generate `Leading()` + forced-method hint strings: `max_orders` join
@@ -747,11 +768,24 @@ def generate_join_method_candidates(
     space for join-method selection -- kept separate from
     `generate_join_order_candidates` so existing callers (order-only) are
     unaffected; opt in via `generate_candidates(..., include_join_methods=True)`.
+
+    Takes the same `join_graph` as the order-only generator, and for a sharper
+    reason. A method hint names the *growing prefixes* of the order --
+    `Leading(p o oi u)` becomes `HashJoin(p o)`, `HashJoin(p o oi)`, ... -- so a
+    prefix whose relations share no join predicate is a hint pg_hint_plan cannot
+    apply. It does not complain; it lists the directive under `not used hint:`
+    and plans that join however it likes.
+
+    That is worse than the wasted candidate the order-only generator avoids. The
+    candidate still runs, still gets a latency, and is still labelled "hash join
+    throughout" while its first join was chosen freely -- a mislabelled training
+    row rather than a merely useless one. Measured on a four-table chain: 9 of 92
+    candidates, every one of them from this family.
     """
     if len(tables) <= 1:
         return []
 
-    orders = _sample_orders(tables, max_orders, _rng_for(tables))
+    orders = _choose_orders(tables, max_orders, join_graph)
 
     return [_method_hint_for_order(order, method) for order in orders for method in methods]
 
@@ -812,7 +846,9 @@ def generate_candidates(
     if include_tuning:
         candidates += generate_tuning_candidates()
     if include_join_methods and len(tables) >= 2:
-        candidates += generate_join_method_candidates(tables, max_orders=max_method_orders)
+        candidates += generate_join_method_candidates(
+            tables, max_orders=max_method_orders, join_graph=join_graph
+        )
     if include_hint_sets:
         candidates += generate_hint_sets()
     if include_bushy:

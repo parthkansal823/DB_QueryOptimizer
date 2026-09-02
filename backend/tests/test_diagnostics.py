@@ -13,8 +13,6 @@ of files that may be absent, stale or corrupt, since it is pointed at whatever
 """
 
 import json
-import sys
-import json
 import pickle
 
 import pytest
