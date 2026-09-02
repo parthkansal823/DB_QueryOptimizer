@@ -5,16 +5,18 @@ class _FakeCursor:
     """
     Serves each of `refresh`'s queries separately.
 
-    `refresh` issues three: the whole-query regression sweep, the per-family
-    one, and the observation counts that drive `caution_multiplier`. They
-    return differently shaped rows, so a fake answering them all identically
-    would feed 4-tuples into a 2-tuple unpack.
+    `refresh` issues four: the whole-query regression sweep, the per-family one,
+    the observation counts that drive `caution_multiplier`, and the median
+    native latency that gives a deviation its runtime deadline. They return
+    differently shaped rows, so a fake answering them all identically would feed
+    4-tuples into a 2-tuple unpack.
     """
 
-    def __init__(self, rows, observations=None, families=()):
+    def __init__(self, rows, observations=None, families=(), native_ms=None):
         self._rows = rows
         self._observations = observations
         self._families = list(families)
+        self._native_ms = native_ms
         self._last = rows
 
     def execute(self, query, params=None):
@@ -28,6 +30,13 @@ class _FakeCursor:
             )
         elif "family" in query:
             self._last = self._families
+        elif "percentile_cont" in query:
+            # Median native latency per query, used for the runtime deadline.
+            self._last = (
+                list(self._native_ms.items())
+                if self._native_ms is not None
+                else [(r[0], r[1]) for r in self._rows]
+            )
         else:
             self._last = self._rows
 

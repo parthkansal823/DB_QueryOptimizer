@@ -1,27 +1,68 @@
+# Everything this project produces at runtime lives inside the repo directory,
+# so that "where is my data" has one answer you can look at, back up and delete.
+# That makes this file the boundary between the project and its output: nothing
+# below is source, and none of it should reach a clone.
+
+# -- language and tooling artifacts -----------------------------------------
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .env
-*.pkl
-node_modules/
 .venv/
+node_modules/
 dist/
+.vite/
 .trunk/
 .claude/
 
-# JOB/IMDB stretch goal: large downloaded dataset + its own git clone --
-# fetched via the steps in data/job/README.md, not tracked here.
+# -- the database -----------------------------------------------------------
+# `docker-compose.yml` bind-mounts this as PostgreSQL's data directory instead
+# of using a Docker named volume, so the database is visible in the repo rather
+# than hidden in Docker's storage. It is roughly 9.5GB with the JOB/IMDB
+# dataset loaded, and it is rebuilt by `docker compose up` from
+# `postgres/init/` and `data/schema.sql`.
+data/pgdata/
+
+# -- the JOB/IMDB stretch goal ----------------------------------------------
+# ~4.8GB of downloaded benchmark data and a git clone of the query set. Fetched
+# via the steps in data/job/README.md rather than tracked here.
 data/job/imdb.tgz
 data/job/csv/
 data/job/queries/
 
-# Local model runtime state: the version registry and stored versions are
-# per-machine (app.retrain rebuilds them), and _challenger* are scratch files
-# from a retrain that may not have been promoted. Committed eval_results*.json
-# are kept deliberately -- they're the reported numbers.
+# -- trained models and runtime state ---------------------------------------
+# Model bundles are per-machine: they carry the feature columns and table
+# cardinalities of the schema they were trained against, so one machine's
+# pickle is meaningless on another's data.
+*.pkl
 backend/models/registry.json
 backend/models/versions/
 backend/models/_challenger*
-# Runtime configuration set from the dashboard. Per-machine, like the registry
-# above -- committing one machine's thresholds would apply them to everyone
-# else's checkout at import, now that they are actually read at startup.
+
+# Written by `app.calibrate --apply`, and measured against whatever data this
+# machine has collected. Committing one would apply another machine's safety
+# thresholds to every checkout, which `app/settings.py` reads at startup.
+backend/models/gate.json
+
+# Runtime configuration set from the dashboard, for the same reason.
 backend/models/settings.json
+
+# The generated workload for whichever database was onboarded here, and the
+# saved queries behind the dashboard's query manager. Both describe a schema
+# this checkout may not have.
+backend/models/workload_*.json
+backend/models/queries/
+
+# Deliberately NOT ignored: `backend/models/eval_results*.json`. Those are the
+# numbers the README and docs/WRITEUP.md report, and a result nobody can see is
+# a result nobody can check.
+
+# -- scratch ----------------------------------------------------------------
+*.log
+.DS_Store
+Thumbs.db

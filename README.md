@@ -23,6 +23,15 @@ safety gate, and 492 tests behind CI.
 | [`docs/WRITEUP.md`](docs/WRITEUP.md) | Design notes, results, comparison to published work |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | How it was built, stage by stage |
 | [`docs/JOB_RESULTS.md`](docs/JOB_RESULTS.md) | Results on the real JOB/IMDB benchmark |
+| [`docs/CONFIDENCE.md`](docs/CONFIDENCE.md) | **How the optimizer decides whether to trust itself** — and the two fixes that were measured and reverted |
+| [`docs/DATABASE_OPTIMIZATION.md`](docs/DATABASE_OPTIMIZATION.md) | Fixing the *database* rather than one query: correlated columns, server settings, index and table health |
+
+> **Read `docs/WRITEUP.md` §2.4.0 before the numbers below.** The seed data in
+> `data/schema.sql` had a bug that gave every categorical column exactly one
+> distinct value — every user in London, every product one brand — so the
+> correlated columns this schema exists to provide had no correlation in them.
+> It is fixed, and the measurements taken before it was found are measurements
+> of a database that did not contain the phenomenon they were about.
 
 ## The benchmark is the bottleneck (read this first)
 
@@ -145,6 +154,59 @@ on each EXPLAIN plan and `pg_class` statistics via `schema_introspection.py`,
 rather than being hardcoded. Point `DATABASE_URL` at a different schema and
 the same pipeline adapts with no code changes.
 
+## What it does, in plain terms
+
+Five things, in the order a query meets them.
+
+**1. It writes alternative versions of your query.** Not different SQL — the
+same query with a `pg_hint_plan` comment on the front that changes how
+PostgreSQL executes it. Different join orders, different join methods, operators
+switched off, and settings like `work_mem` and parallel workers. About 20
+alternatives per query.
+
+**2. It predicts which one is fastest — without running them.** Each alternative
+is planned with `EXPLAIN` (nothing executes) and turned into a feature vector
+describing the plan's shape. A model trained on real timings predicts how each
+compares to PostgreSQL's own choice.
+
+**3. It decides whether it is confident enough to act.** This is the part that
+matters most, and it is where a query optimizer earns or loses trust. Two
+questions: is there an expected win, and is the worst case bounded? If either
+fails, PostgreSQL's plan runs unchanged. `docs/CONFIDENCE.md` is the whole
+story, including two fixes that were measured and thrown away.
+
+**4. It protects itself from being wrong.** A query with a history of getting
+slower is blocked from deviating. A query never seen before gets a stricter bar,
+because nothing is watching it yet. And a deviation that overruns its time
+budget is cancelled and PostgreSQL's plan run instead — so "not much worse than
+native" is enforced, not just predicted.
+
+**5. It looks at the database, not only the query.** Correlated columns the
+planner does not know about, indexes nobody reads, statistics describing a table
+that has since changed, server settings that are defaults rather than decisions.
+Each is fixed once and helps every query afterwards, including ones this system
+has never seen. See `docs/DATABASE_OPTIMIZATION.md`.
+
+Everything it decides is inspectable. `python -m app.diagnostics` answers "should
+I believe this model", `python -m app.dbadvisor` answers "what is wrong with this
+database", and the dashboard shows both.
+
+### Things worth knowing before trusting a number
+
+- **The benchmark reports two figures**, and the second is the honest one. Most
+  of the built-in workload is in the model's training set, so the headline is
+  substantially a memorisation score. The held-out figure below it is the one
+  that says whether the model generalises.
+- **A single benchmark run cannot settle a comparison.** Native totals on this
+  database swing about 13% between identical runs. `python -m app.experiment`
+  interleaves two arms, puts a bootstrap interval around the difference, and
+  reports **unresolved** when the interval spans zero.
+- **`docs/WRITEUP.md` keeps the failures.** A learned cardinality correction that
+  raised the ceiling by 0.0%; a conformal bound that was correct and unusable; a
+  gate that calibrated itself into doing nothing; a seed-data bug that removed
+  the phenomenon the whole schema was built around. Those are in the record with
+  their numbers.
+
 ## Tech stack
 
 - **Database**: PostgreSQL 16 + `pg_hint_plan`, built from source (see
@@ -228,6 +290,8 @@ decision went the way it did, and the history across every run so far.
 | `GET /stats/regret` | Cumulative regret. Below 1.0 means the optimizer is earning its keep |
 | `GET /model/status` | Deployed version, pending feedback, blocked queries |
 | `GET /model/diagnostics` | **Why** it is behaving that way: is the gate consulting uncertainty, was it calibrated on enough queries, is the uncertainty on the right scale |
+| `POST /advisor/rank` | Which missing index would actually help, measured with hypothetical indexes — no index is built |
+| `POST /experiment/start` / `GET /experiment/status` | Run a paired A/B comparison with a bootstrap interval and a sign test |
 | `POST /model/retrain` / `POST /model/rollback` | Drive the learning loop |
 | `GET /advisor` | Schema-wide fixes, currently unindexed foreign keys |
 
@@ -244,6 +308,33 @@ about 2.7%.
 second `job` database in the same container. See `data/job/README.md` for the
 download and load steps, and `docs/WRITEUP.md` §2.3 and §3 for why the
 pipeline needed no code changes to support it.
+
+## Where the data lives
+
+Everything this project produces at runtime is inside the repo directory, so
+"where is my data" has one answer you can look at, back up and delete:
+
+| path | what | size here |
+|---|---|---|
+| `data/pgdata/` | **the PostgreSQL data directory** — bind-mounted by `docker-compose.yml` rather than a Docker named volume | 9.5 GB |
+| `data/job/csv/` | the downloaded JOB/IMDB dataset | 4.8 GB |
+| `backend/models/` | trained bundles, the calibrated gate, generated workloads, saved queries | 23 MB |
+
+A Docker named volume would have been the conventional choice and is the reason
+this is worth stating: a named volume is invisible from the filesystem, easy to
+forget, and easy to destroy with a stray `docker compose down -v`. Bind-mounting
+the data directory trades a little Docker idiom for being able to see, copy and
+delete the database like any other directory.
+
+All three are in `.gitignore`. The one runtime artifact that is *not* ignored is
+`backend/models/eval_results*.json` — those are the numbers the README and
+`docs/WRITEUP.md` report, and a result nobody can see is a result nobody can
+check.
+
+The container's `node_modules` stays a named volume on purpose. It is a build
+artifact rather than data, and it has to be the Linux build: the repo is
+bind-mounted into the container, so without a volume shadowing it the container
+would import modules compiled for the host platform.
 
 ## Project layout
 
@@ -264,6 +355,9 @@ learned-query-optimizer/
 │       ├── schema_introspection.py  table row counts from pg_class, any schema
 │       ├── advisor.py            index and statistics recommendations
 │       ├── diagnostics.py        model/gate health: why it behaves as it does
+│       ├── hypothetical.py       what an index would be worth, via HypoPG
+│       ├── query_template.py     parameterised statements share one identity
+│       ├── experiment_job.py     paired A/B comparisons, run from the dashboard
 │       ├── workload.py           the 25-query benchmark workload
 │       ├── collect_data.py       offline collection -> plan_execution_log
 │       ├── train.py              trains and evaluates the model
@@ -362,6 +456,31 @@ Three findings behind those numbers are worth more than the numbers:
   reported a 97% improvement where the paired figure was about 18%.
   `docs/METRICS.md` §2 works through it.
 
+## Read the benchmark's second number, not its first
+
+`app.benchmark` reports the headline capture rate and then, separately, the
+same figure restricted to queries the model **never trained on**:
+
+```
+=== totals across 24 queries ===
+captured 52.7% of the 393 ms available headroom
+
+--- of those, 11 the model never trained on ---
+captured 52.7% of the 247 ms available headroom
+this is the number that says whether the model generalises;
+the one above largely says how well it memorised.
+```
+
+Most of this workload is in the model's training set — 21 of 24 on that run —
+so the headline is substantially a memorisation score. `docs/WRITEUP.md` §2.2.1
+already documents offline evaluation being optimistically biased; this is that
+bias in the project's own headline metric, and the split is the same correction
+`app.stats` made when it stopped dividing two averages over different
+populations.
+
+On this run the two agree, which is the result worth having: the model
+generalises to queries it has not seen.
+
 ## Known limitations
 
 `docs/WRITEUP.md` §4 keeps an honest list, split into what has been fixed and
@@ -394,6 +513,10 @@ deviate on any predicted win at all.
 | `CONFORMAL_ALPHA` | `0.1` | Risk level for the conformal gate; applied when the model trains |
 | `INCLUDE_JOIN_METHODS` | `0` (off) | Serve forced `HashJoin`/`NestLoop`/`MergeJoin` candidates as well as join orders |
 | `INCLUDE_TUNING` | `1` | Resource/cost-model candidates: parallel workers, `work_mem`, `random_page_cost`, `join_collapse_limit` |
+| `MAX_REGRESSION_RATIO` | `1.25` | Ceiling on the pessimistic case when deviating — the risk half of the gate |
+| `RUNTIME_TIMEOUT_FACTOR` | `3.0` | Abandon a deviation once it has taken this many times what native costs |
+| `GROUP_BY_TEMPLATE` | `1` | Treat `city='Mumbai'` and `city='London'` as one query |
+| `ADAPTIVE_CANDIDATE_BUDGET` | `1` | Plan fewer candidates for queries PostgreSQL already prices as cheap |
 | `GUARD_TOLERANCE` | `0.10` | How much slower than native a query may average before the guard blocks it |
 | `GUARD_MIN_OBSERVATIONS` | `3` | Served executions needed before the guard will judge a query |
 | `AUTO_RETRAIN_SECONDS` | `0` (off) | Retrain on a background interval; promotion is still gated |
@@ -401,6 +524,60 @@ deviate on any predicted win at all.
 
 `GUARD_TOLERANCE` and `GUARD_MIN_OBSERVATIONS` were declared settings that
 nothing read; the guard kept its constructor defaults whatever they were set to.
+
+## The safety gate asks two questions, not one
+
+The gate decides whether to deviate from PostgreSQL. It used to ask a single
+question — would the *pessimistic* case still win?
+
+```
+predicted_ratio + z · sigma  <  1 - min_relative_gain
+```
+
+That reads as "even if the model is wrong, this still beats native", which is a
+much stronger demand than it looks and throws away the best bets the system
+has. A measured example from the dashboard: a six-table join where the model
+predicted **0.20×** native and the truth was 0.16× — a **5.9× speedup**, with
+the point estimate almost exactly right. The ensemble happened to disagree with
+itself on that query, so the pessimistic figure came out at 1.13×, and the rule
+refused. It declined a five-fold win because the worst case was a 13% loss.
+
+The two things being asked are different, so they are now asked separately:
+
+| question | asked of | condition |
+|---|---|---|
+| Is there an expected win? | the point estimate | `predicted < 1 - min_relative_gain` |
+| Is the downside bounded? | the uncertainty | `pessimistic < MAX_REGRESSION_RATIO` |
+
+The first is about the *size* of the opportunity; the second is a ceiling on
+risk, not a demand that the worst case also be good. That is also what Bao
+actually claims a learned optimizer must guarantee: never *much* worse than the
+optimizer it replaces. Never worse at all is a different, unachievable promise.
+
+Both dashboard cases come out right under it. The 5.9× win deviates (0.20
+clears the gain bar, 1.13 is inside the ceiling). A candidate predicted at 0.89×
+whose pessimistic case is 1.32× is held, because that one really is a coin flip
+on a small edge.
+
+Measured over the built-in workload, same harness, same model:
+
+| gate | vetoes | oracle headroom captured |
+|---|---|---|
+| worst-case-must-win | 20/24 | 13.5% |
+| no gate at all | 2/24 | 26.0% |
+| **expected win + bounded downside** | 10/24 | **52.7%** |
+
+The gate now beats following the model blindly, because it lets the good bets
+through *and* blocks the bad ones.
+
+## Enforcing it, not just predicting it
+
+Every mechanism above reasons about a plan before it runs. `RUNTIME_TIMEOUT_FACTOR`
+is the only one that acts once a prediction has already turned out wrong: a
+deviation is given a deadline derived from what native actually costs on that
+query, and if it runs past it the statement is cancelled and PostgreSQL's plan
+is run instead. Queries with no measured history get no deadline, and native
+itself never gets one — cancelling it would leave nothing to fall back to.
 
 ## A safety gate with a guarantee, not a constant
 

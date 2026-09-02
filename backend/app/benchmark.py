@@ -46,6 +46,16 @@ from app.workload import WORKLOAD
 DEFAULT_STATEMENT_TIMEOUT_MS = 30_000
 
 
+def _held_out_ids(optimizer) -> set[str]:
+    """
+    Which workload queries the deployed model never trained on.
+
+    `app.train` records this in the bundle for `app.calibrate`; the benchmark
+    needs it for a different and more uncomfortable reason.
+    """
+    return set(getattr(optimizer, "held_out_queries", None) or ())
+
+
 def run(
     policy: str = "greedy",
     risk_lambda: float = 1.0,
@@ -53,6 +63,7 @@ def run(
     quiet: bool = False,
     limit: int | None = None,
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    gate: dict | None = None,
 ) -> dict:
     """Run the workload and return the run's metrics.
 
@@ -63,13 +74,36 @@ def run(
     """
     say = (lambda *a, **k: None) if quiet else print
     workload = WORKLOAD[:limit] if limit else WORKLOAD
-    optimizer = LearnedOptimizer(policy=policy, risk_lambda=risk_lambda, seed=0)
+    # `gate` overrides the deployed thresholds for this run only, which is what
+    # lets `app.calibrate --measure` compare settings by executing them instead
+    # of replaying a log against them. Passing them explicitly also bypasses
+    # `models/gate.json`, so a sweep is not silently measuring the incumbent.
+    optimizer = LearnedOptimizer(
+        policy=policy, risk_lambda=risk_lambda, seed=0, **(gate or {})
+    )
     selector_mode = "learned" if optimizer.model is not None else "heuristic"
     say(f"selector mode: {selector_mode}" + (f" (policy: {policy})" if selector_mode == "learned" else ""))
 
     native_total = served_total = oracle_total = 0.0
     n_vetoed = 0
     n_guarded = 0
+
+    # The same three totals, restricted to queries the model never trained on.
+    #
+    # This split is the difference between a number that flatters the model and
+    # one that says whether it works. Most of this workload is in the model's
+    # training set -- 21 of 24 on the run that prompted this -- so the headline
+    # figure is largely a measure of how well it memorised, and it read 40.8%
+    # while the same model on the 11 genuinely unseen queries was *losing* 10%.
+    #
+    # docs/WRITEUP.md 2.2.1 already documents offline evaluation being
+    # optimistically biased. This is that bias in the project's own headline
+    # metric, and reporting the two side by side is the same correction
+    # `app.stats` made when it stopped dividing two averages over different
+    # populations.
+    held_out = _held_out_ids(optimizer)
+    held_native = held_served = held_oracle = 0.0
+    n_held_out = 0
 
     with get_cursor() as cur:
         cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
@@ -136,10 +170,17 @@ def run(
             # The best any selector could have done -- the ceiling this run
             # was measured against (see docs/WRITEUP.md on why the oracle
             # matters for reading these numbers).
-            oracle_total += min(
+            best = min(
                 [baseline["actual_total_time_ms"]]
                 + [c["actual_total_time_ms"] for c in candidates]
             )
+            oracle_total += best
+
+            if query_id in held_out:
+                n_held_out += 1
+                held_native += baseline["actual_total_time_ms"]
+                held_served += served_plan["actual_total_time_ms"]
+                held_oracle += best
 
             say(f"--- {query_id} ({len(candidates)} candidates) ---")
             say(f"baseline (native Postgres): {baseline['actual_total_time_ms']:.2f} ms")
@@ -172,6 +213,29 @@ def run(
         say(f"captured {captured:.1f}% of the {headroom:.0f} ms available headroom")
     say(f"safety vetoes: {n_vetoed}/{len(workload)}   guard-blocked: {n_guarded}/{len(workload)}")
 
+    # The honest half. Without it the line above is mostly a memorisation score.
+    held_headroom = held_native - held_oracle
+    held_captured = (
+        (held_native - held_served) / held_headroom * 100 if held_headroom > 0 else None
+    )
+    if n_held_out:
+        say("")
+        say(f"--- of those, {n_held_out} the model never trained on ---")
+        say(f"native total:        {held_native:.2f} ms")
+        say(f"served total:        {held_served:.2f} ms")
+        if held_captured is not None:
+            say(f"captured {held_captured:.1f}% of the {held_headroom:.0f} ms available headroom")
+        say("this is the number that says whether the model generalises;")
+        say("the one above largely says how well it memorised.")
+    elif held_out:
+        say("")
+        say("none of this workload was held out of training, so every number")
+        say("above is in-sample. Retrain, or read app.calibrate instead.")
+    else:
+        say("")
+        say("this model does not record which queries it held out, so none of")
+        say("the above can be separated into seen and unseen. Retrain to fix.")
+
     return {
         "policy": policy,
         "guard": use_guard,
@@ -182,6 +246,13 @@ def run(
         "captured_pct": captured,
         "n_vetoed": n_vetoed,
         "n_guarded": n_guarded,
+        # Reported separately and never folded into `captured_pct`, so a caller
+        # that wants the flattering number has to ask for it by name.
+        "n_held_out": n_held_out,
+        "held_out_native_ms": held_native,
+        "held_out_served_ms": held_served,
+        "held_out_oracle_ms": held_oracle,
+        "held_out_captured_pct": held_captured,
     }
 
 

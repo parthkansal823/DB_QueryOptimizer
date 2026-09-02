@@ -166,6 +166,112 @@ FIELDS: dict[str, dict] = {
         "env": "INCLUDE_JOIN_METHODS",
         "default": False,
     },
+    "include_bushy": {
+        "type": "bool",
+        "label": "Bushy join trees",
+        "group": "Action space",
+        "help": (
+            "Adds `Leading(((a b) (c d)))` candidates -- plan trees no left-deep "
+            "ordering can express, where two pairs are built independently and "
+            "then joined. Worth it when both halves filter down hard, since a "
+            "left-deep tree has to carry the first table's rows through every "
+            "later join. Needs at least four tables."
+        ),
+        "env": "INCLUDE_BUSHY",
+        "default": False,
+    },
+    "include_scan_methods": {
+        "type": "bool",
+        "label": "Per-table scan methods",
+        "group": "Action space",
+        "help": (
+            "Forces a sequential, index, bitmap or index-only scan on one table "
+            "at a time. The surgical version of the operator toggles, which ban "
+            "a scan type for the whole statement including on the small lookup "
+            "table where it was the right choice."
+        ),
+        "env": "INCLUDE_SCAN_METHODS",
+        "default": False,
+    },
+    "include_negative_scans": {
+        "type": "bool",
+        "label": "Negative scan hints",
+        "group": "Action space",
+        "help": (
+            "`NoSeqScan(t)` rather than `IndexScan(t)`: says only what not to do "
+            "and leaves the planner free to choose among the rest. A strictly "
+            "weaker constraint, so it cannot ask for an index scan that no "
+            "usable index can satisfy."
+        ),
+        "env": "INCLUDE_NEGATIVE_SCANS",
+        "default": False,
+    },
+    "include_negative_joins": {
+        "type": "bool",
+        "label": "Negative join methods",
+        "group": "Action space",
+        "help": (
+            "`NoNestLoop(a b c)` bans an operator across the whole join without "
+            "pinning the order, so a loss can be attributed to the operator "
+            "rather than to the ordering that forced-method candidates carry "
+            "along with it."
+        ),
+        "env": "INCLUDE_NEGATIVE_JOINS",
+        "default": False,
+    },
+    "include_memoize": {
+        "type": "bool",
+        "label": "Per-join memoization",
+        "group": "Action space",
+        "help": (
+            "Whether the inner side of a nested loop caches results across "
+            "repeated outer values. The planner decides from `ndistinct`, which "
+            "is the statistic most often wrong on the correlated columns this "
+            "project targets."
+        ),
+        "env": "INCLUDE_MEMOIZE",
+        "default": False,
+    },
+    "include_parallel": {
+        "type": "bool",
+        "label": "Per-table parallel workers",
+        "group": "Action space",
+        "help": (
+            "`Parallel(t 4 hard)` overrides PostgreSQL's table-size heuristic "
+            "and demands the workers, which `max_parallel_workers_per_gather` "
+            "cannot -- that only raises a ceiling the heuristic still gates. "
+            "Measured 4.4x on a four-table join here."
+        ),
+        "env": "INCLUDE_PARALLEL",
+        "default": False,
+    },
+    "include_enable_settings": {
+        "type": "bool",
+        "label": "Partitionwise join and aggregate",
+        "group": "Action space",
+        "help": (
+            "The only two planner features that ship switched off, so no "
+            "operator toggle can reach them. They join or group matching "
+            "partitions pairwise instead of appending first. Planning costs more "
+            "and memory can climb with the partition count, so they are worth "
+            "measuring per query rather than setting globally."
+        ),
+        "env": "INCLUDE_ENABLE_SETTINGS",
+        "default": False,
+    },
+    "include_index_pinning": {
+        "type": "bool",
+        "label": "Pin a specific index",
+        "group": "Action space",
+        "help": (
+            "`IndexScan(t idx)` chooses which index, not just which access "
+            "method -- a separate decision the planner also makes from "
+            "selectivity estimates. Reads index names from the catalog once per "
+            "process and keys them by the query's own aliases."
+        ),
+        "env": "INCLUDE_INDEX_PINNING",
+        "default": False,
+    },
     "adaptive_candidate_budget": {
         "type": "bool",
         "label": "Scale candidates to query cost",
@@ -179,6 +285,21 @@ FIELDS: dict[str, dict] = {
         "env": "ADAPTIVE_CANDIDATE_BUDGET",
         "default": True,
     },
+    "group_by_template": {
+        "type": "bool",
+        "label": "Treat parameters as the same query",
+        "group": "Performance",
+        "help": (
+            "Groups `WHERE city = 'Mumbai'` with `WHERE city = 'London'`. Every "
+            "per-query mechanism -- the regression guard, the caution applied to "
+            "unseen queries, the decision cache, the trend chart -- is keyed on "
+            "query identity, and keying on literal text meant a parameterised "
+            "application looked like thousands of one-off queries. Changing this "
+            "re-keys history rather than migrating it."
+        ),
+        "env": "GROUP_BY_TEMPLATE",
+        "default": True,
+    },
     "decision_cache_seconds": {
         "type": "float", "min": 0.0, "max": 3600.0, "step": 10.0,
         "label": "Decision cache TTL (seconds)",
@@ -190,6 +311,36 @@ FIELDS: dict[str, dict] = {
         ),
         "env": "DECISION_CACHE_SECONDS",
         "default": 300.0,
+    },
+    "shadow_sample_rate": {
+        "type": "float", "min": 0.0, "max": 1.0, "step": 0.05,
+        "label": "Measure native on this share of deviations",
+        "group": "Performance",
+        "help": (
+            "`/query/optimize` runs only the plan it chose, so a deviating "
+            "request logs no baseline and every paired statistic drops it -- the "
+            "trend panel is built entirely from the measuring paths, not from "
+            "served traffic. Sampling some deviations and running PostgreSQL's "
+            "plan alongside puts real traffic back into those numbers, at one "
+            "extra execution on the sampled requests. 0 disables it."
+        ),
+        "env": "SHADOW_SAMPLE_RATE",
+        "default": 0.1,
+    },
+    "runtime_timeout_factor": {
+        "type": "float", "min": 0.0, "max": 20.0, "step": 0.5,
+        "label": "Abandon a deviation after (x native)",
+        "group": "Safety gate",
+        "help": (
+            "A deviation is cancelled and PostgreSQL's plan run instead once it "
+            "has taken this many times what native costs on the same query. "
+            "Every other safety mechanism here reasons about a plan before it "
+            "runs; this is the only one that acts once a prediction has already "
+            "turned out wrong. 0 disables it. Queries with no measured history "
+            "get no deadline."
+        ),
+        "env": "RUNTIME_TIMEOUT_FACTOR",
+        "default": 3.0,
     },
     "guard_tolerance": {
         "type": "float", "min": 0.0, "max": 2.0, "step": 0.01,

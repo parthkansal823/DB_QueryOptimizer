@@ -108,8 +108,33 @@ def _grouped_rows(exclude_prefix: str | None = None) -> dict[str, list[dict]]:
     So the population is a parameter. Generated queries are excellent *training*
     data -- they took the model's typical error from 43% to 24% -- and a poor
     basis for choosing a threshold that will be spent somewhere else.
+
+    ## Why only the most recent run of each query counts
+
+    The log accumulates across every collection this database has ever seen,
+    and those did not run under the same conditions. Measured here, the *same*
+    native query ranges from 2.4 ms to 13.7 ms across runs, and another from
+    88.8 ms to 217.6 ms -- a 5.7x and a 2.4x spread with nothing to do with
+    plan quality. Some of those sweeps were collected while a 74M-row dataset
+    was loading on the same machine.
+
+    Replaying all of it compares a candidate measured in one run against a
+    native measured in another, which is comparing machine states rather than
+    plans. That is exactly the unpaired comparison `app.stats` was rewritten to
+    eliminate -- it groups by `(query, created_at)` because `created_at` is
+    frozen per transaction and so identifies one run -- and this module was
+    still doing the thing that module exists to prevent.
+
+    It is not a small effect. On this log the all-history replay reported every
+    gate setting losing 15-25% with regressions up to 1.96x, while a live
+    benchmark of the same gate captured 40.8% of the available headroom. The
+    replay was wrong, and it had been steering the deployed threshold.
+
+    Keeping the latest `created_at` per query keeps the comparison inside one
+    run: the native plan and every candidate for that query were measured
+    moments apart, under whatever conditions held at the time.
     """
-    rows = _aggregate_repetitions(_load_rows())
+    rows = _aggregate_repetitions(_load_rows(), latest_run_only=True)
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         query_id = row["query_id"]
@@ -117,6 +142,39 @@ def _grouped_rows(exclude_prefix: str | None = None) -> dict[str, list[dict]]:
             continue
         grouped.setdefault(query_id, []).append(row)
     return grouped
+
+
+def _servable(candidates: list[dict]) -> list[dict]:
+    """
+    Keep only the candidates a served query would actually be offered.
+
+    The log is a record of everything ever *collected*, and collection
+    deliberately explores wider than serving does: `app.collect_data` gathers
+    the forced join-method family, and `optimizer/planner.py` then trims what a
+    live query sees by `budget_for` and by the regression guard's per-family
+    blocking.
+
+    Replaying the whole log therefore scores a gate against an action space no
+    query is ever given. That is not a rounding error. The all-candidates replay
+    reported every setting losing 10-25% with a worst case of 1.83x, because it
+    kept choosing forced nested-loop plans the live path had already dropped --
+    while a live benchmark of the same gate captured 52.7% of the available
+    headroom, on held-out queries as much as on seen ones.
+
+    Filtering by hint family rather than by exact hint string keeps this robust
+    to the action space being retuned: what matters is that the replay and the
+    serving path agree about which *kinds* of plan are on the table.
+    """
+    from app.optimizer import planner
+    from app.optimizer.regression_guard import hint_family
+
+    allowed = {"join_order", "operator_toggle", "cardinality"}
+    if planner.INCLUDE_TUNING:
+        allowed.add("resource")
+    if planner.INCLUDE_JOIN_METHODS:
+        allowed.add("join_method")
+
+    return [c for c in candidates if hint_family(c.get("hint")) in allowed]
 
 
 def evaluate_setting(
@@ -147,6 +205,9 @@ def evaluate_setting(
 
         native_ms = baselines[0]["actual_total_time_ms"]
         candidates = [_row_to_candidate(r) for r in candidates_rows]
+        candidates = _servable(candidates)
+        if not candidates:
+            continue
         latencies = [c["actual_total_time_ms"] for c in candidates]
         vectors = [to_vector(featurize(c, cardinalities), feature_columns) for c in candidates]
 
@@ -353,6 +414,73 @@ def _held_out_queries(bundle: dict, grouped: dict[str, list[dict]]) -> set[str]:
     return usable if len(usable) >= 4 else set()
 
 
+# A small, hand-picked grid. Measuring costs a full workload sweep per setting,
+# so this cannot be the 50-point grid the replay sweeps -- and it does not need
+# to be: the replay's own table shows the interesting region is a handful of
+# points, and what was wrong with it was never the resolution.
+MEASURED_GRID: tuple[dict, ...] = (
+    {"confidence_z": 0.0, "min_relative_gain": 0.0},
+    {"confidence_z": 0.5, "min_relative_gain": 0.05},
+    {"confidence_z": 1.0, "min_relative_gain": 0.05},
+    {"confidence_z": 1.0, "min_relative_gain": 0.10},
+    {"confidence_z": 2.0, "min_relative_gain": 0.20},
+)
+
+
+def measure_settings(
+    policy: str = "greedy",
+    grid: tuple[dict, ...] = MEASURED_GRID,
+    limit: int | None = None,
+) -> list[dict]:
+    """
+    Score each gate setting by **running** the workload under it.
+
+    ## Why this exists next to `sweep`
+
+    `sweep` replays the execution log: for each logged candidate it asks what
+    the model would have picked and what that row's recorded latency was. That
+    is fast, needs no database time, and on this project it was wrong.
+
+    Three separate ways, each fixed and each still leaving a gap:
+
+      * it compared a candidate measured in one collection against a native
+        measured in another, when the same query's native time ranges 2.4 ms to
+        13.7 ms across runs (`_grouped_rows`);
+      * it scored gates against every hint ever *collected*, including families
+        the serving path no longer offers (`_servable`);
+      * it was tuned on generated queries whose available headroom is a third of
+        the workload's, then spent on that workload (`exclude_prefix`).
+
+    After all three, the replay still reported every setting losing 6% while a
+    live benchmark of the same model and the same gate captured 52.7% of the
+    available headroom. At some point the honest move is to stop patching the
+    proxy and measure the thing.
+
+    This runs `app.benchmark` once per setting with that setting's thresholds
+    forced. It costs a full sweep per row, so the grid is small -- but every
+    number it returns was produced by executing the plans it is describing.
+
+    Still one sample per setting, so read it with the noise in mind: native
+    totals on this database swing about 13% between identical runs. For a
+    difference that matters, `app.experiment` puts an interval around it.
+    """
+    from app.benchmark import run as run_benchmark
+
+    measured = []
+    for setting in grid:
+        result = run_benchmark(policy=policy, quiet=True, limit=limit, gate=setting)
+        measured.append({
+            **setting,
+            "captured_pct": result.get("captured_pct"),
+            "held_out_captured_pct": result.get("held_out_captured_pct"),
+            "n_held_out": result.get("n_held_out"),
+            "n_vetoed": result.get("n_vetoed"),
+            "native_ms": result.get("native_ms"),
+            "served_ms": result.get("served_ms"),
+        })
+    return measured
+
+
 def apply_gate(setting: dict, path: str = GATE_PATH) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -395,7 +523,48 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--apply", action="store_true", help="write the recommendation to models/gate.json")
+    parser.add_argument(
+        "--measure",
+        action="store_true",
+        help=(
+            "score a small grid by running the workload under each setting "
+            "instead of replaying the log against it -- slower, and the numbers "
+            "come from executing the plans rather than from historical rows"
+        ),
+    )
+    parser.add_argument("--limit", type=int, default=None, help="workload queries per measured run")
     args = parser.parse_args()
+
+    if args.measure:
+        rows = measure_settings(policy=args.policy, limit=args.limit)
+        print(f"{'z':>5} {'min_gain':>9} {'vetoed':>7} {'captured':>9} {'held-out':>9}")
+        for r in rows:
+            captured = "-" if r["captured_pct"] is None else f"{r['captured_pct']:.1f}%"
+            held = "-" if r["held_out_captured_pct"] is None else f"{r['held_out_captured_pct']:.1f}%"
+            print(
+                f"{r['confidence_z']:>5.2f} {r['min_relative_gain']:>9.2f} "
+                f"{r['n_vetoed']:>7} {captured:>9} {held:>9}"
+            )
+        usable = [r for r in rows if r["held_out_captured_pct"] is not None]
+        if usable:
+            # Chosen on the held-out column: the other one largely measures how
+            # well the model memorised this workload.
+            best = max(usable, key=lambda r: r["held_out_captured_pct"])
+            print(
+                f"\nBest on held-out queries: confidence_z={best['confidence_z']}, "
+                f"min_relative_gain={best['min_relative_gain']} "
+                f"({best['held_out_captured_pct']:.1f}% of {best['n_held_out']} unseen queries)"
+            )
+            if args.apply:
+                apply_gate({
+                    **best,
+                    "n_queries": best.get("n_held_out") or 0,
+                    "deviation_rate": 0.0,
+                    "regression_rate": 0.0,
+                    "worst_regression_ratio": 1.0,
+                })
+                print(f"Written to {GATE_PATH} -- restart the backend to pick it up.")
+        raise SystemExit(0)
 
     report = sweep(
         policy=args.policy,

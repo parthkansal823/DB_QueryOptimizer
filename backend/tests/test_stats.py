@@ -177,7 +177,12 @@ def test_fingerprint_is_stable_across_formatting():
 
 
 def test_fingerprint_distinguishes_different_queries():
-    assert query_fingerprint("SELECT 1") != query_fingerprint("SELECT 2")
+    # Genuinely different queries: different tables, not different parameters.
+    # `SELECT 1` and `SELECT 2` now share an id on purpose -- see
+    # `app/query_template.py` and tests/test_query_template.py.
+    assert query_fingerprint("SELECT * FROM orders") != query_fingerprint(
+        "SELECT * FROM users"
+    )
 
 
 def test_fingerprint_is_marked_as_adhoc():

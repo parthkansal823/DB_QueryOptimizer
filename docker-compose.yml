@@ -23,7 +23,13 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # The database lives in the repo directory rather than in a Docker named
+      # volume, so everything this project produces is in one place you can see,
+      # back up, and delete. A named volume is invisible from the filesystem and
+      # survives `docker compose down -v` being forgotten; this does not.
+      #
+      # `data/pgdata/` is gitignored -- it is 9.5GB of database, not source.
+      - ./data/pgdata:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d
       - ./data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql
       # Read-only: lets `data/job/load_job.sh` COPY the JOB/IMDB CSVs
@@ -33,7 +39,15 @@ services:
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo
+      # `lqo_v2` rather than `lqo`. The original was seeded before the bug in
+      # data/schema.sql was found: a `CROSS JOIN LATERAL (... ORDER BY random()
+      # LIMIT 1)` that PostgreSQL is free to evaluate once, so every user got the
+      # same city and every product the same brand. `SELECT count(DISTINCT city)`
+      # returned 1 across 50,000 rows, which means the correlated columns this
+      # whole project is built around had no correlation because they had no
+      # variety. The old database is kept rather than dropped so the two can be
+      # compared.
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo_v2
       FRONTEND_ORIGIN: http://localhost:5173
       # Measured best on this dataset: 87.8% of oracle headroom captured
       # versus 77.2% for the ensemble policies (docs/WRITEUP.md 2.1).
@@ -63,5 +77,9 @@ services:
       - frontend_node_modules:/app/node_modules
 
 volumes:
-  pgdata:
+  # `node_modules` stays a named volume on purpose, unlike the database above.
+  # It is not project data -- it is a build artifact, and it has to be the
+  # *Linux* build. The repo is bind-mounted into the container, so without this
+  # shadowing it the container would import modules compiled for the host
+  # platform, and anything with a native binding would fail at runtime.
   frontend_node_modules:

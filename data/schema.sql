@@ -84,28 +84,49 @@ CREATE TABLE order_items (
 -- city -> country is a strict functional dependency, and language follows
 -- country. PostgreSQL has no multi-column statistics here by default, so
 -- filtering on two of the three reads as far more selective than it is.
+-- NOTE ON THE `pick` SUBQUERIES BELOW
+--
+-- Each of the three inserts that build a correlated pair used to draw its
+-- values like this:
+--
+--     CROSS JOIN LATERAL (
+--         SELECT ... FROM (VALUES (...)) AS v ORDER BY random() LIMIT 1
+--     ) AS c
+--
+-- which reads as "pick a random row for each generated row" and is not. The
+-- subquery references nothing from the outer row, so PostgreSQL is free to
+-- evaluate it **once** and reuse the result for all of them -- and does.
+--
+-- Every user got the same city, every product the same brand, every order the
+-- same status. `SELECT count(DISTINCT city) FROM users` returned **1** across
+-- 50,000 rows. So the correlated columns this schema exists to provide had no
+-- correlation in them, because they had no variety at all: a filter on `city`
+-- either matched every row or none.
+--
+-- That is not a cosmetic problem. It is the premise of the whole project --
+-- "PostgreSQL assumes filters are unrelated and multiplies their odds
+-- together" needs two columns that vary and covary. It also explains the
+-- dashboard reporting estimates like "expected 75 rows and got 0": the
+-- generated workload filters on `city = 'Mumbai'`, and no such row existed.
+--
+-- The form below computes an index per generated row in a plain subquery, then
+-- subscripts parallel arrays with it. One index shared across the columns is
+-- what keeps them correlated; computing it per row is what gives them variety.
+
 INSERT INTO users (name, country, city, language, signup_year)
 SELECT
-    'user_' || i,
-    c.country,
-    c.city,
-    c.language,
+    'user_' || pick.i,
+    (ARRAY['IN','IN','IN','US','US','US','UK','UK','DE','DE','SG'])[pick.idx],
+    (ARRAY['Mumbai','Delhi','Bangalore','New York','Austin','Seattle',
+           'London','Manchester','Berlin','Munich','Singapore'])[pick.idx],
+    (ARRAY['hi','hi','en','en','en','en','en','en','de','de','en'])[pick.idx],
     2018 + (random() * 6)::int
-FROM generate_series(1, 50000) AS i
-CROSS JOIN LATERAL (
-    SELECT country, city, language
-    FROM (VALUES
-        ('IN','Mumbai','hi'), ('IN','Delhi','hi'), ('IN','Bangalore','en'),
-        ('US','New York','en'), ('US','Austin','en'), ('US','Seattle','en'),
-        ('UK','London','en'), ('UK','Manchester','en'),
-        ('DE','Berlin','de'), ('DE','Munich','de'),
-        ('SG','Singapore','en')
-    ) AS v(country, city, language)
-    -- Skewed city popularity: the first rows are far more common, so no
-    -- single city is a uniform 1/11 slice.
-    ORDER BY random() * (CASE WHEN random() < 0.5 THEN 0.2 ELSE 1.0 END)
-    LIMIT 1
-) AS c;
+FROM (
+    -- `power(random(), 2)` skews toward the low indices, so no single city is a
+    -- uniform 1/11 slice -- the same skew the previous ORDER BY intended.
+    SELECT i, 1 + floor(power(random(), 2.0) * 11)::int AS idx
+    FROM generate_series(1, 50000) AS i
+) AS pick;
 
 INSERT INTO suppliers (name, country, rating)
 SELECT 'supplier_' || i,
@@ -117,29 +138,20 @@ FROM generate_series(1, 2000) AS i;
 -- brand -> category is strict, and price follows the category's band.
 INSERT INTO products (name, category, brand, price, price_band)
 SELECT
-    'product_' || i,
-    b.category,
-    b.brand,
-    round((b.base_price * (0.6 + random() * 0.8))::numeric, 2),
-    b.band
-FROM generate_series(1, 20000) AS i
-CROSS JOIN LATERAL (
-    SELECT category, brand, base_price, band
-    FROM (VALUES
-        ('electronics','Voltix',   800.0, 'premium'),
-        ('electronics','Nexon',    450.0, 'mid'),
-        ('books','PagePress',       25.0, 'budget'),
-        ('books','InkHouse',        40.0, 'budget'),
-        ('clothing','Threadly',     70.0, 'mid'),
-        ('clothing','Wovenly',     180.0, 'premium'),
-        ('home','Hearthware',      120.0, 'mid'),
-        ('home','Nestly',           35.0, 'budget'),
-        ('sports','Peakline',      260.0, 'premium'),
-        ('sports','Trailmark',      90.0, 'mid')
-    ) AS v(category, brand, base_price, band)
-    ORDER BY random()
-    LIMIT 1
-) AS b;
+    'product_' || pick.i,
+    (ARRAY['electronics','electronics','books','books','clothing',
+           'clothing','home','home','sports','sports'])[pick.idx],
+    (ARRAY['Voltix','Nexon','PagePress','InkHouse','Threadly',
+           'Wovenly','Hearthware','Nestly','Peakline','Trailmark'])[pick.idx],
+    round(((ARRAY[800.0, 450.0, 25.0, 40.0, 70.0,
+                  180.0, 120.0, 35.0, 260.0, 90.0])[pick.idx]
+           * (0.6 + random() * 0.8))::numeric, 2),
+    (ARRAY['premium','mid','budget','budget','mid',
+           'premium','mid','budget','premium','mid'])[pick.idx]
+FROM (
+    SELECT i, 1 + floor(random() * 10)::int AS idx
+    FROM generate_series(1, 20000) AS i
+) AS pick;
 
 INSERT INTO product_suppliers (product_id, supplier_id, lead_days)
 SELECT 1 + floor(random() * 20000)::int,
@@ -157,19 +169,17 @@ SELECT
          THEN 1 + floor(random() * 100)::int
          ELSE 101 + floor(random() * 49900)::int END,
     now() - (random() * interval '365 days'),
-    s.status,
-    s.channel
-FROM generate_series(1, 200000) AS i
-CROSS JOIN LATERAL (
-    SELECT status, channel
-    FROM (VALUES
-        ('completed','web'), ('completed','web'), ('completed','mobile'),
-        ('shipped','web'), ('shipped','mobile'),
-        ('cancelled','partner'), ('refunded','partner')
-    ) AS v(status, channel)
-    ORDER BY random()
-    LIMIT 1
-) AS s;
+    -- cancelled and refunded cluster in 'partner', which is the trap: a filter
+    -- on both status and channel is estimated as the product of two
+    -- independent selectivities and is really far narrower.
+    (ARRAY['completed','completed','completed','shipped','shipped',
+           'cancelled','refunded'])[pick.idx],
+    (ARRAY['web','web','mobile','web','mobile',
+           'partner','partner'])[pick.idx]
+FROM (
+    SELECT 1 + floor(random() * 7)::int AS idx
+    FROM generate_series(1, 200000) AS i
+) AS pick;
 
 -- Popular products: 200 products take 50% of all line items.
 INSERT INTO order_items (order_id, product_id, quantity)

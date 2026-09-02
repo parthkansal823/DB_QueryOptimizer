@@ -93,7 +93,7 @@ def test_coverage_holds_on_gaussian_residuals(alpha):
     stds = [1.0] * 4000
     y = [rng.gauss(0.0, 1.0) for _ in range(4000)]
 
-    gate = ConformalGate(alpha=alpha).fit(means, stds, y)
+    gate = ConformalGate(alpha=alpha, normalize=True).fit(means, stds, y)
     held_out = [rng.gauss(0.0, 1.0) for _ in range(4000)]
 
     covered = gate.coverage([0.0] * 4000, [1.0] * 4000, held_out)
@@ -113,7 +113,7 @@ def test_coverage_holds_when_the_residuals_are_heavy_tailed():
         return rng.gauss(0.0, 0.2) + (4.0 if rng.random() < 0.15 else 0.0)
 
     calibration = [draw() for _ in range(4000)]
-    gate = ConformalGate(alpha=0.1).fit([0.0] * 4000, [1.0] * 4000, calibration)
+    gate = ConformalGate(alpha=0.1, normalize=True).fit([0.0] * 4000, [1.0] * 4000, calibration)
 
     held_out = [draw() for _ in range(4000)]
     assert gate.coverage([0.0] * 4000, [1.0] * 4000, held_out) >= 0.88
@@ -123,15 +123,43 @@ def test_coverage_holds_when_the_residuals_are_heavy_tailed():
     assert naive < 0.88
 
 
-def test_the_bound_scales_with_the_ensemble_s_own_uncertainty():
-    """Normalising by sigma is what keeps the ensemble's judgement of *where*
-    it is unsure, while conformal supplies how far out that reaches."""
-    gate = ConformalGate(alpha=0.1).fit([0.0] * 100, [1.0] * 100, [float(i) / 100 for i in range(100)])
+def test_the_normalised_bound_scales_with_the_ensemble_s_spread():
+    """When the spread is informative, normalising widens the interval exactly
+    where the model is unsure. That is the case this mode is for."""
+    gate = ConformalGate(alpha=0.1, normalize=True).fit(
+        [0.0] * 100, [1.0] * 100, [float(i) / 100 for i in range(100)]
+    )
 
-    narrow = gate.upper_bound(0.0, 0.1)
-    wide = gate.upper_bound(0.0, 1.0)
+    assert gate.upper_bound(0.0, 1.0) > gate.upper_bound(0.0, 0.1)
 
-    assert wide > narrow
+
+def test_the_absolute_bound_ignores_the_spread():
+    """The default, and why: on this model the spread is four times smaller than
+    the error and near zero on some rows, so dividing by it produced a bound of
+    effectively infinity at alpha=0.05. A constant width is the honest shape
+    when there is nothing reliable to vary the width by."""
+    gate = ConformalGate(alpha=0.1).fit(
+        [0.0] * 100, [1.0] * 100, [float(i) / 100 for i in range(100)]
+    )
+
+    assert gate.upper_bound(0.0, 1.0) == gate.upper_bound(0.0, 0.001)
+
+
+def test_the_absolute_bound_is_the_residual_quantile_itself():
+    """`mean + q`, where q is measured in the target's own units rather than in
+    sigmas -- which is what makes it interpretable as a ratio."""
+    gate = ConformalGate(alpha=0.1).fit([0.0] * 100, [1.0] * 100, [0.5] * 100)
+
+    assert gate.upper_bound(2.0, 99.0) == pytest.approx(2.5)
+
+
+def test_a_bundle_pickled_before_the_mode_existed_stays_normalised():
+    """Those gates were fitted with the normalised score, so reading them as
+    absolute would silently reinterpret a calibrated number."""
+    gate = ConformalGate(alpha=0.1, normalize=True).fit([0.0] * 50, [1.0] * 50, [0.2] * 50)
+    del gate.normalize  # what an older pickle restores as
+
+    assert gate.upper_bound(0.0, 2.0) > gate.upper_bound(0.0, 1.0)
 
 
 def test_a_tighter_alpha_never_gives_a_looser_bound():

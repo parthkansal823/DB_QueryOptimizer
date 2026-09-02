@@ -188,7 +188,7 @@ def _grouped(query_ids):
         grouped[qid] = [
             {"query_id": qid, "hint": None, "is_baseline": True, "raw_plan": plan,
              "total_cost": 10.0, "actual_total_time_ms": 100.0},
-            {"query_id": qid, "hint": "/*+ h */", "is_baseline": False, "raw_plan": plan,
+            {"query_id": qid, "hint": "/*+ Leading(a b) */", "is_baseline": False, "raw_plan": plan,
              "total_cost": 10.0, "actual_total_time_ms": 50.0},
         ]
     return grouped
@@ -254,7 +254,7 @@ def test_the_worst_regression_is_reported(monkeypatch):
     grouped = {"q": [
         {"query_id": "q", "hint": None, "is_baseline": True, "raw_plan": plan,
          "total_cost": 10.0, "actual_total_time_ms": 100.0},
-        {"query_id": "q", "hint": "/*+ h */", "is_baseline": False, "raw_plan": plan,
+        {"query_id": "q", "hint": "/*+ Leading(a b) */", "is_baseline": False, "raw_plan": plan,
          "total_cost": 10.0, "actual_total_time_ms": 600.0},
     ]}
 

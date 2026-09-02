@@ -126,6 +126,20 @@ FAMILY_REGRESSION_SQL = f"""
 """
 
 
+# The median native latency per query. Median rather than mean for the reason
+# `train._aggregate_repetitions` gives: latency has a heavy right tail, and a
+# deadline derived from a mean that one autovacuum collision inflated would be
+# uselessly generous.
+NATIVE_LATENCY_SQL = """
+    SELECT query_id,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY actual_total_time_ms)
+    FROM plan_execution_log
+    WHERE is_baseline
+      AND query_id IS NOT NULL
+      AND actual_total_time_ms IS NOT NULL
+    GROUP BY query_id
+"""
+
 OBSERVATION_COUNT_SQL = """
     SELECT query_id, COUNT(*) FILTER (WHERE is_chosen)
     FROM plan_execution_log
@@ -215,6 +229,11 @@ class RegressionGuard:
         self.blocked: dict[str, dict] = {}
         self.blocked_families: dict[str, dict[str, dict]] = {}
         self.observations: dict[str, int] = {}
+        # How long native has historically taken, per query. Kept for *every*
+        # query rather than only the regressed ones, because it is what lets a
+        # served plan be stopped at runtime before it becomes a regression --
+        # see `planner.execute_chosen`.
+        self.native_ms: dict[str, float] = {}
 
     def refresh(self, cur) -> dict[str, dict]:
         self.blocked = find_regressed_queries(
@@ -223,7 +242,25 @@ class RegressionGuard:
         self.blocked_families = find_regressed_families(cur, tolerance=self.tolerance)
         cur.execute(OBSERVATION_COUNT_SQL)
         self.observations = {qid: int(n) for qid, n in cur.fetchall()}
+        cur.execute(NATIVE_LATENCY_SQL)
+        self.native_ms = {qid: float(ms) for qid, ms in cur.fetchall() if ms is not None}
         return self.blocked
+
+    def runtime_budget_ms(self, query_id: str | None, factor: float) -> int | None:
+        """
+        How long a deviation may run before it is abandoned for native.
+
+        `None` when there is no history to base it on -- a query nobody has
+        measured cannot be given a deadline, and guessing one would cancel
+        perfectly good plans on their first execution.
+        """
+        if query_id is None or factor <= 0:
+            return None
+        native = self.native_ms.get(query_id)
+        if not native or native <= 0:
+            return None
+        # A floor, because a 2 ms query times out on scheduling noise alone.
+        return max(int(native * factor), 250)
 
     def is_family_blocked(self, query_id: str | None, hint: str | None) -> bool:
         """Has this *kind* of hint demonstrably hurt this query before?"""

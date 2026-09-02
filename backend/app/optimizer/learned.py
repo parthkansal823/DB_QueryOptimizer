@@ -133,6 +133,7 @@ class LearnedOptimizer:
         # denominated in standard deviations; 1.0 for bundles that predate the
         # measurement, which is exactly the old behaviour.
         self.uncertainty_scale = 1.0
+        self.held_out_queries: list[str] = []
 
         # A calibrated gate (written by `app.calibrate --apply`) beats the
         # hardcoded defaults, because the right threshold depends on how
@@ -197,6 +198,9 @@ class LearnedOptimizer:
         # fixed-z bound rather than refusing to serve.
         self.conformal = bundle.get("conformal")
         self.uncertainty_scale = float(bundle.get("uncertainty_scale") or 1.0)
+        # Which queries this model never trained on. `app.benchmark` needs it to
+        # separate a memorisation score from a generalisation one.
+        self.held_out_queries = list(bundle.get("held_out_queries") or ())
         self.target = bundle.get("target", "actual_total_time_ms")
 
     # -- selection ---------------------------------------------------------
@@ -476,7 +480,14 @@ class LearnedOptimizer:
         if self.gate_mode == "conformal":
             gate = self.conformal
             if gate is not None and getattr(gate, "fitted", False):
-                return gate.upper_bound(mean, std * caution), "conformal"
+                bound = gate.upper_bound(mean, std)
+                # `caution` scales the *margin*, not the spread. Passing
+                # `std * caution` worked only while the bound was
+                # sigma-normalised; an absolute bound ignores `std` entirely, so
+                # that form silently removed the extra protection a query with
+                # no served history is supposed to get -- exactly the case the
+                # guard cannot cover.
+                return mean + (bound - mean) * caution, "conformal"
         # `uncertainty_scale` is measured and reported (`app.diagnostics`) but
         # deliberately *not* multiplied in here.
         #

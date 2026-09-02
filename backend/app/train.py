@@ -41,7 +41,8 @@ MODEL_PATH = os.getenv("MODEL_OUT_PATH", "models/plan_selector.pkl")
 EVAL_PATH = os.getenv("EVAL_OUT_PATH", "models/eval_results.json")
 
 FETCH_SQL = """
-    SELECT query_id, sql_text, hint, is_baseline, raw_plan, total_cost, actual_total_time_ms
+    SELECT query_id, sql_text, hint, is_baseline, raw_plan, total_cost,
+           actual_total_time_ms, created_at
     FROM plan_execution_log
     WHERE actual_total_time_ms IS NOT NULL
       AND query_id IS NOT NULL
@@ -70,10 +71,16 @@ def _row_to_candidate(row: dict) -> dict:
     }
 
 
-def _aggregate_repetitions(rows: list[dict]) -> list[dict]:
+def _aggregate_repetitions(rows: list[dict], latest_run_only: bool = False) -> list[dict]:
     """
     Collapse repeated executions of the same (query, hint) into one row
     carrying the **median** latency.
+
+    `latest_run_only` first discards everything but each query's most recent
+    run. Training wants every measurement it can get and leaves this off; a
+    *comparison* wants measurements taken under the same conditions, because
+    the same native query in this log ranges from 2.4 ms to 13.7 ms across runs
+    collected months and workloads apart. See `app.calibrate._grouped_rows`.
 
     Why median and not mean: latency has a heavy right tail (a candidate
     occasionally collides with autovacuum, a checkpoint, or another process
@@ -82,6 +89,25 @@ def _aggregate_repetitions(rows: list[dict]) -> list[dict]:
     attacks the noise that docs/WRITEUP.md §2.3 identifies as the binding
     constraint on the whole system.
     """
+    if latest_run_only:
+        # `created_at` defaults to now() and Postgres freezes it per
+        # transaction, so one collection of one query shares a single value --
+        # which is what makes it an identifier for a run rather than a clock.
+        newest: dict[str, object] = {}
+        for row in rows:
+            at = row.get("created_at")
+            if at is None:
+                continue
+            current = newest.get(row["query_id"])
+            if current is None or at > current:
+                newest[row["query_id"]] = at
+        if newest:
+            rows = [
+                row for row in rows
+                if row.get("created_at") is not None
+                and row["created_at"] == newest.get(row["query_id"])
+            ]
+
     buckets: dict[tuple, list[dict]] = {}
     for row in rows:
         buckets.setdefault((row["query_id"], row["hint"]), []).append(row)
@@ -162,13 +188,34 @@ def _load_rows() -> list[dict]:
         return [dict(zip(columns, r, strict=True)) for r in cur.fetchall()]
 
 
+# Ensemble members are deliberately left deterministic apart from their
+# bootstrap resample.
+#
+# Turning on row and feature sampling to make them disagree more was tried and
+# measured: the spread got *smaller* (0.0264 -> 0.0247), its correlation with
+# the actual error fell (+0.238 -> +0.218), and held-out MAE rose slightly. So
+# did an earlier attempt at per-member seeds, which was a complete no-op.
+#
+# Both attempts assumed the members were too similar. They are not: they agree
+# because they are all making the *same* mistake. Ensemble spread measures
+# variance -- how much the fit moves when the data moves -- and this model's
+# error is dominated by bias and by irreducible measurement noise, neither of
+# which any amount of member diversity can reveal. That is why sigma is four
+# times smaller than the error and why no arrangement of the ensemble fixes it.
+#
+# The consequence is in `optimizer/conformal.py`: a confidence signal here has
+# to come from the residuals themselves, not from how much the members argue.
 def _build_model():
     """A single regressor + the name of the backend that provided it."""
     try:
         import lightgbm as lgb
 
         return lgb.LGBMRegressor(
-            n_estimators=200, max_depth=5, learning_rate=0.05, random_state=42, verbosity=-1
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            random_state=42,
+            verbosity=-1,
         ), "lightgbm"
     except (ImportError, OSError):
         from sklearn.ensemble import GradientBoostingRegressor
@@ -351,6 +398,9 @@ def train(
             oob_m = [row[0] for row in usable]
             oob_s = [row[1] for row in usable]
             oob_y = [row[2] for row in usable]
+            # Absolute rather than sigma-normalised: on this model the spread
+            # is four times smaller than the error and near-zero on some rows,
+            # which made the normalised bound explode. See conformal.py.
             conformal = ConformalGate(alpha=conformal_alpha).fit(oob_m, oob_s, oob_y)
             # Separate from the conformal bound and used by the default gate:
             # puts `confidence_z` back into real standard deviations, so the

@@ -54,8 +54,11 @@ body {
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
+/* Wider than it was. The analytics panels now sit two to a row on a desktop
+   screen, and 1080px left them squeezed while the rest of the window sat
+   empty. */
 #root {
-  max-width: 1080px;
+  max-width: 1240px;
   margin: 0 auto;
-  padding: 32px 24px 64px;
+  padding: 24px 24px 64px;
 }

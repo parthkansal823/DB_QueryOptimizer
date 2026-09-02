@@ -4,15 +4,16 @@ import os
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app import (
-    db, db_profiles, diagnostics, experiment_job, model_store, retrain,
-    saved_queries, stats, training_job, workload,
+    db, db_profiles, diagnostics, experiment_job, metrics, model_store,
+    retrain, saved_queries, stats, training_job, workload,
 )
 from app import settings as app_settings
-from app import hypothetical
+from app import dbadvisor, hypothetical
 from app.advisor import analyze_plan, missing_fk_indexes
 from app.db import get_cursor
 from app.logging_store import log_execution, query_fingerprint
@@ -103,7 +104,17 @@ def _apply_settings(values: dict) -> None:
     planner.ENABLE_ROWS_CORRECTION = values["enable_rows_correction"]
     planner.INCLUDE_JOIN_METHODS = values["include_join_methods"]
     planner.INCLUDE_TUNING = values["include_tuning"]
+    planner.INCLUDE_BUSHY = values["include_bushy"]
+    planner.INCLUDE_SCAN_METHODS = values["include_scan_methods"]
+    planner.INCLUDE_NEGATIVE_SCANS = values["include_negative_scans"]
+    planner.INCLUDE_NEGATIVE_JOINS = values["include_negative_joins"]
+    planner.INCLUDE_MEMOIZE = values["include_memoize"]
+    planner.INCLUDE_PARALLEL = values["include_parallel"]
+    planner.INCLUDE_ENABLE_SETTINGS = values["include_enable_settings"]
+    planner.INCLUDE_INDEX_PINNING = values["include_index_pinning"]
     planner.ADAPTIVE_CANDIDATE_BUDGET = values["adaptive_candidate_budget"]
+    planner.RUNTIME_TIMEOUT_FACTOR = values["runtime_timeout_factor"]
+    planner.SHADOW_SAMPLE_RATE = values["shadow_sample_rate"]
 
     # The cache is rebuilt rather than resized: every entry in it was decided
     # by the policy and thresholds that just changed, so keeping any of them
@@ -151,14 +162,46 @@ class QueryRequest(BaseModel):
     sql: str
 
 
+def _drifted() -> bool:
+    """
+    Has the deployed gate stopped delivering what its calibration promised?
+
+    `app.calibrate` records `expected_regression_rate` in `models/gate.json` --
+    a prediction about future behaviour, measured on a held-out sweep at the
+    moment the gate was chosen. `app.diagnostics.drift_report` checks it against
+    what has since happened.
+
+    Used here to make retraining *evidence*-driven. The interval below is a
+    clock: on a stable workload it retrains for nothing, and on one that shifted
+    an hour ago it waits. A gate whose regressions have climbed past what it
+    promised is a reason to retrain now; the absence of that is a reason not to.
+    """
+    try:
+        with get_cursor() as cur:
+            report = diagnostics.diagnose(cur=cur)
+    except Exception:  # noqa: BLE001 - an empty log is not drift
+        return False
+    return any(w["code"] == "gate_promise_not_met" for w in report.get("warnings", []))
+
+
 async def _auto_retrain_loop() -> None:
-    """Periodically fold accumulated feedback back into the served model."""
+    """
+    Fold accumulated feedback back into the served model.
+
+    Wakes on the interval but only retrains when there is a reason to: enough
+    new data (`retrain_if_needed`'s own gate) or measured drift. Promotion is
+    still decided by the champion/challenger comparison either way, so the worst
+    case remains a wasted retrain rather than a regression.
+    """
     while True:
         await asyncio.sleep(AUTO_RETRAIN_SECONDS)
         try:
+            drifted = await asyncio.to_thread(_drifted)
+            if drifted:
+                log.info("auto-retrain: gate is missing its promised regression rate")
             # Training is CPU-bound and synchronous; keep it off the event
             # loop so query serving isn't blocked while a retrain runs.
-            result = await asyncio.to_thread(retrain.retrain_if_needed)
+            result = await asyncio.to_thread(retrain.retrain_if_needed, force=drifted)
             if result.get("action") == "promoted":
                 _reload_optimizer()
                 with get_cursor() as cur:
@@ -348,6 +391,15 @@ def optimize_query(req: QueryRequest):
             hint=result["hint"], is_baseline=result["hint"] is None,
             selector_used=SELECTOR_MODE, is_chosen=True,
         )
+        # The other half of a sampled pair. Written in the same transaction, so
+        # it shares the `created_at` that `app.stats` groups a run by -- that is
+        # what makes the two rows a pair rather than two unrelated executions.
+        if result.get("shadow_native_plan") is not None:
+            log_execution(
+                cur, query_id=query_id, sql_text=req.sql,
+                plan=result["shadow_native_plan"],
+                is_baseline=True, selector_used="native", is_chosen=False,
+            )
 
     return {
         "hint": result["hint"],
@@ -361,6 +413,13 @@ def optimize_query(req: QueryRequest):
         # `optimizer_overhead_ms` is unexplained -- it reads as the planner
         # having become mysteriously fast rather than not having run.
         "from_cache": result.get("from_cache", False),
+        # Whether this request also measured PostgreSQL's plan, and what it
+        # cost. Present only on sampled requests; see planner.SHADOW_SAMPLE_RATE.
+        "native_ms": (
+            result["shadow_native_plan"]["actual_total_time_ms"]
+            if result.get("shadow_native_plan") is not None
+            else None
+        ),
     }
 
 
@@ -377,6 +436,30 @@ def advisor():
     """
     with get_cursor() as cur:
         return {"recommendations": missing_fk_indexes(cur)}
+
+
+@app.get("/dbadvisor")
+def database_advisor(include_statistics: bool = False):
+    """
+    What is wrong with the database, as opposed to with one query's plan.
+
+    The rest of this API answers "given this query, which plan should run".
+    That is the hard part and it is not the only reason a database is slow --
+    on most databases it is not even the first one. This reports the things that
+    make the planner's estimates wrong in the first place, each of which is
+    fixed once and then helps every query, including ones never seen here:
+    correlated columns the planner does not know about, indexes that are never
+    used, stale statistics, and server settings that are defaults nobody chose.
+
+    `include_statistics` is off by default because measuring a correlated-column
+    candidate costs an `ANALYZE` per candidate, which is not something a polled
+    endpoint should do. Everything else is a catalogue read.
+
+    Nothing is changed. Each finding carries the statement that would apply it.
+    """
+    with get_cursor() as cur:
+        findings = dbadvisor.report(cur, include_statistics=include_statistics)
+    return {"n_findings": dbadvisor.count_findings(findings), **findings}
 
 
 @app.post("/advisor/rank")
@@ -486,6 +569,34 @@ def model_status():
         # the traffic pattern is wrong.
         "decision_cache": decision_cache.stats() if decision_cache is not None else None,
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics():
+    """
+    Everything worth alerting on, in Prometheus' text exposition format.
+
+    The rest of this API answers questions when asked. This is the half that
+    lets the system be *watched*: a regression rate climbing past what the gate
+    promised, or a deviation rate that has fallen to zero and turned the
+    optimizer into an expensive no-op, are both things you want to find out
+    from a graph rather than by opening the dashboard.
+
+    One scrape costs the same three reports the dashboard polls, so scrape
+    interval should be measured in tens of seconds, not seconds.
+    """
+    with get_cursor() as cur:
+        trend = stats.served_vs_native(cur)
+        report = diagnostics.diagnose(cur=cur)
+        blocked = guard.refresh(cur)
+
+    status = {
+        "current_version": model_store.current_version(),
+        "rows_since_last_training": retrain.rows_since_last_training(),
+        "regression_guard": {"blocked_queries": blocked},
+        "decision_cache": decision_cache.stats() if decision_cache is not None else None,
+    }
+    return metrics.render(trend, report, status)
 
 
 @app.get("/model/diagnostics")

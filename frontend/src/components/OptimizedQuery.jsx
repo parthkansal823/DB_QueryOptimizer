@@ -1,13 +1,23 @@
 import { useState } from "react";
 
-export default function OptimizedQuery({ best, decision }) {
+export default function OptimizedQuery({ best, decision, candidatesTried }) {
   const [copied, setCopied] = useState(false);
 
   if (!best) {
+    // Saying how many alternatives were measured turns this from a shrug into
+    // a result. "Nothing was faster" and "nothing was faster out of nineteen
+    // plans we ran" invite very different amounts of trust, and the second one
+    // is what actually happened.
     return (
       <div className="empty-state">
-        Nothing beat PostgreSQL on this query — its own plan was the fastest of everything we
-        tried. There is nothing to hand you here.
+        Nothing beat PostgreSQL on this query
+        {candidatesTried
+          ? ` — its own plan was the fastest of the ${candidatesTried} alternative ${
+              candidatesTried === 1 ? "plan" : "plans"
+            } we ran.`
+          : " — its own plan was the fastest of everything we tried."}{" "}
+        That is a normal outcome: PostgreSQL is already right on most queries, and this system
+        exists for the ones where it is not.
       </div>
     );
   }

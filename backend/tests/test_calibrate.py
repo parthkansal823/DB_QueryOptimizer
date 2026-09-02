@@ -35,7 +35,10 @@ def _rows(native_ms, candidate_latencies):
     ]
     rows += [
         {
-            "query_id": "q", "hint": f"/*+ h{i} */", "is_baseline": False, "raw_plan": plan,
+            # A hint the generator actually produces: `_servable` filters by
+            # family, so a placeholder would be dropped as unservable.
+            "query_id": "q", "hint": f"/*+ Leading(a b{i}) */", "is_baseline": False,
+            "raw_plan": plan,
             "total_cost": 10.0, "actual_total_time_ms": lat,
         }
         for i, lat in enumerate(candidate_latencies)

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+
+from app.query_template import query_template
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -18,6 +21,20 @@ _WHITESPACE = re.compile(r"\s+")
 # excludes ad-hoc traffic from training data, and the dashboard reports on it
 # separately from the offline sweeps.
 ADHOC_PREFIX = "adhoc:"
+
+
+# Whether a query's identity ignores its parameters.
+#
+# On means `WHERE city = 'Mumbai'` and `WHERE city = 'London'` are one query,
+# which is what every per-query mechanism here needs: the guard cannot block a
+# query it only ever sees once, `caution_multiplier` is at its strictest on the
+# most familiar traffic, and the decision cache misses every request. See
+# `app/query_template.py`.
+#
+# It re-keys history: ids computed this way do not match ones computed from the
+# raw text, so an existing log starts accumulating fresh per template rather
+# than being migrated. That is why it is a switch and not a silent change.
+GROUP_BY_TEMPLATE = os.getenv("GROUP_BY_TEMPLATE", "1") != "0"
 
 
 def query_fingerprint(sql: str) -> str:
@@ -38,7 +55,9 @@ def query_fingerprint(sql: str) -> str:
     Must stay in sync with `QUERY_KEY_SQL` below, which reproduces this same
     id in SQL for rows written before ids were assigned.
     """
-    normalized = _WHITESPACE.sub(" ", sql.strip())
+    normalized = (
+        query_template(sql) if GROUP_BY_TEMPLATE else _WHITESPACE.sub(" ", sql.strip())
+    )
     # Not a security hash -- an identity for grouping rows by query text.
     return ADHOC_PREFIX + hashlib.md5(normalized.encode(), usedforsecurity=False).hexdigest()
 

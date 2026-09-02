@@ -34,8 +34,10 @@ path outright.
 from __future__ import annotations
 
 import os
+import random
 import time
 
+from app.optimizer.catalog import index_map, indexes_by_alias
 from app.optimizer.decision_cache import STOCHASTIC_POLICIES
 from app.optimizer.hints import (
     apply_hint,
@@ -84,6 +86,44 @@ INCLUDE_JOIN_METHODS = os.getenv("INCLUDE_JOIN_METHODS", "0") != "0"
 # sequential scan parallel.
 INCLUDE_TUNING = os.getenv("INCLUDE_TUNING", "1") != "0"
 
+# The families read off the pg_hint_plan reference and verified to bind against
+# this server (`Leading(((a b) (c d)))`, per-table scan methods and their
+# negative forms, order-free `NoNestLoop(...)`, `Memoize`/`NoMemoize`,
+# `Parallel(t n hard)`, `IndexScan(t idx)`, and the two off-by-default
+# partitionwise settings).
+#
+# **All off by default, deliberately.** Widening the action space without
+# retraining has already been measured to hurt here: it sent 17 of 25 queries
+# into the safety veto, because the model was scoring plan shapes it had never
+# been shown (docs/WRITEUP.md 2.9). These flags exist so each family can be
+# switched on, collected with `python -m app.collect_data`, and settled with
+# `python -m app.experiment` -- one at a time, on measurement, which is the only
+# way this project has ever accepted a change to the action space.
+#
+# What binding was measured to look like, on a 4-table join over this schema
+# (baseline cost 7870.2):
+#
+#   bushy            Leading(((o u) (oi p)))        12233.5   all candidates bind
+#   scan_method      SeqScan(o) / BitmapScan(o)     11040.3 / 7930.0
+#   negative_scan    NoIndexScan(o)                  7930.0
+#   negative_join    NoNestLoop(o oi p u)            8972.1
+#   parallel         Parallel(oi 4 hard)             1774.2   <- 4.4x
+#   memoize          no effect on a plan with no Memoize node
+#
+# `Memoize`/`NoMemoize` and `IndexScan(t idx)` are no-ops when the baseline plan
+# already does (or cannot do) the thing they ask for, which is expected rather
+# than broken -- `plan_fingerprint` deduplication drops them before they cost a
+# model evaluation. They still cost a planning round trip to discover, which is
+# why they are not on for free.
+INCLUDE_BUSHY = os.getenv("INCLUDE_BUSHY", "0") != "0"
+INCLUDE_SCAN_METHODS = os.getenv("INCLUDE_SCAN_METHODS", "0") != "0"
+INCLUDE_NEGATIVE_SCANS = os.getenv("INCLUDE_NEGATIVE_SCANS", "0") != "0"
+INCLUDE_NEGATIVE_JOINS = os.getenv("INCLUDE_NEGATIVE_JOINS", "0") != "0"
+INCLUDE_MEMOIZE = os.getenv("INCLUDE_MEMOIZE", "0") != "0"
+INCLUDE_PARALLEL = os.getenv("INCLUDE_PARALLEL", "0") != "0"
+INCLUDE_ENABLE_SETTINGS = os.getenv("INCLUDE_ENABLE_SETTINGS", "0") != "0"
+INCLUDE_INDEX_PINNING = os.getenv("INCLUDE_INDEX_PINNING", "0") != "0"
+
 # Scale the candidate count to how much the query is worth optimising.
 #
 # Every candidate costs one `EXPLAIN` round trip. Measured on this database
@@ -131,6 +171,25 @@ def budget_for(total_cost: float | None) -> int:
     return UNBUDGETED_CANDIDATES
 
 
+def _index_candidates_for(cur, baseline_plan: dict) -> dict[str, list[str]] | None:
+    """
+    `{alias: [index, ...]}` for this query, or None if index pinning is off.
+
+    Needs a live cursor to read `pg_index`, and `candidate_hints` is also called
+    from paths that have none (tests, and any caller working from a stored
+    plan). Missing either the flag or the cursor means the family generates
+    nothing, which is the same as it was before it existed.
+    """
+    if not INCLUDE_INDEX_PINNING or cur is None:
+        return None
+    try:
+        return indexes_by_alias(baseline_plan.get("scan_relations"), index_map(cur))
+    except Exception:  # noqa: BLE001
+        # A catalog read failing is not a reason to refuse to optimise the
+        # query -- every other family still works without it.
+        return None
+
+
 def candidate_hints(
     optimizer,
     baseline_plan: dict,
@@ -138,6 +197,7 @@ def candidate_hints(
     max_candidates: int = 8,
     include_join_methods: bool | None = None,
     include_tuning: bool | None = None,
+    cur=None,
 ) -> list[str]:
     """
     The full action space for one query.
@@ -170,6 +230,18 @@ def candidate_hints(
         # Read off the baseline plan's own join conditions, so the order
         # candidates skip the cartesian products Postgres would never pick.
         join_graph=baseline_plan.get("join_graph"),
+        include_bushy=INCLUDE_BUSHY,
+        include_scan_methods=INCLUDE_SCAN_METHODS,
+        include_negative_scans=INCLUDE_NEGATIVE_SCANS,
+        include_negative_joins=INCLUDE_NEGATIVE_JOINS,
+        include_memoize=INCLUDE_MEMOIZE,
+        include_parallel=INCLUDE_PARALLEL,
+        include_enable_settings=INCLUDE_ENABLE_SETTINGS,
+        # Keyed by the query's own aliases, not by relation name: pg_hint_plan
+        # silently ignores an index hint that names the table when the query
+        # gave it an alias, which is indistinguishable from a hint that applied
+        # and did nothing. See `optimizer/catalog.py`.
+        table_indexes=_index_candidates_for(cur, baseline_plan),
     )
 
     corrector = getattr(optimizer, "join_corrector", None)
@@ -232,7 +304,9 @@ def plan_query(
 
     # Scaled to what the query is worth optimising; see `budget_for`.
     budget = budget_for(baseline.get("total_cost"))
-    hints = candidate_hints(optimizer, baseline, tables, max_candidates=max_candidates)
+    hints = candidate_hints(
+        optimizer, baseline, tables, max_candidates=max_candidates, cur=cur
+    )
     # Drop the kinds of action that have already lost on this query, before the
     # budget is applied -- otherwise a blocked family eats budget that a family
     # with a chance could have used.
@@ -298,10 +372,80 @@ def plan_query(
     return result
 
 
-def execute_chosen(cur, sql: str, hint: str | None) -> dict:
-    """Run exactly one plan -- the chosen one -- and return its real metrics."""
-    final_sql = apply_hint(sql, hint) if hint else sql
-    return get_plan(cur, final_sql, analyze=True)
+# How many times a query's known native latency a deviation may run for before
+# it is abandoned. 0 disables the deadline.
+RUNTIME_TIMEOUT_FACTOR = float(os.getenv("RUNTIME_TIMEOUT_FACTOR", "3.0"))
+
+# How often a deviating production query also runs PostgreSQL's plan, purely to
+# measure it.
+#
+# This closes a hole that made the production path invisible to every statistic
+# the project reports. `/query/optimize` executes only the plan it chose -- that
+# is the whole point of it, and why it costs one execution instead of N. But
+# `app.stats` is built on *matched pairs*: it groups by `(query, created_at)`
+# and requires both a baseline and a chosen row, because comparing two averages
+# over different populations is the bug that module exists to prevent. A
+# deviating production run logs a chosen row and no baseline, so the HAVING
+# clause drops it. Every number on the dashboard's trend panel therefore comes
+# from `/query/analyze` and `app.benchmark` -- the measuring paths -- and none
+# from the path that actually serves traffic.
+#
+# Sampling a fraction of deviations and running native alongside them puts real
+# served traffic back into that population. It costs one extra execution on the
+# sampled requests and nothing on the rest, which is the usual shadow-evaluation
+# trade: pay a little on a few requests to know whether the thing works.
+#
+# 0 disables it. Kept low by default because the point is a representative
+# sample, not a second benchmark.
+SHADOW_SAMPLE_RATE = float(os.getenv("SHADOW_SAMPLE_RATE", "0.1"))
+
+
+def execute_chosen(cur, sql: str, hint: str | None, budget_ms: int | None = None) -> dict:
+    """
+    Run exactly one plan -- the chosen one -- and return its real metrics.
+
+    ## The deadline
+
+    Every safety mechanism before this one reasons about a plan *before* it
+    runs: the gate bounds the predicted downside, the regression guard blocks
+    queries with a measured history of regressing. Both are predictions, and a
+    prediction that turns out wrong has, until now, been discovered by watching
+    the query take longer than it should have and then finish anyway.
+
+    `budget_ms` closes that. A deviation is given a deadline derived from what
+    native actually costs on this query (`RegressionGuard.runtime_budget_ms`),
+    and if it runs past it the statement is cancelled and PostgreSQL's own plan
+    is run instead. The user waits longer than native would have taken, but
+    bounded -- rather than however long the bad plan happened to need.
+
+    That is the difference between "we predict this will not be much worse" and
+    "this will not be much worse". Bao's claim is the second one.
+
+    Only deviations get a deadline. Cancelling *native* would leave nothing to
+    fall back to, and a query that is simply slow is not the failure this is
+    for. A query with no measured history gets none either, since there is
+    nothing to derive one from.
+    """
+    if not hint:
+        return get_plan(cur, sql, analyze=True)
+
+    if budget_ms is None:
+        return get_plan(cur, apply_hint(sql, hint), analyze=True)
+
+    # The savepoint is what makes the fallback possible: a cancelled statement
+    # aborts the transaction, and without one the native retry would fail too.
+    cur.execute("SAVEPOINT deviation")
+    try:
+        cur.execute("SET LOCAL statement_timeout = %s", (budget_ms,))
+        plan = get_plan(cur, apply_hint(sql, hint), analyze=True)
+        cur.execute("RELEASE SAVEPOINT deviation")
+        return plan
+    except Exception:  # noqa: BLE001 - a cancelled deviation is a fallback, not an error
+        cur.execute("ROLLBACK TO SAVEPOINT deviation")
+        native = get_plan(cur, sql, analyze=True)
+        native["deviation_abandoned"] = True
+        native["deviation_budget_ms"] = budget_ms
+        return native
 
 
 def optimize_and_execute(
@@ -318,10 +462,46 @@ def optimize_and_execute(
     measured every time, only the choosing is reused.
     """
     choice = plan_query(cur, sql, optimizer, query_id=query_id, guard=guard, cache=cache)
-    executed = execute_chosen(cur, sql, choice["hint"])
 
-    return {
+    # A deadline for the deviation, derived from what native costs on this
+    # query. See `execute_chosen`.
+    budget = (
+        guard.runtime_budget_ms(query_id, RUNTIME_TIMEOUT_FACTOR)
+        if guard is not None and choice["hint"]
+        else None
+    )
+    executed = execute_chosen(cur, sql, choice["hint"], budget_ms=budget)
+
+    abandoned = bool(executed.pop("deviation_abandoned", False))
+
+    # A sampled deviation also runs native, so this request contributes a
+    # matched pair rather than an unpairable half. Measured *after* the served
+    # plan so the user's latency is never the shadow's.
+    shadow = None
+    if (
+        choice["hint"]
+        and not abandoned
+        and SHADOW_SAMPLE_RATE > 0
+        and random.random() < SHADOW_SAMPLE_RATE
+    ):
+        try:
+            shadow = get_plan(cur, sql, analyze=True)
+        except Exception:  # noqa: BLE001 - a failed measurement is not a failed request
+            shadow = None
+
+    result = {
         **choice,
         "executed_plan": executed,
         "execution_ms": executed["actual_total_time_ms"],
+        "runtime_budget_ms": budget,
+        # The native plan for this same request, when one was measured. The
+        # caller logs it as the baseline half of the pair.
+        "shadow_native_plan": shadow,
     }
+    if abandoned:
+        # The hint did not run, so reporting it as the served decision would be
+        # a lie the trend chart would then average in.
+        result["hint"] = None
+        result["reason"] = "deviation_abandoned"
+        result["deviation_abandoned"] = True
+    return result

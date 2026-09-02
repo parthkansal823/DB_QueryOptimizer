@@ -83,11 +83,12 @@ class BootstrappedEnsemble:
         rng = random.Random(self.seed)
         self.models = []
         self._bootstrap_indices = []
-        for _ in range(self.n_models):
+        for member in range(self.n_models):
             # Sample n rows *with replacement* -- each member sees a slightly
             # different dataset, and their disagreement is the uncertainty.
             idx = [rng.randrange(n) for _ in range(n)]
             model = self.build_model()
+            _reseed(model, self.seed + member)
             model.fit([X[i] for i in idx], [y[i] for i in idx])
             self.models.append(model)
             self._bootstrap_indices.append(idx)
@@ -168,6 +169,37 @@ class BootstrappedEnsemble:
         """One draw from the 'posterior' -- a single ensemble member."""
         rng = rng or random
         return rng.choice(self.models)
+
+
+def _reseed(model, seed: int) -> None:
+    """
+    Give one ensemble member its own random seed.
+
+    Only meaningful because `train._build_model` turns on row and feature
+    sampling. Without that the learner is deterministic, the seed has nothing to
+    act on, and the members differ solely by which bootstrap resample they saw --
+    which a boosted forest barely notices. That combination was measured
+    producing a spread four times smaller than the model's own error, so
+    `confidence_z` was buying a quarter of the protection its name implied.
+
+    Bootstrapped Thompson sampling treats the members as draws from a posterior.
+    Identical learners on near-identical data are not draws from anything, and
+    an ensemble that agrees with itself for structural reasons reports
+    confidence it has not earned.
+
+    Done here rather than in the factory so the documented zero-argument
+    contract (`build_model()`) is unchanged, and an estimator without a
+    `random_state` -- or a stand-in for one in a test -- is left alone.
+    """
+    setter = getattr(model, "set_params", None)
+    getter = getattr(model, "get_params", None)
+    if setter is None or getter is None:
+        return
+    try:
+        if "random_state" in getter():
+            setter(random_state=seed)
+    except (TypeError, ValueError):  # noqa: S110 - a stand-in that is not an estimator
+        pass
 
 
 def select_index(

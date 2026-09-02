@@ -260,10 +260,13 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
             "severity": "medium",
             "code": "uncertainty_understated",
             "detail": (
-                f"the ensemble's spread understates its own error by {scale:.1f}x. "
-                "confidence_z is rescaled by this factor before the gate reads it; "
-                "without that a whole unit of z would buy less than a standard "
-                "deviation of protection."
+                f"the ensemble's spread understates its own error by {scale:.1f}x, so "
+                "sigma cannot be read as a probability -- a plan at 'one sigma' is "
+                "further out than that sounds. The gate does not multiply this in "
+                "(measuring it against training spread and spending it on serving "
+                "spread double-counted), so confidence_z is calibrated against the "
+                "raw spread instead. Treat it as a reason to distrust sigma, not a "
+                "number to scale decisions by."
             ),
         })
 

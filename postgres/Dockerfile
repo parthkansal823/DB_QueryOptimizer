@@ -19,4 +19,13 @@ RUN git clone --branch PG16 --depth 1 https://github.com/ossc-db/pg_hint_plan.gi
 # `EXPLAIN` can be asked what an index *would* do without building it. That is
 # what turns app/advisor.py's "these indexes are missing" into "this one would
 # cut the plan's cost by 78% and the planner would actually use it".
-RUN git clone --branch REL1_4_STABLE --depth 1 https://github.com/HypoPG/hypopg.git /tmp/hypopg     && cd /tmp/hypopg     && make && make install     && rm -rf /tmp/hypopg
+#
+# Cloned from the default branch rather than a pinned one: HypoPG's release
+# branches are not named the way pg_hint_plan's are, and a wrong `--branch`
+# fails the clone with a git error that `docker compose build` still reports as
+# an overall success -- the image builds without the extension, and the failure
+# only surfaces later as "could not open extension control file".
+RUN git clone --depth 1 https://github.com/HypoPG/hypopg.git /tmp/hypopg \
+    && cd /tmp/hypopg \
+    && make && make install \
+    && rm -rf /tmp/hypopg

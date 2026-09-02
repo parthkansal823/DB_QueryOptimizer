@@ -599,6 +599,112 @@ winning setting to `models/gate.json`, and `LearnedOptimizer` prefers that
 over its built-in defaults. The threshold is therefore re-derived for each
 dataset instead of being inherited from whatever happened to work here.
 
+## 2.4.0 The benchmark schema had no correlations in it
+
+This section is placed before the others in 2.4 because it invalidates parts of
+what they measured, and because it is the most embarrassing thing in this
+document.
+
+The schema in `data/schema.sql` was rebuilt specifically to be hard (§2.9). Its
+whole purpose is correlated columns — `city` determines `country`, `brand`
+determines `category` — because PostgreSQL estimates `WHERE a = x AND b = y` as
+sel(a) x sel(b), which is only right when the columns are unrelated. Version 1
+of the workload had 6.5% mean available headroom and nothing for a plan-picker
+to find; version 2 was built around that failure and reported 22.2%.
+
+The seed data never had those correlations, because it never had any variety.
+
+```
+SELECT count(DISTINCT city)     FROM users;      -- 1
+SELECT count(DISTINCT country)  FROM users;      -- 1
+SELECT count(DISTINCT brand)    FROM products;   -- 1
+SELECT count(DISTINCT category) FROM products;   -- 1
+SELECT count(DISTINCT status)   FROM orders;     -- 1
+```
+
+One value per column, across 50,000 users and 20,000 products. Every user lived
+in London; every product was a Voltix; every order was completed. A filter on
+any of those columns matched either every row or none.
+
+### The bug
+
+All three inserts that build a correlated pair drew their values like this:
+
+```sql
+FROM generate_series(1, 50000) AS i
+CROSS JOIN LATERAL (
+    SELECT country, city, language
+    FROM (VALUES ('IN','Mumbai','hi'), ('UK','London','en'), ...) AS v
+    ORDER BY random()
+    LIMIT 1
+) AS c
+```
+
+Which reads as "pick a random row for each generated row", and is not. The
+subquery references nothing from the outer row, so it is not correlated in the
+SQL sense, and PostgreSQL is free to evaluate it **once** and reuse the result
+for all 50,000 — which it does.
+
+`random()` being volatile is not enough; volatility governs whether the planner
+may cache a value *within* one evaluation, not how many times an uncorrelated
+subquery is evaluated. Both of the obvious rewrites were tested and are also
+wrong: pushing the `random()` into a `LATERAL (SELECT ... AS idx)` collapses the
+same way. What works is computing the index in a plain subquery over the series
+and subscripting parallel arrays with it, which is what the file now does. One
+index shared across the columns keeps them correlated; computing it per row is
+what gives them variety.
+
+### What it explains
+
+The dashboard had been reporting estimates like *"it expected 75 rows and got
+0"* and *"expected 4 rows and got 0"*, which reads as a spectacular
+mis-estimate and is really the generated workload filtering on `city =
+'Mumbai'` in a database with no Mumbai in it. Every such query returned nothing.
+
+It also means the model was trained on a workload where every categorical
+predicate was all-or-nothing. There was no independence-assumption error to
+learn, because there were no two columns whose joint selectivity could differ
+from the product of the marginals. Whatever the model learned, it was not the
+thing this project exists to learn.
+
+### After the fix
+
+| | before | after |
+|---|---|---|
+| `users.city` distinct values | 1 | 11 |
+| `users.country` | 1 | 5 |
+| `products.brand` | 1 | 10 |
+| `orders.status` | 1 | 4 |
+
+And the trap the schema was designed around is measurable again:
+
+```
+city = 'Mumbai' AND country = 'IN'       planner expected 7722, got 14919   (1.9x)
+brand = 'Hearthware' AND category = 'home'  expected 421, got 2051          (4.9x)
+```
+
+with `CREATE STATISTICS` closing it exactly:
+
+```
+brand = 'Hearthware' AND category = 'home'  expected 2051, got 2051         (1.0x)
+```
+
+which is the whole argument for `app/dbadvisor/extended_stats.py`
+(`docs/DATABASE_OPTIMIZATION.md` §1).
+
+### What this costs the rest of the document
+
+Every measurement in §2.1 through §2.9 was taken against the degenerate
+database. The *mechanisms* they describe are unaffected — the pg_hint_plan
+binding bug in §2.0 was real, the unpaired-averages bug in §2.2 was real, the
+median-aggregation finding in §2.3 was real — but the headline numbers attached
+to them are measurements of a database that did not contain the phenomenon they
+were about.
+
+They are left in place rather than deleted, with this section pointing at them,
+because rewriting them would need the whole sequence re-run and because a result
+that turned out to rest on bad data is itself the finding.
+
 ## 2.4.3 How the calibrated gate ended up switching itself off
 
 §2.4.2 describes `app.calibrate` as bounding the regression rate first and

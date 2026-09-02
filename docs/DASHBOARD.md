@@ -78,6 +78,29 @@ If the optimizer stayed with PostgreSQL, a short line explains why:
 | The learned path has been slower before | The regression guard blocked this query |
 | No alternative join orders | Single table, or a shape not handled yet |
 
+### Was the pick actually faster?
+
+Directly under the two plan panels, one sentence saying what happened:
+
+> **This pick was slower.** It ran in 12.50 ms against PostgreSQL's 8.64 ms —
+> 45% worse.
+
+or
+
+> **Outcome:** the chosen plan and PostgreSQL's ran within 5% of each other,
+> which is inside this database's measurement noise. Neither was meaningfully
+> faster.
+
+This is a *measured* statement, not a predicted one. The decision note beside it
+says what the model expected; this says what the clock said. `/query/analyze`
+runs every candidate, so by the time the panel renders the answer is known — and
+it used to present a pick that ran slower as "LEARNED PICK / CHOSEN" beside a
+larger number and leave you to compare the two yourself.
+
+The 5% band matters. Two runs of the *same* plan on this database differ by more
+than that, so calling a 4% difference a regression would be as wrong as calling
+it a win.
+
 ### Every plan we tried
 
 A bar per plan, so you can see the whole spread rather than just the winner.
@@ -108,6 +131,28 @@ can be blocked, so a query that just regressed will not appear immediately.
 beats what is running. **Roll back** restores the previous version.
 
 ---
+
+### Findings
+
+At the top of Model health, a list of things wrong with the model or its safety
+gate, worst first. Each says what was measured and what it means.
+
+Every one of these had actually shipped at some point and was invisible from
+this dashboard:
+
+| finding | what it means |
+|---|---|
+| `gate_ignores_uncertainty` | `confidence_z` is 0, so the model's uncertainty is being multiplied by zero. The "pessimistically" figure in the decision note will equal the prediction exactly — the safety check is decorative. |
+| `gate_calibrated_on_too_few_queries` | The threshold was chosen on a handful of queries, so its reported regression rate moves in steps of 1/n and is fitted to whichever queries happened to be held out. |
+| `uncertainty_understated` | The eight models disagree by less than the model's actual error, by the factor shown. `docs/CONFIDENCE.md` §3 explains why no arrangement of the ensemble fixes that. |
+| `error_comparable_to_headroom` | Predictions are typically off by about as much as the speedups worth chasing. More distinct queries is the lever, not a different model. |
+| `gate_promise_not_met` | The calibration promised a regression rate and the system is exceeding it. Either the workload has moved or the gate was chosen on too few queries. |
+| `optimizer_never_deviates` | Nothing has deviated recently, so the optimizer is currently a no-op. |
+
+"No problems found" is a result, not an empty panel.
+
+The same report is `GET /model/diagnostics`, or `python -m app.diagnostics` for
+the full version including the drift check.
 
 ## The production path
 
@@ -142,6 +187,56 @@ Each card carries DDL you can copy. Nothing runs automatically: `CREATE INDEX`
 takes locks and disk space.
 
 ---
+
+## Database health
+
+Findings about the *database* rather than about one query's plan. Every other
+panel here is about plan choice; these are things fixed once that then help
+every query, including ones this system has never seen.
+
+Four groups, each with the exact statement that would apply it:
+
+- **Correlated columns the planner does not know about.** PostgreSQL estimates
+  `WHERE a = x AND b = y` by multiplying the two selectivities, which is only
+  right when the columns are unrelated. Where they are related the estimate is
+  badly wrong and every plan built from it is built for the wrong number of
+  rows. Shown as a measured before-and-after: *"estimate off by 4.9x → 1.0x"*.
+- **Server settings.** PostgreSQL's defaults are chosen so it will start
+  anywhere, not to suit anything. `shared_buffers` is 128MB whether the machine
+  has 1GB or 128GB.
+- **Indexes not earning their keep.** Never scanned, duplicated, or a leading
+  prefix of a wider index. Each is paid for on every write and appears in no
+  slow-query report.
+- **Table health.** Statistics describing a table that has since changed, and
+  dead row versions that every sequential scan has to read past.
+
+**Nothing here is applied.** Running DDL against your database is your decision;
+the panel shows the statement and stops.
+
+The correlated-column check is behind a checkbox because it is the expensive
+one — each candidate is *measured* by creating the statistics object, running
+`ANALYZE`, re-planning and rolling back. `docs/DATABASE_OPTIMIZATION.md` has
+the detail.
+
+## Settle a comparison
+
+Every other number on this page comes from a single run. This panel runs a
+proper A/B: two arms interleaved so neither gets the colder cache, a pair
+discarded if either half fails, a bootstrap interval around the difference, and
+a sign test.
+
+The important output is the word **unresolved**. Native totals on this database
+swing about 13% between identical runs, so a mean difference smaller than that
+is not a result however good it looks. When the interval spans zero the panel
+says so rather than reporting the mean.
+
+It is slow — each paired run is two full benchmark sweeps — and runs in the
+background, so the panel can be left and come back to.
+
+This existed as `python -m app.experiment` long before it had a panel, which is
+the problem it solves: the rigorous comparison was the inconvenient one, and
+`docs/WRITEUP.md` §2.4 records a headline result that rested on three runs
+because of it.
 
 ## How much time this is saving
 

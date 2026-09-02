@@ -29,6 +29,10 @@ export function fetchModelDiagnostics() {
   return request("/model/diagnostics");
 }
 
+export function fetchDatabaseAdvisor(includeStatistics = false) {
+  return request(`/dbadvisor?include_statistics=${includeStatistics}`);
+}
+
 export function fetchExperimentStatus() {
   return request("/experiment/status");
 }

@@ -184,6 +184,363 @@ def generate_join_order_candidates(
     return [f"/*+ Leading({' '.join(perm)}) */" for perm in chosen]
 
 
+# -- Bushy join trees -------------------------------------------------------
+#
+# `Leading(a b c d)` names an order, and pg_hint_plan builds it **left-deep**:
+# ((a JOIN b) JOIN c) JOIN d. Every candidate this module produced was that
+# shape, so the entire action space was one corner of the plan space.
+#
+# The nested form `Leading(((a b) (c d)))` specifies the tree itself, which
+# lets two pairs be built independently and then joined -- a *bushy* plan. That
+# matters when both halves filter down hard: a left-deep tree has to carry the
+# first table's rows through every subsequent join, while a bushy one builds two
+# small intermediates and joins those.
+#
+# This project already knew the difference mattered. `plan_tree.py` computes
+# `tree_bushiness` as a feature and describes it as "0.0 = perfectly left-deep
+# (what Leading() produces)" -- the encoder was measuring a property the
+# generator could not vary. Neo and Bao both search bushy plans for the same
+# reason.
+#
+# Only balanced splits are produced, and only where both halves are internally
+# connected and connected to each other. An unconnected half is a cartesian
+# product, which Postgres prices at disable_cost and never picks.
+
+
+def _is_connected_set(tables: tuple[str, ...], join_graph: dict[str, list[str]]) -> bool:
+    """Is this set of tables reachable from any one of them, using only itself?"""
+    if len(tables) <= 1:
+        return True
+    remaining = set(tables)
+    frontier = {remaining.pop()}
+    while frontier:
+        table = frontier.pop()
+        neighbours = set(join_graph.get(table, ())) & remaining
+        remaining -= neighbours
+        frontier |= neighbours
+    return not remaining
+
+
+def _halves_touch(
+    left: tuple[str, ...], right: tuple[str, ...], join_graph: dict[str, list[str]]
+) -> bool:
+    """Do the two halves share a join predicate, so joining them is not a cross product?"""
+    right_set = set(right)
+    return any(set(join_graph.get(t, ())) & right_set for t in left)
+
+
+def generate_bushy_candidates(
+    tables: list[str],
+    join_graph: dict[str, list[str]] | None = None,
+    max_candidates: int = 6,
+) -> list[str]:
+    """
+    `Leading(((a b) (c d)))` hints: plan trees no left-deep ordering can express.
+
+    Needs at least four tables -- below that every tree is left-deep -- and a
+    join graph, because a bushy split is only worth proposing when both halves
+    are genuinely joinable.
+    """
+    if len(tables) < 4 or not join_graph:
+        return []
+
+    rng = _rng_for(tables)
+    ordered = sorted(tables)
+    half = len(ordered) // 2
+
+    splits: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    seen: set[tuple] = set()
+    for left in itertools.combinations(ordered, half):
+        right = tuple(t for t in ordered if t not in left)
+        # A split and its mirror image describe the same tree.
+        key = tuple(sorted((left, right)))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _is_connected_set(left, join_graph):
+            continue
+        if not _is_connected_set(right, join_graph):
+            continue
+        if not _halves_touch(left, right, join_graph):
+            continue
+        splits.append((left, right))
+
+    if not splits:
+        return []
+    if len(splits) > max_candidates:
+        splits = rng.sample(splits, max_candidates)
+
+    return [
+        f"/*+ Leading((({' '.join(left)}) ({' '.join(right)}))) */"
+        for left, right in sorted(splits)
+    ]
+
+
+# -- Per-table scan methods -------------------------------------------------
+#
+# `HINT_SETS` below turns operators off for the *whole statement*:
+# `Set(enable_seqscan off)` bans sequential scans everywhere, including on the
+# small lookup table where one is obviously right. pg_hint_plan can say it per
+# relation instead -- `IndexScan(orders)` forces an index scan on `orders` and
+# leaves every other table alone.
+#
+# That is the difference between "never scan anything sequentially" and "stop
+# scanning *this* table sequentially", and on a join between a large filtered
+# table and a small one it is usually the second that is wanted.
+# `IndexOnlyScan` is in the default tuple because it is the one scan type the
+# other three cannot substitute for: it answers the query from the index alone
+# and never touches the heap, so on a covering index it does a fraction of the
+# I/O an index scan does. Postgres only picks it when it believes the visibility
+# map is current enough, which is a judgement about vacuum state rather than
+# about the query -- exactly the kind of estimate this project exists to
+# second-guess.
+SCAN_METHODS = ("SeqScan", "IndexScan", "BitmapScan", "IndexOnlyScan")
+
+# TID scans only apply to queries with a `ctid` predicate, which no query in
+# this workload has. Kept so the family is complete and so a `ctid`-driven
+# workload can switch it on, but out of the default tuple: on every other query
+# `TidScan(t)` is a planning round trip that returns the native plan.
+ALL_SCAN_METHODS = SCAN_METHODS + ("TidScan",)
+
+
+def generate_scan_method_candidates(
+    tables: list[str], methods: tuple[str, ...] = SCAN_METHODS, max_tables: int = 3
+) -> list[str]:
+    """One hint per (table, scan method), for the first few tables."""
+    if not tables:
+        return []
+    # Bounded: every table x method is a planning round trip, and the tables a
+    # query lists first are the ones its FROM clause leads with.
+    chosen = sorted(dict.fromkeys(tables))[:max_tables]
+    return [f"/*+ {method}({table}) */" for table in chosen for method in methods]
+
+
+# -- Negative scan hints ----------------------------------------------------
+#
+# `IndexScan(orders)` says "use an index on orders". If no index is usable it is
+# not a request the planner can honour, so it prices the alternatives at
+# disable_cost and hands back a plan chosen under a constraint that was never
+# satisfiable -- a wasted candidate that still costs a planning round trip.
+#
+# `NoSeqScan(orders)` says only "not a sequential scan", and leaves the planner
+# free to choose between index, index-only and bitmap on its own. It is a
+# strictly weaker constraint than any of the positive forms, which makes it the
+# safer way to express the thing that is actually usually wanted: *this
+# particular* table is being scanned when it should not be.
+#
+# The distinction matters most where the positive form is most tempting. On a
+# join between a large filtered table and a small lookup table, forcing an index
+# scan on the large table is right and forcing one on the lookup table is wrong;
+# the negative form on the large table gets the first without risking the
+# second.
+NEGATIVE_SCAN_METHODS = ("NoSeqScan", "NoIndexScan", "NoBitmapScan")
+
+# `NoIndexScan` already bans index-only scans as well (pg_hint_plan documents it
+# as covering both), so `NoIndexOnlyScan` is only distinct when you want to
+# forbid the index-only variant while still permitting a plain index scan -- a
+# narrow case, hence out of the default tuple. `NoTidScan` is here for
+# completeness, and is a no-op on any query without a `ctid` predicate.
+ALL_NEGATIVE_SCAN_METHODS = NEGATIVE_SCAN_METHODS + ("NoIndexOnlyScan", "NoTidScan")
+
+
+def generate_negative_scan_candidates(
+    tables: list[str],
+    methods: tuple[str, ...] = NEGATIVE_SCAN_METHODS,
+    max_tables: int = 3,
+) -> list[str]:
+    """`NoSeqScan(t)` and friends: ban one scan type on one table."""
+    if not tables:
+        return []
+    chosen = sorted(dict.fromkeys(tables))[:max_tables]
+    return [f"/*+ {method}({table}) */" for table in chosen for method in methods]
+
+
+# -- Index selection --------------------------------------------------------
+#
+# Every scan hint above chooses an access *method*. When a table carries several
+# indexes the harder question is which one, and that is a separate decision the
+# planner also makes from estimates: it prices each candidate index by the
+# selectivity it expects the predicate to have and picks the cheapest. A
+# correlated pair of columns -- the failure this whole project is built around
+# -- makes a two-column index look far less selective than it is, so the planner
+# reaches for a different index, or for a sequential scan.
+#
+# `IndexScan(table index)` pins the choice. It is the only family here that
+# needs to know something about the schema rather than the query, so callers
+# pass a `{table: [index, ...]}` map read from `pg_index`; without one this
+# generates nothing rather than guessing at names.
+#
+# **That map must be keyed by the query's alias, not the relation name.**
+# pg_hint_plan addresses relations the way the query spells them, so on
+# `FROM orders o` the relation is `o`; `IndexScan(orders orders_pkey)` is not an
+# error and not a warning -- it is silently ignored, which looks exactly like a
+# hint that applied and changed nothing. Measured here: `Parallel(order_items 4
+# hard)` planned at cost 7870 (unchanged), `Parallel(oi 4 hard)` at 1774. Use
+# `optimizer/catalog.py::indexes_by_alias`, which rekeys the catalog through the
+# baseline plan's own alias mapping.
+def generate_index_candidates(
+    table_indexes: dict[str, list[str]] | None,
+    methods: tuple[str, ...] = ("IndexScan", "BitmapScan", "IndexOnlyScan"),
+    max_tables: int = 2,
+    max_indexes_per_table: int = 3,
+) -> list[str]:
+    """`IndexScan(t idx)`: pin the specific index, not just the access method."""
+    if not table_indexes:
+        return []
+    candidates: list[str] = []
+    for table in sorted(table_indexes)[:max_tables]:
+        for index in sorted(table_indexes[table])[:max_indexes_per_table]:
+            for method in methods:
+                candidates.append(f"/*+ {method}({table} {index}) */")
+    return candidates
+
+
+# `DisableIndex(t idx)` plans as though the index were not there. Its use here
+# is not to speed a query up -- it is the missing half of the unused-index
+# finding in `app/dbadvisor/indexes.py`.
+#
+# That advisor can say an index has zero scans in `pg_stat_user_indexes`, which
+# is evidence about the past and says nothing about whether some query would
+# have been slower without it. `DisableIndex` answers the question directly:
+# plan the workload as if it had already been dropped, and compare. An index
+# recommended for deletion on statistics alone is a recommendation that cannot
+# be checked before it is irreversible.
+def generate_disable_index_candidates(
+    table_indexes: dict[str, list[str]] | None,
+    max_tables: int = 2,
+    max_indexes_per_table: int = 3,
+) -> list[str]:
+    """`DisableIndex(t idx)`: plan as if this index had already been dropped."""
+    if not table_indexes:
+        return []
+    candidates: list[str] = []
+    for table in sorted(table_indexes)[:max_tables]:
+        for index in sorted(table_indexes[table])[:max_indexes_per_table]:
+            candidates.append(f"/*+ DisableIndex({table} {index}) */")
+    return candidates
+
+
+# The `*Regexp` forms restrict the scan to indexes whose *name* matches a POSIX
+# pattern. Where index names are known -- and this system reads them from the
+# catalog -- naming them outright is strictly more precise, so this family adds
+# nothing the one above cannot already express.
+#
+# It earns its place in exactly one situation: a naming convention that outlives
+# any particular index. `IndexScanRegexp(orders .*_created_at)` keeps meaning
+# the right thing after the index is rebuilt under a new name, which a pinned
+# name does not. Off by default; supply your own patterns to use it.
+def generate_index_regexp_candidates(
+    tables: list[str],
+    patterns: tuple[str, ...] = (),
+    methods: tuple[str, ...] = (
+        "IndexScanRegexp",
+        "BitmapScanRegexp",
+        "IndexOnlyScanRegexp",
+    ),
+    max_tables: int = 2,
+) -> list[str]:
+    """`IndexScanRegexp(t pattern)`: restrict to indexes matching a name pattern."""
+    if not tables or not patterns:
+        return []
+    chosen = sorted(dict.fromkeys(tables))[:max_tables]
+    return [
+        f"/*+ {method}({table} {pattern}) */"
+        for table in chosen
+        for pattern in patterns
+        for method in methods
+    ]
+
+
+# -- Negative join methods --------------------------------------------------
+#
+# `generate_join_method_candidates` below forces one operator across every join
+# in the tree, and to do that it has to pin the join order too -- the method
+# hints name the growing prefixes of a `Leading()`. So a candidate meant to
+# answer "would a hash join be better here" also silently answers "and in this
+# order", and a loss cannot be attributed to either.
+#
+# The negative forms need no `Leading()` at all. `NoNestLoop(a b c)` bans nested
+# loops among those relations however the planner chooses to order them, which
+# isolates the operator question from the ordering question. It is also the form
+# that matches the actual failure mode: a nested loop chosen because the outer
+# side was estimated at 3 rows and returned 30,000 is a disaster, and what is
+# wanted is not a specific replacement but simply *not that*.
+NEGATIVE_JOIN_METHODS = ("NoNestLoop", "NoHashJoin", "NoMergeJoin")
+
+
+def generate_negative_join_method_candidates(
+    tables: list[str], methods: tuple[str, ...] = NEGATIVE_JOIN_METHODS
+) -> list[str]:
+    """`NoNestLoop(a b c)`: ban an operator across the whole join, order-free."""
+    if len(tables) < 2:
+        return []
+    relations = " ".join(sorted(dict.fromkeys(tables)))
+    return [f"/*+ {method}({relations}) */" for method in methods]
+
+
+# -- Memoize ----------------------------------------------------------------
+#
+# Memoize (PG14+) caches the inner side of a nested loop across repeated outer
+# values. Whether it pays depends entirely on how many *distinct* values the
+# outer side has -- a high-repeat outer side turns N inner scans into a handful,
+# and a unique one adds a hash table nobody reads.
+#
+# The planner decides from `ndistinct`, which is the single statistic most often
+# wrong on the correlated columns this project targets, so it is a decision
+# worth putting in the action space. `Set(enable_memoize off)` in `HINT_SETS`
+# already covers the statement-wide ban; these are the per-join forms, which can
+# leave memoization on where it helps and off where it does not.
+#
+# `Memoize()` is documented as permissive rather than forcing -- it allows the
+# topmost join among those relations to memoize, and the planner may still
+# decline.
+def generate_memoize_candidates(tables: list[str]) -> list[str]:
+    """`Memoize(a b)` / `NoMemoize(a b)`: per-join inner-result caching."""
+    if len(tables) < 2:
+        return []
+    relations = " ".join(sorted(dict.fromkeys(tables)))
+    return [f"/*+ Memoize({relations}) */", f"/*+ NoMemoize({relations}) */"]
+
+
+# -- Per-table parallelism --------------------------------------------------
+#
+# `TUNING_SETTINGS` already varies `max_parallel_workers_per_gather`, but that
+# is a statement-wide ceiling, and it is only a ceiling: Postgres still applies
+# its own size heuristic and will refuse to parallelise a table it considers too
+# small, so `Set(max_parallel_workers_per_gather 4)` on such a table changes
+# nothing at all.
+#
+# `Parallel(table 4 hard)` overrides the heuristic and demands the workers. That
+# is the whole point -- the heuristic is a rule about table size, and the cases
+# worth attacking are the ones where a small table is expensive (an expensive
+# filter, a costly function) or a large one is cheap. `Parallel(table 0)`
+# removes a Gather whose startup cost is not repaid.
+#
+# `soft` respects the planner's own judgement, which makes it the safe default
+# and also, mostly, a no-op; `hard` is the one that adds something to the space.
+PARALLEL_DEGREES: tuple[str, ...] = ("0", "2", "4")
+
+
+def generate_parallel_candidates(
+    tables: list[str],
+    degrees: tuple[str, ...] = PARALLEL_DEGREES,
+    max_tables: int = 2,
+    mode: str = "hard",
+) -> list[str]:
+    """`Parallel(t 4 hard)`: force a worker count on one table."""
+    if not tables:
+        return []
+    chosen = sorted(dict.fromkeys(tables))[:max_tables]
+    candidates: list[str] = []
+    for table in chosen:
+        for degree in degrees:
+            # Zero workers means "no parallelism at all", where hard/soft has
+            # nothing left to qualify -- pg_hint_plan takes the bare form.
+            qualifier = "" if degree == "0" else f" {mode}"
+            candidates.append(f"/*+ Parallel({table} {degree}{qualifier}) */")
+    return candidates
+
+
 def apply_hint(query: str, hint: str) -> str:
     """Prepend a pg_hint_plan hint comment to a SQL query."""
     return f"{hint}\n{query}"
@@ -246,7 +603,15 @@ def generate_candidates(
     max_method_orders: int = 4,
     include_hint_sets: bool = True,
     include_tuning: bool = False,
+    include_bushy: bool = False,
+    include_scan_methods: bool = False,
+    include_negative_scans: bool = False,
+    include_negative_joins: bool = False,
+    include_memoize: bool = False,
+    include_parallel: bool = False,
+    include_enable_settings: bool = False,
     join_graph: dict[str, list[str]] | None = None,
+    table_indexes: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """
     Order-only candidates, plus (opt-in) order x method, plus hint sets, plus
@@ -267,6 +632,25 @@ def generate_candidates(
         candidates += generate_hint_sets()
     if include_tuning:
         candidates += generate_tuning_candidates()
+    if include_bushy:
+        candidates += generate_bushy_candidates(tables, join_graph=join_graph)
+    if include_scan_methods:
+        candidates += generate_scan_method_candidates(tables)
+    if include_negative_scans:
+        candidates += generate_negative_scan_candidates(tables)
+    if include_negative_joins:
+        candidates += generate_negative_join_method_candidates(tables)
+    if include_memoize:
+        candidates += generate_memoize_candidates(tables)
+    if include_parallel:
+        candidates += generate_parallel_candidates(tables)
+    if include_enable_settings:
+        candidates += generate_enable_candidates()
+    # Index pinning is last because it is the only family that can be empty for
+    # a reason outside the query -- no catalog map was supplied -- and the
+    # budget in `planner.py` truncates from the end.
+    if table_indexes:
+        candidates += generate_index_candidates(table_indexes)
     return candidates
 
 
@@ -302,6 +686,18 @@ HINT_SETS: tuple[tuple[str, ...], ...] = (
     ("enable_hashjoin", "enable_seqscan"),
     ("enable_mergejoin", "enable_seqscan"),
     ("enable_material",),
+    # Memoize (PG14+) caches the inner side of a nested loop across repeated
+    # parameter values. It is a large win when the outer side repeats and pure
+    # overhead when it does not, and the planner decides from the estimate this
+    # project exists because it distrusts.
+    ("enable_memoize",),
+    # Hash aggregation can spill; a sorted group-by sometimes beats it, and
+    # this is the only way to find out which.
+    ("enable_hashagg",),
+    # Incremental sort exploits an already-partially-sorted input. When the
+    # planner is wrong about how sorted that input is, it is slower than a
+    # plain sort.
+    ("enable_incremental_sort",),
 )
 
 
@@ -342,7 +738,51 @@ TUNING_SETTINGS: tuple[tuple[str, str], ...] = (
     ("work_mem", "65536"),
     ("random_page_cost", "1.1"),
     ("join_collapse_limit", "1"),
+    # JIT compilation is priced by the planner's cost estimate, and it is a
+    # fixed cost paid before the first row. On a query the planner *thinks* is
+    # expensive and is not, compiling can take longer than executing -- a
+    # common and easily-missed regression on short analytical queries.
+    ("jit", "off"),
+    # Above `geqo_threshold` joined relations PostgreSQL stops searching
+    # exhaustively and runs a genetic algorithm instead, which is fast,
+    # approximate, and *non-deterministic* -- the same query can get different
+    # plans on different runs. Raising the threshold buys an exhaustive search
+    # on the large joins where the plan space is worth searching properly, and
+    # is the setting that matters most on JOB's 8-to-17 table queries.
+    ("geqo_threshold", "20"),
 )
+
+
+# -- Settings worth turning ON ---------------------------------------------
+#
+# `HINT_SETS` is built entirely out of flags to switch *off*, which quietly
+# assumes every planner feature is on by default. Two are not:
+# `enable_partitionwise_join` and `enable_partitionwise_aggregate` both default
+# to **off**, so no combination of `off` toggles can reach the plan shapes they
+# unlock -- joining matching partitions pairwise instead of appending first, and
+# aggregating per partition. On a partitioned schema that is a shape the action
+# space simply could not express.
+#
+# They are off by default for a reason the manual is explicit about: planning
+# gets significantly more expensive, and the number of nodes bounded by
+# `work_mem` grows with the partition count, so memory use can climb sharply.
+# That is an argument for measuring them per query, which is what this project
+# is for, rather than for setting them globally.
+ENABLE_SETTINGS: tuple[tuple[str, ...], ...] = (
+    ("enable_partitionwise_join",),
+    ("enable_partitionwise_aggregate",),
+    ("enable_partitionwise_join", "enable_partitionwise_aggregate"),
+)
+
+
+def generate_enable_candidates(
+    settings: tuple[tuple[str, ...], ...] = ENABLE_SETTINGS,
+) -> list[str]:
+    """One candidate per off-by-default planner feature worth switching on."""
+    return [
+        "/*+ " + " ".join(f"Set({flag} on)" for flag in flags) + " */"
+        for flags in settings
+    ]
 
 
 def generate_tuning_candidates(

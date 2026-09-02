@@ -1,5 +1,21 @@
+import pytest
+
 from app.optimizer.decision_cache import DecisionCache
 from app.optimizer import planner
+
+
+@pytest.fixture(autouse=True)
+def _no_shadow_sampling(monkeypatch):
+    """
+    Turn off the shadow measurement for these tests.
+
+    `optimize_and_execute` runs PostgreSQL's plan alongside a sampled fraction
+    of deviations so that served traffic contributes matched pairs (see
+    `planner.SHADOW_SAMPLE_RATE`). It fires at random, which makes any assertion
+    about *how many* plans were executed pass roughly nine times in ten -- a
+    flake that would have reached CI rather than a failure.
+    """
+    monkeypatch.setattr(planner, "SHADOW_SAMPLE_RATE", 0.0)
 
 
 class _RecordingCursor:

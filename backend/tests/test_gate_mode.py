@@ -71,7 +71,15 @@ def _plan(cost, hint="/*+ Leading(o u) */"):
 
 
 def _calibrated(q):
-    """A gate whose measured multiplier is exactly `q`."""
+    """
+    A gate whose measured quantile is exactly `q`.
+
+    `q` is in the target's own units -- log(candidate / native) -- because the
+    bound is absolute rather than sigma-normalised. So 0.1 is "the truth lands
+    at most 1.1x above the prediction", and 1.5 would be 4.5x, which is a model
+    nobody should deviate on. See `optimizer/conformal.py` for the measurement
+    that made absolute the default.
+    """
     gate = ConformalGate(alpha=0.1)
     gate.q = q
     gate.n_calibration = 100
@@ -90,7 +98,7 @@ def test_fixed_z_is_the_default():
 
 def test_conformal_is_used_when_selected_and_calibrated():
     optimizer = _optimizer(math.log(0.5), spread=0.1, gate_mode="conformal",
-                           conformal=_calibrated(1.0))
+                           conformal=_calibrated(0.05))
     optimizer.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
 
     assert optimizer.last_decision["gate"] == "conformal"
@@ -126,9 +134,9 @@ def test_a_larger_measured_multiplier_makes_the_gate_stricter():
     gain and differ only in how far out their plausible worst case sits.
     """
     lenient = _optimizer(math.log(0.7), spread=0.1, gate_mode="conformal",
-                         conformal=_calibrated(0.5))
+                         conformal=_calibrated(0.05))
     strict = _optimizer(math.log(0.7), spread=0.1, gate_mode="conformal",
-                        conformal=_calibrated(20.0))
+                        conformal=_calibrated(1.5))
 
     lenient_served = lenient.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
     strict_served = strict.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
@@ -154,10 +162,17 @@ def test_an_unreachable_risk_level_refuses_to_deviate():
 
 
 def test_the_guard_s_caution_still_tightens_the_conformal_bound():
-    """A query with no served history gets a stricter bar under either gate --
-    the guard cannot protect what it has never seen."""
+    """
+    A query with no served history gets a stricter bar under either gate -- the
+    guard cannot protect what it has never seen.
+
+    This is the test that caught `caution` being applied to the ensemble's
+    spread rather than to the margin. That worked only while the bound was
+    sigma-normalised; the absolute bound ignores the spread, so the extra
+    protection silently disappeared.
+    """
     optimizer = _optimizer(math.log(0.6), spread=0.2, gate_mode="conformal",
-                           conformal=_calibrated(1.5))
+                           conformal=_calibrated(0.20))
 
     relaxed = optimizer.select_plan(
         [_plan(100.0)], baseline_plan=_plan(200.0, hint=None), caution=1.0
@@ -173,7 +188,7 @@ def test_the_guard_s_caution_still_tightens_the_conformal_bound():
 def test_both_gates_agree_when_the_win_is_overwhelming():
     """A change of gate is a change of where the line sits, not of what the
     system is trying to do."""
-    for mode, conformal in (("fixed_z", None), ("conformal", _calibrated(1.0))):
+    for mode, conformal in (("fixed_z", None), ("conformal", _calibrated(0.05))):
         optimizer = _optimizer(math.log(0.05), spread=0.01, gate_mode=mode, conformal=conformal)
 
         served = optimizer.select_plan([_plan(100.0)], baseline_plan=_plan(200.0, hint=None))
