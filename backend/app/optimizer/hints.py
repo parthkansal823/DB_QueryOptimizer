@@ -785,15 +785,36 @@ def generate_candidates(
     with, and can beat every plan shape on the menu without changing the shape
     at all.
     """
+    # Ordered by measured value, because `planner.budget_for` truncates this
+    # list from the end and therefore decides what a query never gets to try.
+    #
+    # It used to run: join orders, join methods, operator toggles, resources.
+    # The comment justifying that in `planner.py` argued the resource settings
+    # "are precisely the ones that cannot help a small query" -- giving a hash
+    # join over two thousand rows more `work_mem` does nothing, while reordering
+    # its joins might. Plausible, and measured over 2,364 collected candidates
+    # on this database, wrong:
+    #
+    #     resource / cost model   n=542    mean ratio 0.99   median 0.93
+    #     join order              n=486    mean ratio 1.27   median 1.12
+    #     operator toggle        n=1328    mean ratio 2.91   median 1.58
+    #
+    # The resource family is the only one whose median is *below* native, and it
+    # was the family being thrown away. Measured across the workload, the budget
+    # dropped resource candidates on **every** query -- on seven of eight it was
+    # the only thing it dropped.
+    #
+    # Fast families first, so the budget spends what it has on the candidates
+    # most likely to win and truncates the ones least likely to.
     candidates = generate_join_order_candidates(
         tables, max_candidates=max_order_candidates, join_graph=join_graph
     )
+    if include_tuning:
+        candidates += generate_tuning_candidates()
     if include_join_methods and len(tables) >= 2:
         candidates += generate_join_method_candidates(tables, max_orders=max_method_orders)
     if include_hint_sets:
         candidates += generate_hint_sets()
-    if include_tuning:
-        candidates += generate_tuning_candidates()
     if include_bushy:
         candidates += generate_bushy_candidates(tables, join_graph=join_graph)
     if include_scan_methods:

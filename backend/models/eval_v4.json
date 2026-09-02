@@ -1,0 +1,63 @@
+{
+  "model_backend": "bootstrapped-ensemble[8x lightgbm]",
+  "pairwise_ranker": "trained",
+  "join_cardinality_corrector": "trained",
+  "conformal_gate": {
+    "alpha": 0.1,
+    "q": 0.1962866466702889,
+    "n_calibration": 2194,
+    "target_coverage": 0.9,
+    "held_out_coverage": 0.8787878787878788
+  },
+  "point_calibration": {
+    "intercept": -0.0049671584347163455,
+    "slope": 1.017755391066554,
+    "n_calibration": 2194,
+    "fitted": true,
+    "before": {
+      "mean_log_error": -0.0011959581146829149,
+      "systematic_factor": 0.9988047567582087,
+      "mean_absolute_log_error": 0.12776779776850689,
+      "min_predicted_ratio": 0.5300792256267151
+    },
+    "after": {
+      "mean_log_error": 4.189902754738512e-17,
+      "systematic_factor": 1.0,
+      "mean_absolute_log_error": 0.12733685870849895,
+      "min_predicted_ratio": 0.5215418190540729
+    }
+  },
+  "uncertainty_scale": 3.6856016093005617,
+  "n_rows_raw": 8694,
+  "reps_aggregated_to_median": true,
+  "n_rows_total": 2978,
+  "n_rows_train": 2252,
+  "n_rows_test": 726,
+  "n_features": 62,
+  "test_mae_log_ratio": 0.1591136549745168,
+  "test_typical_multiplicative_error": 1.1724711962922698,
+  "test_mean_uncertainty_log_ratio": 0.05389670871435868,
+  "n_tables_in_schema": 6,
+  "n_held_out_queries": 36,
+  "avg_latency_ms": {
+    "native": 197.9648611111111,
+    "heuristic": 212.59380555555555,
+    "oracle_best_possible": 164.62374999999997,
+    "learned_greedy": 192.87541666666664,
+    "learned_thompson": 179.19749999999996,
+    "learned_risk_averse": 181.36030555555556,
+    "learned_pairwise_rank": 192.6620833333333
+  },
+  "headroom_captured_vs_oracle": {
+    "learned_greedy": 0.15264771553304288,
+    "learned_thompson": 0.5628894924517619,
+    "learned_risk_averse": 0.49802046189222465,
+    "learned_pairwise_rank": 0.15904622254807285
+  },
+  "beats_or_ties_heuristic_rate": {
+    "learned_greedy": 0.75,
+    "learned_thompson": 0.7777777777777778,
+    "learned_risk_averse": 0.6111111111111112,
+    "learned_pairwise_rank": 0.7777777777777778
+  }
+}

@@ -198,12 +198,41 @@ class LearnedOptimizer:
         # fixed-z bound rather than refusing to serve.
         self.conformal = bundle.get("conformal")
         self.uncertainty_scale = float(bundle.get("uncertainty_scale") or 1.0)
+        # Corrects the predicted *level*, which is what the gate reads. Absent
+        # in a bundle trained before it existed, where the identity is right.
+        self.point_calibration = bundle.get("point_calibration")
         # Which queries this model never trained on. `app.benchmark` needs it to
         # separate a memorisation score from a generalisation one.
         self.held_out_queries = list(bundle.get("held_out_queries") or ())
         self.target = bundle.get("target", "actual_total_time_ms")
 
     # -- selection ---------------------------------------------------------
+
+    def _predict_mean_std(self, vectors) -> tuple[list[float], list[float]]:
+        """
+        Ensemble predictions, with the level corrected.
+
+        Every prediction the gate sees goes through here. The raw model is a
+        good *ranker* and a poor *level-setter*: measured over 321 candidates,
+        it predicted every one at 0.826x native or worse while 54 were genuinely
+        under 0.8x, so the gate -- which deviates below 0.80x -- could not fire
+        on any query at any confidence setting.
+
+        The correction is affine and increasing, so the ordering the argmin uses
+        is untouched and the model's 79% headroom capture is preserved exactly.
+        Only the position relative to the threshold changes, which is the thing
+        that was wrong. See `optimizer/calibration.py`.
+
+        The spread is deliberately left alone. `uncertainty_scale` and the
+        conformal bound are both fitted against *calibrated* means paired with
+        raw spreads (`app/train.py`), so scaling the spread here too would count
+        the correction twice.
+        """
+        means, stds = self.model.predict_mean_std(vectors)
+        calibration = getattr(self, "point_calibration", None)
+        if calibration is not None and getattr(calibration, "fitted", False):
+            means = calibration.apply(means)
+        return means, stds
 
     def _vectorize(self, candidate_plans: list[dict]) -> list[list[float]]:
         """Feature vectors for `candidate_plans`, shaped for the loaded bundle."""
@@ -346,7 +375,7 @@ class LearnedOptimizer:
             return self._select_against_native_absolute(candidate_plans, baseline_plan)
 
         vectors = self._vectorize(candidate_plans)
-        means, stds = self.model.predict_mean_std(vectors)
+        means, stds = self._predict_mean_std(vectors)
 
         # Which candidate to put forward is the *policy's* decision (greedy,
         # thompson, risk_averse, pairwise_rank all pick differently). The
@@ -427,7 +456,7 @@ class LearnedOptimizer:
         vectors = [
             to_vector(featurize(c, self.table_cardinalities), self.feature_columns) for c in scored
         ]
-        means, stds = self.model.predict_mean_std(vectors)
+        means, stds = self._predict_mean_std(vectors)
 
         best_i = min(range(1, len(scored)), key=lambda i: means[i])
         predicted_gain = means[0] - means[best_i]

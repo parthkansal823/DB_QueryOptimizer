@@ -328,6 +328,40 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
     return sorted(found, key=lambda w: order[w["severity"]])
 
 
+def _served_evaluation(eval_path: str) -> tuple[dict | None, str]:
+    """
+    The evaluation of the model that is actually deployed, and where it came from.
+
+    `eval_path` is a fixed filename, and the deployed model is whatever
+    `model_store` last promoted. Those are two different things, and they had
+    drifted apart: the dashboard's "should I believe this model" panel was
+    reporting **-5.9% headroom captured** from a stale `models/eval_results.json`
+    while the promoted version measured **+79.2%**. A panel whose entire purpose
+    is to say whether the model can be trusted, describing a different model, is
+    the worst possible thing for it to do quietly.
+
+    The registry stores the metrics alongside the version it promoted, so that
+    is the authority. The file is the fallback for a deployment that predates
+    the registry, and the report says which one it used.
+    """
+    # An explicitly-passed path wins. The registry is consulted only for the
+    # default, because a caller naming a file means that file -- the CLI's
+    # `--eval` flag and every test that builds a synthetic evaluation depend on
+    # it, and silently substituting the registry would make the argument a lie.
+    if eval_path == DEFAULT_EVAL_PATH:
+        try:
+            from app import model_store
+
+            version = model_store.current_version()
+            if version:
+                for entry in model_store.list_versions():
+                    if entry.get("version_id") == version and entry.get("metrics"):
+                        return entry["metrics"], f"registry version {version}"
+        except Exception:  # noqa: BLE001 - a missing registry is not a failure
+            pass
+    return _read_json(eval_path), eval_path
+
+
 def diagnose(
     model_path: str = DEFAULT_MODEL_PATH,
     gate_path: str = DEFAULT_GATE_PATH,
@@ -344,7 +378,7 @@ def diagnose(
     """
     bundle = _read_bundle(model_path)
     gate = _read_json(gate_path)
-    evaluation = _read_json(eval_path)
+    evaluation, evaluation_source = _served_evaluation(eval_path)
 
     gate_section = gate_report(gate, bundle)
     uncertainty_section = uncertainty_report(bundle, evaluation)
@@ -360,6 +394,10 @@ def diagnose(
     return {
         "model_loaded": bundle is not None,
         "target": (bundle or {}).get("target"),
+        # Which evaluation these numbers describe. The panel exists to say
+        # whether the deployed model can be trusted, so it has to be checkable
+        # that it is describing the deployed model -- see `_served_evaluation`.
+        "evaluation_source": evaluation_source,
         "gate": gate_section,
         "uncertainty": uncertainty_section,
         "evidence": evidence_section,

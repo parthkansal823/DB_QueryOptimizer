@@ -21,7 +21,6 @@ import LatencyChart from "./components/LatencyChart";
 import DatabaseAdvisor from "./components/DatabaseAdvisor";
 import ExperimentPanel from "./components/ExperimentPanel";
 import Collapsible from "./components/Collapsible";
-import HowToUse from "./components/HowToUse";
 import ModelHealth from "./components/ModelHealth";
 import OptimizedQuery from "./components/OptimizedQuery";
 import Recommendations from "./components/Recommendations";
@@ -175,26 +174,27 @@ export default function DemoPage() {
 
   return (
     <>
-      <header className="app-header">
-        <p>Paste a query and see how PostgreSQL&rsquo;s plan compares to the one the {overall?.selector_mode ?? "…"} optimizer picks.</p>
-      </header>
+      {/* A plain intro line, not a second site header. Reusing `app-header`
+          here gave a one-sentence paragraph the header's border, padding and
+          bottom margin -- a stray rule across the page and a large gap under
+          it. */}
+      <p className="page-intro">
+        Paste a query and see how PostgreSQL&rsquo;s plan compares to the one the{" "}
+        {overall?.selector_mode ?? "…"} optimizer picks.
+      </p>
 
-      {/* The page used to be fourteen cards in a flat list, which is readable
-          only if you already know which ones answer which question. Grouping
-          them says what each run of panels is for: this query, then this
-          database, then whether any of it is working, then the model itself. */}
-      <h2 className="group-heading">This query</h2>
+      {/* Grouping the fourteen panels was an improvement over a flat list, but
+          it left every one of them open: 4,200 pixels of prose and charts under
+          a query box, with no way to tell what to look at.
 
+          The page does one thing now. Paste a query, get an answer, see what
+          would fix it properly. Everything else is diagnostics -- true, worth
+          having, and not what anyone opens this to read -- so it is folded away
+          behind two toggles that say what is inside them. */}
       <section className="card">
         <h2>Query</h2>
         <QueryForm onAnalyze={handleAnalyze} loading={loading} error={error} />
       </section>
-
-      {/* Below the query box, not above it. The instructions are worth having
-          and they are not what anyone came here to read first -- opening on a
-          screenful of them pushes the one control that does anything below the
-          fold. */}
-      <HowToUse />
 
       {result && (
         <>
@@ -243,98 +243,108 @@ export default function DemoPage() {
         </>
       )}
 
-      {result && (
-        <section className="card">
-          <h2>Production path</h2>
-          <ProductionRun result={production} onRun={handleProductionRun} busy={productionBusy} />
-        </section>
-      )}
-
-      <h2 className="group-heading">This database</h2>
-      <p className="group-blurb">
-        Findings about the database rather than one query&rsquo;s plan. Each is fixed once and
-        then helps every query, including ones this system has never seen. Nothing here is
-        applied &mdash; every finding shows the statement that would apply it.
-      </p>
-
-      <Collapsible title="Database health" hint="correlated columns, indexes, settings">
-        <DatabaseAdvisor
-          findings={dbFindings}
-          onRefresh={loadDatabaseAdvisor}
-          busy={dbBusy}
-          deep={dbDeep}
-          onDeepChange={setDbDeep}
-        />
-      </Collapsible>
-
+      {/* A hint fixes one query; these fix the reason it needed one. Kept open
+          and next to the result, because it is the other half of the answer --
+          not a diagnostic. */}
       <section className="card">
-        <h2>Database fixes &mdash; treat the cause, not the symptom</h2>
+        <h2>Fix the cause, not the symptom</h2>
         <Recommendations queryRecs={result?.recommendations} schemaRecs={schemaRecs} />
       </section>
 
-      <Collapsible title="What we found in your database" hint="tables and join edges">
-        <SchemaPanel schema={schema} />
+      {/* Everything below is true and worth having, and none of it is why
+          anyone opened the page. Two toggles, closed. */}
+      <h2 className="group-heading">Going deeper</h2>
+
+      <Collapsible
+        title="Is it working?"
+        hint="time saved, decision quality, and how good PostgreSQL's estimates are"
+      >
+        <p className="decision-caution" style={{ marginTop: 0 }}>
+          Every figure is a matched pair &mdash; PostgreSQL&rsquo;s plan and the served plan for
+          the same query, in the same run. One run settles very little;{" "}
+          <em>Settle a comparison</em> below is the tool for that.
+        </p>
+        {trendError && <div className="error-banner">{trendError}</div>}
+        <div className="card-grid">
+          {/* Spans the grid: it carries a table of every run, which a 340px
+              track squeezes into a horizontal scrollbar with clipped headers. */}
+          <section className="card card-wide">
+            <h2>How much time this is saving</h2>
+            <ServedVsNative trend={trend} />
+          </section>
+
+          <section className="card">
+            <h2>Were the decisions right?</h2>
+            <DecisionQuality quality={trend?.decision_quality} />
+          </section>
+
+          <section className="card">
+            <h2>Time saved, run by run</h2>
+            <CumulativeChart runs={trend?.runs} />
+          </section>
+
+          <section className="card">
+            <h2>Do PostgreSQL&rsquo;s estimates match reality?</h2>
+            <CostModelChart data={costModel} />
+          </section>
+        </div>
+
+        {/* A per-day rollup needs more than one day to mean anything. Until
+            then the run sequence above is the honest time axis. */}
+        {trend?.by_day?.length > 1 && (
+          <section className="card">
+            <h2>Day by day</h2>
+            <TrendChart byDay={trend.by_day} />
+          </section>
+        )}
       </Collapsible>
 
-      <h2 className="group-heading">Is it working?</h2>
-      <p className="group-blurb">
-        Every figure here is a matched pair &mdash; PostgreSQL&rsquo;s plan and the served plan
-        for the same query, measured in the same run. A single run settles very little on this
-        database; <em>Settle a comparison</em> below is the tool for that.
-      </p>
-
-      <div className="card-grid">
+      <Collapsible
+        title="The database, and the model"
+        hint="schema, health checks, model status, and a paired A/B"
+      >
         <section className="card">
-          <h2>How much time this is saving</h2>
-          {trendError && <div className="error-banner">{trendError}</div>}
-          <ServedVsNative trend={trend} />
+          <h2>Database health</h2>
+          <DatabaseAdvisor
+            findings={dbFindings}
+            onRefresh={loadDatabaseAdvisor}
+            busy={dbBusy}
+            deep={dbDeep}
+            onDeepChange={setDbDeep}
+          />
         </section>
 
         <section className="card">
-          <h2>Were the decisions right?</h2>
-          <DecisionQuality quality={trend?.decision_quality} />
+          <h2>What we found in your database</h2>
+          <SchemaPanel schema={schema} />
         </section>
 
         <section className="card">
-          <h2>Time saved, run by run</h2>
-          <CumulativeChart runs={trend?.runs} />
+          <h2>Model health</h2>
+          <ModelHealth
+            status={modelStatus}
+            diagnostics={modelDiagnostics}
+            busy={modelBusy}
+            onRetrain={() => runModelAction(triggerRetrain)}
+            onRollback={() => runModelAction(triggerRollback)}
+          />
         </section>
 
         <section className="card">
-          <h2>Do PostgreSQL&rsquo;s estimates match reality?</h2>
-          <CostModelChart data={costModel} />
+          <h2>Settle a comparison</h2>
+          <ExperimentPanel status={experiment} onStart={handleStartExperiment} busy={modelBusy} />
         </section>
-      </div>
 
-      {/* A per-day rollup needs more than one day to mean anything. Until
-          then the run sequence above is the honest time axis, and a two-point
-          line chart would just be decoration. */}
-      {trend?.by_day?.length > 1 && (
-        <section className="card">
-          <h2>Day by day</h2>
-          <TrendChart byDay={trend.by_day} />
-        </section>
-      )}
-
-      <h2 className="group-heading">The model itself</h2>
-      <p className="group-blurb">
-        Whether the model can be believed, and how to settle a question about it properly
-        rather than by reading three numbers off one run.
-      </p>
-
-      <section className="card">
-        <h2>Model health</h2>
-        <ModelHealth
-          status={modelStatus}
-          diagnostics={modelDiagnostics}
-          busy={modelBusy}
-          onRetrain={() => runModelAction(triggerRetrain)}
-          onRollback={() => runModelAction(triggerRollback)}
-        />
-      </section>
-
-      <Collapsible title="Settle a comparison" hint="paired A/B with a confidence interval">
-        <ExperimentPanel status={experiment} onStart={handleStartExperiment} busy={modelBusy} />
+        {result && (
+          <section className="card">
+            <h2>Production path</h2>
+            <ProductionRun
+              result={production}
+              onRun={handleProductionRun}
+              busy={productionBusy}
+            />
+          </section>
+        )}
       </Collapsible>
     </>
   );

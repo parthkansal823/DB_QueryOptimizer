@@ -265,7 +265,21 @@ def report(cur, schema: str = "public", limit: int = 200) -> dict:
 
         mean_ms = float(mean_ms or 0.0)
         stddev_ms = float(stddev_ms or 0.0)
-        if calls >= 10 and mean_ms > 0 and stddev_ms / mean_ms >= NOISY_STDDEV_FRACTION:
+        # Not reported for this optimizer's own EXPLAIN traffic.
+        #
+        # The finding's note offers "the spread may be between plans rather than
+        # within one" as a possibility. For a sweep row it is a certainty: the
+        # optimizer plans twenty-odd different candidates under one normalised
+        # entry, and their runtimes differ because that is the entire point.
+        # Reporting it is a false positive by construction, and a loud one --
+        # measured 29 noisy findings on this database, 14 of them the tool
+        # observing itself.
+        if (
+            not base["from_optimizer_sweep"]
+            and calls >= 10
+            and mean_ms > 0
+            and stddev_ms / mean_ms >= NOISY_STDDEV_FRACTION
+        ):
             findings["noisy"].append({
                 **base,
                 "stddev_ms": round(stddev_ms, 3),

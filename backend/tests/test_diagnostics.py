@@ -13,6 +13,8 @@ of files that may be absent, stale or corrupt, since it is pointed at whatever
 """
 
 import json
+import sys
+import json
 import pickle
 
 import pytest
@@ -380,3 +382,101 @@ def test_a_gate_with_no_recorded_promise_cannot_drift(tmp_path, monkeypatch):
     report = diagnostics.diagnose(paths["model"], paths["gate"], paths["eval"], cur=object())
 
     assert report["drift"] is None
+
+
+# -- which model the evidence describes ---------------------------------------
+
+
+class TestServedEvaluation:
+    """
+    The panel exists to answer "should I believe this model". It was answering
+    it about a *different* model.
+
+    `eval_path` is a fixed filename; the deployed model is whatever
+    `model_store` last promoted. Those drifted apart, and the dashboard reported
+    **-5.9% headroom captured** from a stale `models/eval_results.json` while
+    the promoted version measured **+79.2%**. Worse than useless: a panel whose
+    whole job is trustworthiness, quietly describing something else.
+    """
+
+    def test_the_registry_is_preferred_over_the_file(self, monkeypatch, tmp_path):
+        from app import diagnostics
+
+        registry_metrics = {"headroom_captured_vs_oracle": {"learned_greedy": 0.79}}
+
+        class _Store:
+            @staticmethod
+            def current_version():
+                return "v-new"
+
+            @staticmethod
+            def list_versions():
+                return [
+                    {"version_id": "v-old", "metrics": {"headroom_captured_vs_oracle": {}}},
+                    {"version_id": "v-new", "metrics": registry_metrics},
+                ]
+
+        monkeypatch.setattr("app.model_store.current_version", _Store.current_version)
+        monkeypatch.setattr("app.model_store.list_versions", _Store.list_versions)
+        evaluation, source = diagnostics._served_evaluation(diagnostics.DEFAULT_EVAL_PATH)
+        assert evaluation == registry_metrics
+        assert "v-new" in source
+
+    def test_the_file_is_the_fallback(self, monkeypatch, tmp_path):
+        """A deployment older than the registry still has to report something."""
+        from app import diagnostics
+
+        path = tmp_path / "eval.json"
+        path.write_text(json.dumps({"n_rows_train": 7}))
+
+        class _Store:
+            @staticmethod
+            def current_version():
+                return None
+
+            @staticmethod
+            def list_versions():
+                return []
+
+        monkeypatch.setattr("app.model_store.current_version", _Store.current_version)
+        monkeypatch.setattr("app.model_store.list_versions", _Store.list_versions)
+        evaluation, source = diagnostics._served_evaluation(str(path))
+        assert evaluation == {"n_rows_train": 7}
+        assert source == str(path)
+
+    def test_a_broken_registry_falls_back_rather_than_failing(self, monkeypatch, tmp_path):
+        from app import diagnostics
+
+        path = tmp_path / "eval.json"
+        path.write_text(json.dumps({"n_rows_train": 3}))
+
+        def _explode():
+            raise RuntimeError("registry unreadable")
+
+        monkeypatch.setattr("app.model_store.current_version", _explode)
+        evaluation, source = diagnostics._served_evaluation(str(path))
+        assert evaluation == {"n_rows_train": 3}
+
+    def test_a_promoted_version_without_metrics_falls_back(self, monkeypatch, tmp_path):
+        """
+        Reporting an empty evidence section as though it described the served
+        model is the same mistake in a quieter form.
+        """
+        from app import diagnostics
+
+        path = tmp_path / "eval.json"
+        path.write_text(json.dumps({"n_rows_train": 11}))
+
+        class _Store:
+            @staticmethod
+            def current_version():
+                return "v1"
+
+            @staticmethod
+            def list_versions():
+                return [{"version_id": "v1", "metrics": {}}]
+
+        monkeypatch.setattr("app.model_store.current_version", _Store.current_version)
+        monkeypatch.setattr("app.model_store.list_versions", _Store.list_versions)
+        evaluation, _ = diagnostics._served_evaluation(str(path))
+        assert evaluation == {"n_rows_train": 11}

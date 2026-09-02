@@ -1,8 +1,11 @@
 {
   "confidence_z": 2.0,
-  "min_relative_gain": 0.2,
-  "calibrated_on_n_queries": 11,
-  "expected_deviation_rate": 0.36363636363636365,
-  "expected_regression_rate": 0.0,
-  "expected_worst_regression_ratio": 1.0
+  "min_relative_gain": 0.02,
+  "calibrated_on_n_queries": 9,
+  "expected_deviation_rate": 0.5555555555555556,
+  "expected_regression_rate": 0.2,
+  "expected_worst_regression_ratio": 1.0924024640657084,
+  "chosen_by": "replay",
+  "evaluated_on": "held_out_queries",
+  "excluded_query_prefix": "auto_"
 }

@@ -55,11 +55,23 @@ beforeEach(() => {
   api.fetchTrainStatus.mockResolvedValue({ status: "idle", is_running: false, log: [] });
 });
 
+// Settings are folded away, one toggle per group -- there are now more than
+// thirty across five groups, and rendering them all open made the page five
+// thousand pixels tall. A test that wants a control has to open its group
+// first, exactly as a user does.
+async function openSettingsGroup(name) {
+  const toggle = await screen.findByRole("button", { name: new RegExp(name, "i") });
+  await userEvent.click(toggle);
+}
+
 describe("rendering from backend metadata", () => {
   it("renders a control per declared field, grouped", async () => {
     // The page knows nothing about individual settings: a field added to
     // app/settings.py must appear here with no frontend change.
     render(<DashboardPage />);
+    await openSettingsGroup("Model");
+    await openSettingsGroup("Safety gate");
+    await openSettingsGroup("Action space");
 
     expect(await screen.findByLabelText("Selection policy")).toBeInTheDocument();
     expect(screen.getByLabelText("Minimum predicted speedup")).toBeInTheDocument();
@@ -69,6 +81,7 @@ describe("rendering from backend metadata", () => {
 
   it("shows the current value, not the default", async () => {
     render(<DashboardPage />);
+    await openSettingsGroup("Model");
     expect(await screen.findByLabelText("Selection policy")).toHaveValue("greedy");
   });
 });
@@ -80,6 +93,7 @@ describe("changing a setting", () => {
       applied: true,
     });
     render(<DashboardPage />);
+    await openSettingsGroup("Model");
 
     await userEvent.selectOptions(await screen.findByLabelText("Selection policy"), "thompson");
 
@@ -93,6 +107,7 @@ describe("changing a setting", () => {
     // value the optimizer never accepted.
     api.updateSettings.mockRejectedValue(new Error("422: confidence_z must be <= 5.0"));
     render(<DashboardPage />);
+    await openSettingsGroup("Model");
 
     await userEvent.selectOptions(await screen.findByLabelText("Selection policy"), "thompson");
 
@@ -103,6 +118,7 @@ describe("changing a setting", () => {
 describe("the model/schema mismatch warning", () => {
   it("stays quiet when the model matches the connected database", async () => {
     render(<DashboardPage />);
+    await openSettingsGroup("Model");
     await screen.findByLabelText("Selection policy");
     expect(screen.queryByText(/trained on a different schema/i)).not.toBeInTheDocument();
   });
@@ -140,7 +156,10 @@ describe("databases", () => {
 
   it("does not offer to deactivate the live connection", async () => {
     render(<DashboardPage />);
-    await screen.findByLabelText("Selection policy");
+    // Waits on the databases panel, which is what this test is about. It used
+    // to wait on a settings label, which was only ever standing in for "the
+    // page has loaded" -- and stopped existing once settings were folded away.
+    await screen.findAllByText(/postgres:\*\*\*\*@postgres:5432\/lqo/);
     expect(screen.queryByRole("button", { name: "Make active" })).not.toBeInTheDocument();
   });
 

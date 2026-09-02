@@ -25,6 +25,8 @@ safety gate, and 492 tests behind CI.
 | [`docs/JOB_RESULTS.md`](docs/JOB_RESULTS.md) | Results on the real JOB/IMDB benchmark |
 | [`docs/CONFIDENCE.md`](docs/CONFIDENCE.md) | **How the optimizer decides whether to trust itself** — and the two fixes that were measured and reverted |
 | [`docs/DATABASE_OPTIMIZATION.md`](docs/DATABASE_OPTIMIZATION.md) | Fixing the *database* rather than one query: correlated columns, server settings, index and table health |
+| [`docs/TECHNIQUES_BACKLOG.md`](docs/TECHNIQUES_BACKLOG.md) | The PostgreSQL manual read against this system — what was built from it, what is blocked on a server upgrade, and the four documented features that do not exist on this server |
+| [`famalies.txt`](famalies.txt) | Every hint family in the action space, with measured evidence that each one binds |
 
 > **Read `docs/WRITEUP.md` §2.4.0 before the numbers below.** The seed data in
 > `data/schema.sql` had a bug that gave every categorical column exactly one

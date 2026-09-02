@@ -31,6 +31,37 @@ from app.measurement import make_deterministic
 DEFAULT_REPS = 3
 
 
+def _recover(cur, statement_timeout_ms: int) -> None:
+    """
+    Get the connection back to a usable state after a candidate failed.
+
+    Tries the cheap thing first: `ROLLBACK TO SAVEPOINT` keeps every row logged
+    so far in this transaction, which is the whole reason the savepoint exists --
+    a full rollback after an hour of collection throws the hour away.
+
+    If that fails too -- and it can, since the same cancellation that killed the
+    candidate can surface on the next statement -- fall back to rolling the
+    transaction back and re-applying the session settings, because a connection
+    that is quietly missing `statement_timeout` will hang on the next slow
+    candidate instead of skipping it.
+    """
+    try:
+        cur.execute("ROLLBACK TO SAVEPOINT candidate")
+        return
+    except Exception:  # noqa: BLE001 - fall through to the heavier reset
+        pass
+
+    try:
+        cur.connection.rollback()
+        cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
+        cur.execute("LOAD 'pg_hint_plan'")
+        cur.execute("SET pg_hint_plan.enable_hint = on")
+        print("  [reset] transaction rolled back; rows from this batch are lost",
+              file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [reset] could not recover the connection: {exc}", file=sys.stderr)
+
+
 def collect(
     reps: int = DEFAULT_REPS,
     include_join_methods: bool = True,
@@ -82,11 +113,11 @@ def collect(
             cur.execute("SAVEPOINT candidate")
             try:
                 baseline = get_plan(cur, sql)
+                cur.execute("RELEASE SAVEPOINT candidate")
             except Exception as exc:  # noqa: BLE001 - one bad query shouldn't kill the run
-                cur.execute("ROLLBACK TO SAVEPOINT candidate")
                 print(f"  [skip] {query_id} (baseline): {exc}", file=sys.stderr)
+                _recover(cur, statement_timeout_ms)
                 continue
-            cur.execute("RELEASE SAVEPOINT candidate")
 
             log_execution(
                 cur,
@@ -117,13 +148,30 @@ def collect(
                 hinted_sql = apply_hint(sql, hint)
                 for _ in range(reps):
                     cur.execute("SAVEPOINT candidate")
+                    # The recovery statements are inside the guard too, because
+                    # they can fail for the same reason the candidate did.
+                    #
+                    # A cancelled statement does not always surface its error on
+                    # the `execute` that issued it -- psycopg2 can raise it on
+                    # the next one instead. `RELEASE SAVEPOINT` was outside this
+                    # block, so a timeout arriving there killed the whole run
+                    # after four minutes of collection:
+                    #
+                    #     File "app/collect_data.py", line 126, in collect
+                    #       cur.execute("RELEASE SAVEPOINT candidate")
+                    #     psycopg2.errors.QueryCanceled: canceling statement due
+                    #     to statement timeout
+                    #
+                    # Losing an hour of collection to the bookkeeping around a
+                    # skipped candidate is exactly what the savepoint was added
+                    # to prevent.
                     try:
                         plan = get_plan(cur, hinted_sql)
+                        cur.execute("RELEASE SAVEPOINT candidate")
                     except Exception as exc:  # noqa: BLE001 - a bad/slow hint shouldn't kill the run
-                        cur.execute("ROLLBACK TO SAVEPOINT candidate")
                         print(f"  [skip] {query_id} {hint!r}: {exc}", file=sys.stderr)
+                        _recover(cur, statement_timeout_ms)
                         continue
-                    cur.execute("RELEASE SAVEPOINT candidate")
                     log_execution(
                         cur,
                         query_id=query_id,

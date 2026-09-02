@@ -47,9 +47,19 @@ hurt an individual query. `_dominates` therefore treats settings whose net
 improvement is within `TIE_FRACTION` as equivalent and breaks the tie on
 regression rate, which is the quantity the project actually cares about.
 
+**A threshold is chosen on one population and spent on another.** Generated
+queries carry a third of the built-in workload's available headroom, so a sweep
+including them picks a threshold right for neither -- `_grouped_rows` has the
+measurement. `DEFAULT_EXCLUDE_PREFIX` therefore leaves them out of gate
+selection by default. They stay excellent *training* data; this is only about
+where the threshold gets chosen.
+
 Usage:
-    python -m app.calibrate            # sweep, report, recommend
-    python -m app.calibrate --apply    # also write the result to models/gate.json
+    python -m app.calibrate                      # sweep, report, recommend
+    python -m app.calibrate --apply              # write it to models/gate.json
+    python -m app.calibrate --exclude-prefix ''  # include generated queries too
+    python -m app.calibrate --measure            # execute the plans instead of
+                                                 # replaying the log
 """
 
 from __future__ import annotations
@@ -79,6 +89,32 @@ def _load_bundle(path: str = "models/plan_selector.pkl") -> dict:
 
     with open(path, "rb") as f:
         return pickle.load(f)
+
+
+# Generated queries are excluded from gate selection by default.
+#
+# `_grouped_rows` documents why at length -- generated queries carry 12.3% mean
+# available headroom against the built-in workload's 40.5%, while the model's
+# typical error is around 24%, so a sweep over both picks a threshold right for
+# neither -- and `measure_settings` lists it as one of three ways the offline replay
+# had been wrong. It was still the default, which meant the documented defect
+# was what everyone got.
+#
+# Measured on the current model, over the same 15 held-out queries:
+#
+#     including auto_*    no setting qualified at any threshold; the best was
+#                         net -7.3%, and *all* of it was one generated query
+#                         (auto_4w_72_oi_quantity_lt, -158.1 ms at 1.64x)
+#                         against a +2.2 ms win on the other deviation
+#     excluding auto_*    net +24.0%, 0% regressions, worst case 1.00x
+#
+# Two deviations decided the first verdict. That is not a measurement of the
+# model, it is a measurement of one query, and it was vetoing the whole gate.
+#
+# Generated queries remain excellent *training* data -- they took the model's
+# typical error from 43% to 24%. This is only about where a threshold that will
+# be spent on the real workload should be chosen.
+DEFAULT_EXCLUDE_PREFIX = "auto_"
 
 
 def _grouped_rows(exclude_prefix: str | None = None) -> dict[str, list[dict]]:
@@ -370,11 +406,7 @@ def sweep(
     # never fires has a perfect (vacuous) regression rate.
     best = None
     for result in results:
-        if result["deviation_rate"] <= 0.0:
-            continue
-        if result["worst_regression_ratio"] > max_worst_regression:
-            continue
-        if result["regression_rate"] > max_regression_rate:
+        if _refused_by(result, max_regression_rate, max_worst_regression):
             continue
         if _dominates(result, best):
             best = result
@@ -392,8 +424,136 @@ def sweep(
         "evaluated_on": "held_out_queries" if held_out else "all_queries_in_sample",
         "n_queries_scored": len(scored),
         "recommended": best,
+        # When nothing qualified, which bound turned down the best thing on
+        # offer. See closest_rejected() for why that distinction is the whole
+        # difference between "collect more data" and "raise a threshold".
+        "closest_rejected": (
+            None if best is not None
+            else closest_rejected(results, max_regression_rate, max_worst_regression)
+        ),
         "all_settings": sorted(results, key=lambda r: -r["net_improvement_ms"]),
     }
+
+
+def _refused_by(
+    result: dict, max_regression_rate: float, max_worst_regression: float
+) -> str | None:
+    """
+    Which bound disqualifies this setting, or None if it qualifies.
+
+    Kept as one function so the sweep and the diagnosis below cannot disagree
+    about why a setting was turned down.
+    """
+    if result["deviation_rate"] <= 0.0:
+        return "never_fires"
+    if result["worst_regression_ratio"] > max_worst_regression:
+        return "worst_regression"
+    if result["regression_rate"] > max_regression_rate:
+        return "regression_rate"
+    return None
+
+
+def closest_rejected(
+    results: list[dict], max_regression_rate: float, max_worst_regression: float
+) -> dict | None:
+    """
+    The most valuable setting that a bound refused, and which bound refused it.
+
+    "Nothing qualified" and "the model is not accurate enough" are different
+    statements, and reporting the second when the first is true sends whoever
+    reads it to fix the wrong thing. The case that prompted this: a setting
+    netting **+6.2%** whose worst single regression was **1.01x** -- comfortably
+    inside the 1.25x magnitude bound -- refused because 33% of its deviations
+    regressed, against a 25% rate bound. No amount of extra training data fixes
+    that; it is a threshold choice, and it is the caller's to make.
+
+    The distinction matters because the two bounds are not peers. As sweep()'s
+    docstring records from measurement, `max_worst_regression` is the safety
+    bound -- no query may end up meaningfully slower than native -- while
+    `max_regression_rate` is a frequency sanity check. A refusal by the second
+    while the first is satisfied means the losses are real but negligible.
+    """
+    live = [r for r in results if r["deviation_rate"] > 0.0]
+    rejected = [
+        {**r, "refused_by": why}
+        for r in live
+        if (why := _refused_by(r, max_regression_rate, max_worst_regression))
+    ]
+    if not rejected:
+        return None
+    return max(rejected, key=lambda r: r["net_improvement_ms"])
+
+
+def refusal_lines(report: dict) -> list[str]:
+    """
+    What to tell someone whose calibration recommended nothing.
+
+    Three distinct situations, with three different things to go and do, and
+    the old message collapsed all of them into "collect more data":
+
+    * **Nothing fired anywhere.** The gate declined every query at every
+      threshold. That really is a model problem.
+    * **Refused by the magnitude bound.** Some query ends up meaningfully
+      slower than native. That bound is the safety property this system
+      promises, so the answer is a better model, not a looser bound.
+    * **Refused by the rate bound while the magnitude bound is satisfied.**
+      The losses are real but individually negligible -- the case that prompted
+      this function had a worst case of 1.01x, refused for a 33% rate. Whether
+      to accept many tiny losses in exchange for the wins is a *policy* choice
+      and it belongs to the caller: no amount of extra training data changes a
+      threshold comparison.
+
+      Unless the net is negative. Then there are no wins for those small losses
+      to pay for, raising the bound would buy a setting that loses time overall,
+      and the honest advice is the same as the first case.
+    """
+    near = report["closest_rejected"]
+    rate_bound = report["max_regression_rate"]
+    worst_bound = report["max_worst_regression"]
+
+    if near is None:
+        return [
+            "",
+            "No setting optimized anything at all -- at every threshold in the grid",
+            "the gate declined every query. That is a model problem, and more data",
+            "is the fix.",
+        ]
+
+    lines = [
+        "",
+        f"No setting qualified. The closest was z={near['confidence_z']}, "
+        f"min_gain={near['min_relative_gain']} "
+        f"(net {near['net_improvement_pct']:+.1f}%, {near['net_improvement_ms']:+.0f} ms).",
+    ]
+
+    if near["refused_by"] != "regression_rate":
+        return lines + [
+            f"  refused by --max-worst-regression: one query ends up "
+            f"{near['worst_regression_ratio']:.2f}x slower than native, bound is "
+            f"{worst_bound:.2f}x.",
+            "  That is the safety bound doing its job. Collect more data rather than",
+            "  raising it.",
+        ]
+
+    lines += [
+        f"  refused by --max-regression-rate: {near['regression_rate']:.0%} of its "
+        f"deviations regress, bound is {rate_bound:.0%}.",
+        f"  but its worst single regression was {near['worst_regression_ratio']:.2f}x, "
+        f"inside the {worst_bound:.2f}x safety bound.",
+    ]
+    if near["net_improvement_ms"] > 0:
+        suggested = min(0.95, near["regression_rate"] + 0.02)
+        return lines + [
+            "  So the frequency threshold is what is binding here, not the model's",
+            "  accuracy. Losses that small may be worth the wins: re-run with a higher",
+            f"  --max-regression-rate (say {suggested:.2f}). --max-worst-regression is",
+            "  the bound that protects against a real regression, and it stays on.",
+        ]
+    return lines + [
+        f"  Raising that bound would not help: this setting is net "
+        f"{near['net_improvement_pct']:+.1f}%, so its small",
+        "  losses have no wins to pay for them. Collect more data.",
+    ]
 
 
 def _held_out_queries(bundle: dict, grouped: dict[str, list[dict]]) -> set[str]:
@@ -481,21 +641,68 @@ def measure_settings(
     return measured
 
 
-def apply_gate(setting: dict, path: str = GATE_PATH) -> None:
+def grid_with_recommendation(grid: tuple[dict, ...], recommended: dict | None) -> list[dict]:
+    """
+    The measured grid, plus whatever the replay currently recommends.
+
+    `MEASURED_GRID` is a fixed handful of settings, and the point of running
+    `--measure` is to check the replay's pick by executing it. If the pick is
+    not in the grid, the expensive run answers a question nobody asked: the
+    first time this mattered, the replay recommended `z=2.0, min_gain=0.02`
+    while the grid held `z=2.0, min_gain=0.20` -- the incumbent -- and nothing
+    in between.
+
+    Adding the recommendation to the constant would have worked once and then
+    gone stale the next time the model changed, so it is computed instead. The
+    incumbent stays in the grid deliberately: a measurement of a candidate
+    without a measurement of what it would replace is not a comparison.
+    """
+    if recommended is None:
+        return list(grid)
+    pick = {
+        "confidence_z": recommended["confidence_z"],
+        "min_relative_gain": recommended["min_relative_gain"],
+    }
+    if any(
+        g["confidence_z"] == pick["confidence_z"]
+        and g["min_relative_gain"] == pick["min_relative_gain"]
+        for g in grid
+    ):
+        return list(grid)
+    return list(grid) + [pick]
+
+
+def apply_gate(setting: dict, path: str = GATE_PATH, provenance: dict | None = None) -> None:
+    """
+    Write the deployed gate, recording where its numbers came from.
+
+    Two things this file has to be honest about, both learned the hard way.
+
+    **Which population.** The expected rates below are a property of the queries
+    the gate was chosen on, not of the gate. On this project the same gate over
+    the same 15 queries scored net -7.3% including generated queries and +24.0%
+    excluding them, so a file stating expected rates without stating the
+    population is stating almost nothing. `provenance` carries it.
+
+    **What was not measured.** The `--measure` path applies a setting picked by
+    executing the workload, which yields captured headroom but no per-query
+    regression breakdown. It used to fill those three fields with `0.0`, `0.0`
+    and `1.0` -- a perfect score, for a quantity nobody had computed. Missing
+    values are written as `null` now: "not measured" and "measured as flawless"
+    must not look the same to whoever reads this next.
+    """
+    payload = {
+        "confidence_z": setting["confidence_z"],
+        "min_relative_gain": setting["min_relative_gain"],
+        "calibrated_on_n_queries": setting.get("n_queries"),
+        "expected_deviation_rate": setting.get("deviation_rate"),
+        "expected_regression_rate": setting.get("regression_rate"),
+        "expected_worst_regression_ratio": setting.get("worst_regression_ratio"),
+    }
+    payload.update(provenance or {})
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
-        json.dump(
-            {
-                "confidence_z": setting["confidence_z"],
-                "min_relative_gain": setting["min_relative_gain"],
-                "calibrated_on_n_queries": setting["n_queries"],
-                "expected_deviation_rate": setting["deviation_rate"],
-                "expected_regression_rate": setting["regression_rate"],
-                "expected_worst_regression_ratio": setting["worst_regression_ratio"],
-            },
-            f,
-            indent=2,
-        )
+        json.dump(payload, f, indent=2)
 
 
 def load_gate(path: str = GATE_PATH) -> dict | None:
@@ -515,11 +722,11 @@ if __name__ == "__main__":
         help="no single query may end up more than this much slower than native",
     )
     parser.add_argument(
-        "--exclude-prefix", default=None,
+        "--exclude-prefix", default=DEFAULT_EXCLUDE_PREFIX,
         help=(
-            "skip query ids starting with this when choosing the gate, e.g. "
-            "'auto_' to calibrate on your own workload rather than on generated "
-            "queries whose available headroom is much smaller"
+            "skip query ids starting with this when choosing the gate "
+            f"(default {DEFAULT_EXCLUDE_PREFIX!r}, the prefix app.onboard gives "
+            "generated queries; pass '' to calibrate on everything)"
         ),
     )
     parser.add_argument("--apply", action="store_true", help="write the recommendation to models/gate.json")
@@ -536,7 +743,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.measure:
-        rows = measure_settings(policy=args.policy, limit=args.limit)
+        # Measure the replay's own recommendation alongside the fixed grid --
+        # checking the pick by execution is the entire point of --measure.
+        offline = sweep(
+            policy=args.policy,
+            max_regression_rate=args.max_regression_rate,
+            max_worst_regression=args.max_worst_regression,
+            exclude_prefix=args.exclude_prefix,
+        )["recommended"]
+        grid = tuple(grid_with_recommendation(MEASURED_GRID, offline))
+        if offline is not None:
+            print(
+                f"replay recommends z={offline['confidence_z']}, "
+                f"min_gain={offline['min_relative_gain']} -- measuring it too\n"
+            )
+        rows = measure_settings(policy=args.policy, limit=args.limit, grid=grid)
         print(f"{'z':>5} {'min_gain':>9} {'vetoed':>7} {'captured':>9} {'held-out':>9}")
         for r in rows:
             captured = "-" if r["captured_pct"] is None else f"{r['captured_pct']:.1f}%"
@@ -556,13 +777,16 @@ if __name__ == "__main__":
                 f"({best['held_out_captured_pct']:.1f}% of {best['n_held_out']} unseen queries)"
             )
             if args.apply:
-                apply_gate({
-                    **best,
-                    "n_queries": best.get("n_held_out") or 0,
-                    "deviation_rate": 0.0,
-                    "regression_rate": 0.0,
-                    "worst_regression_ratio": 1.0,
-                })
+                # No zeros here: a benchmark reports captured headroom, not a
+                # per-query regression breakdown, so those fields stay null.
+                apply_gate(
+                    {**best, "n_queries": best.get("n_held_out") or 0},
+                    provenance={
+                        "chosen_by": "measured",
+                        "held_out_captured_pct": best.get("held_out_captured_pct"),
+                        "excluded_query_prefix": args.exclude_prefix or None,
+                    },
+                )
                 print(f"Written to {GATE_PATH} -- restart the backend to pick it up.")
         raise SystemExit(0)
 
@@ -590,8 +814,8 @@ if __name__ == "__main__":
 
     best = report["recommended"]
     if best is None:
-        print("\nNo setting met the regression-rate bound while still optimizing anything.")
-        print("That means the model isn't accurate enough to act on yet -- collect more data.")
+        for line in refusal_lines(report):
+            print(line)
     else:
         print(
             f"\nRecommended: confidence_z={best['confidence_z']}, "
@@ -601,5 +825,12 @@ if __name__ == "__main__":
             f"net {best['net_improvement_pct']:+.1f}%)"
         )
         if args.apply:
-            apply_gate(best)
+            apply_gate(
+                best,
+                provenance={
+                    "chosen_by": "replay",
+                    "evaluated_on": report["evaluated_on"],
+                    "excluded_query_prefix": report["excluded_prefix"] or None,
+                },
+            )
             print(f"Written to {GATE_PATH} -- restart the backend to pick it up.")

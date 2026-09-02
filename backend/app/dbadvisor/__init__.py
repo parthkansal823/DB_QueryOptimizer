@@ -92,12 +92,27 @@ def report(cur, schema: str = "public", include_statistics: bool = True) -> dict
 
 
 def count_findings(findings: dict) -> int:
-    """How many things this found, for a headline or a metric."""
-    total = 0
-    for section in ("unused", "duplicates", "redundant"):
-        total += len(findings.get("indexes", {}).get(section, ()))
-    for section in ("stale_statistics", "bloated", "heavily_scanned"):
-        total += len(findings.get("tables", {}).get(section, ()))
-    total += len(findings.get("server_config", {}).get("findings", ()))
-    total += len(findings.get("extended_statistics", ()))
-    return total
+    """
+    How many things this found, for a headline or a metric.
+
+    Counted structurally rather than by naming every section, because naming
+    them meant a new section did not count. Four were added -- maintenance,
+    workload, physical, observability -- and the headline kept reporting the
+    old total: the live report said "4 findings" while `observability` alone
+    held four more. A dashboard that undercounts is worse than one that shows
+    nothing, because the number looks authoritative.
+
+    The rule is simple enough to be safe: a finding is a dict in a list. That
+    skips the scalars sections carry alongside their findings
+    (`pgstattuple_available`, `current`, the `note` explaining an empty panel)
+    without needing to know their names either.
+    """
+
+    def count(value) -> int:
+        if isinstance(value, dict):
+            return sum(count(v) for v in value.values())
+        if isinstance(value, list):
+            return sum(1 for item in value if isinstance(item, dict))
+        return 0
+
+    return count(findings)

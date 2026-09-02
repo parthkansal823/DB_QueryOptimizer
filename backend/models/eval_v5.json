@@ -1,0 +1,63 @@
+{
+  "model_backend": "bootstrapped-ensemble[8x lightgbm]",
+  "pairwise_ranker": "trained",
+  "join_cardinality_corrector": "trained",
+  "conformal_gate": {
+    "alpha": 0.1,
+    "q": 0.20985430403322292,
+    "n_calibration": 2609,
+    "target_coverage": 0.9,
+    "held_out_coverage": 0.8739754098360656
+  },
+  "point_calibration": {
+    "intercept": -0.008045364230060303,
+    "slope": 1.0208491165368787,
+    "n_calibration": 2609,
+    "fitted": true,
+    "before": {
+      "mean_log_error": 0.0012242462746880304,
+      "systematic_factor": 1.0012249959700645,
+      "mean_absolute_log_error": 0.13249453588279067,
+      "min_predicted_ratio": 0.36411277374665096
+    },
+    "after": {
+      "mean_log_error": 2.4687462159305654e-16,
+      "systematic_factor": 1.0000000000000002,
+      "mean_absolute_log_error": 0.13169273866289513,
+      "min_predicted_ratio": 0.35366657304963384
+    }
+  },
+  "uncertainty_scale": 3.5321892589919845,
+  "n_rows_raw": 12572,
+  "reps_aggregated_to_median": true,
+  "n_rows_total": 3653,
+  "n_rows_train": 2677,
+  "n_rows_test": 976,
+  "n_features": 62,
+  "test_mae_log_ratio": 0.2000568278510306,
+  "test_typical_multiplicative_error": 1.2214721698263982,
+  "test_mean_uncertainty_log_ratio": 0.07942414181080842,
+  "n_tables_in_schema": 6,
+  "n_held_out_queries": 36,
+  "avg_latency_ms": {
+    "native": 196.04906944444443,
+    "heuristic": 208.84125,
+    "oracle_best_possible": 155.99319444444444,
+    "learned_greedy": 194.81786111111114,
+    "learned_thompson": 191.41084722222226,
+    "learned_risk_averse": 195.19770833333334,
+    "learned_pairwise_rank": 189.37684722222224
+  },
+  "headroom_captured_vs_oracle": {
+    "learned_greedy": 0.030737272206219076,
+    "learned_thompson": 0.11579380608268251,
+    "learned_risk_averse": 0.021254338124209977,
+    "learned_pairwise_rank": 0.16657287407208532
+  },
+  "beats_or_ties_heuristic_rate": {
+    "learned_greedy": 0.6666666666666666,
+    "learned_thompson": 0.6388888888888888,
+    "learned_risk_averse": 0.6388888888888888,
+    "learned_pairwise_rank": 0.7222222222222222
+  }
+}

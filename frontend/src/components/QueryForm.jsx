@@ -76,9 +76,11 @@ export default function QueryForm({ onAnalyze, loading, error }) {
   return (
     <form className="query-form" onSubmit={handleSubmit}>
       <textarea
+        className="query-editor"
         value={sql}
         onChange={(e) => setSql(e.target.value)}
         spellCheck={false}
+        aria-label="SQL query"
       />
       <div className="query-form-actions">
         <button type="submit" disabled={loading}>

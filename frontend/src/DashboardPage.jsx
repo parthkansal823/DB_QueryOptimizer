@@ -10,6 +10,8 @@ import {
   testDatabase,
   updateSettings,
 } from "./api";
+import Collapsible from "./components/Collapsible";
+import HowToUse from "./components/HowToUse";
 import QueryManager from "./components/QueryManager";
 import TrainingPanel from "./components/TrainingPanel";
 
@@ -284,16 +286,21 @@ export default function DashboardPage() {
 
   return (
     <>
-      <header className="app-header">
-        <p>
-          Connect a database, save the queries you care about, train on them, and tune how the
-          optimizer behaves — all without touching the backend. Every setting applies to the
-          next query and is remembered across restarts.
-        </p>
-      </header>
+      {/* A plain intro line, not a second site header -- reusing `app-header`
+          gave one sentence the header's border, padding and bottom margin. */}
+      <p className="page-intro">
+        Connect a database, save the queries you care about, train on them, and tune how the
+        optimizer behaves — all without touching the backend. Every setting applies to the next
+        query and is remembered across restarts.
+      </p>
 
       {error && <p className="decision-caution">{error}</p>}
       {saved && !error && <p className="probe-ok">Saved and applied.</p>}
+
+      {/* The instructions live here, not on the demo page. The demo exists to
+          show a result; instructions above the result push it off the screen,
+          and this is the page you are on when you are setting things up. */}
+      <HowToUse />
 
       <DatabasePanel databases={databases} onChanged={loadDatabases} onError={setError} />
 
@@ -310,12 +317,34 @@ export default function DashboardPage() {
         onError={setError}
       />
 
-      {settings.groups.map((group) => (
-        <section className="card" key={group}>
-          <h2>{group}</h2>
-          {settings.fields
-            .filter((field) => field.group === group)
-            .map((field) => (
+      {/* Settings are folded away, one toggle per group.
+          There are now more than thirty of them across five groups -- every
+          hint family added from the pg_hint_plan reference brought one -- and
+          rendering them all open made this page five thousand pixels tall. The
+          three panels above are what someone comes here to do; the settings are
+          what they change once and then leave alone.
+
+          Each toggle says how many settings are inside and how many are no
+          longer at their default, so a changed setting is findable without
+          opening all five. */}
+      <h2 className="group-heading">Settings</h2>
+
+      {settings.groups.map((group) => {
+        const fields = settings.fields.filter((field) => field.group === group);
+        const changed = fields.filter(
+          (field) => settings.values[field.name] !== field.default,
+        ).length;
+        return (
+          <Collapsible
+            key={group}
+            title={group}
+            hint={
+              changed
+                ? `${fields.length} settings, ${changed} changed`
+                : `${fields.length} settings, all default`
+            }
+          >
+            {fields.map((field) => (
               <Field
                 key={field.name}
                 field={field}
@@ -324,14 +353,20 @@ export default function DashboardPage() {
                 disabled={busy}
               />
             ))}
-        </section>
-      ))}
+          </Collapsible>
+        );
+      })}
 
-      <section className="card">
-        <button type="button" onClick={handleReset} disabled={busy}>
-          Reset to defaults
+      <p>
+        <button
+          type="button"
+          className="button-secondary"
+          onClick={handleReset}
+          disabled={busy}
+        >
+          Reset all settings to defaults
         </button>
-      </section>
+      </p>
     </>
   );
 }

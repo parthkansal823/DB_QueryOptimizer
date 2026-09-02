@@ -2,6 +2,7 @@ import { NavLink, Route, HashRouter as Router, Routes } from "react-router-dom";
 import "./App.css";
 import DashboardPage from "./DashboardPage";
 import DemoPage from "./DemoPage";
+import ThemeToggle from "./components/ThemeToggle";
 
 // HashRouter rather than BrowserRouter: the dashboard is served by `vite
 // preview` and by a plain static host in the Docker image, neither of which
@@ -20,6 +21,7 @@ export default function App() {
           <NavLink to="/demo" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
             Demo
           </NavLink>
+          <ThemeToggle />
         </nav>
       </header>
 

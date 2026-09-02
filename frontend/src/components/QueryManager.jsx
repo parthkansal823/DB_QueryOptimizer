@@ -65,7 +65,11 @@ export default function QueryManager({ queries, onChanged, onError }) {
         care about, not the one this project shipped with.
       </p>
 
-      <div className="query-editor">
+      {/* `query-compose`, not `query-editor`: that name belongs to the
+          textarea in `QueryForm`, and having a container and a control
+          share it gave this wrapper a fixed 9rem height with the inputs
+          laid out inside it. */}
+      <div className="query-compose">
         <input
           aria-label="Query name"
           placeholder="name (e.g. orders-by-country)"

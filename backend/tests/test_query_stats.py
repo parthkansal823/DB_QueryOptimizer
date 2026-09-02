@@ -221,3 +221,33 @@ def test_it_survives_a_version_without_the_io_timing_column():
     columns = [c for c in _Cursor.COLUMNS if c != "blk_read_time"]
     report = query_stats.report(_Cursor([row(temp=5)], columns=columns))
     assert report["spilling"][0]["temp_blocks_written"] == 5
+
+
+def test_the_noisy_check_ignores_the_optimizers_own_sweep():
+    """
+    The finding's note offers "the spread may be between plans rather than
+    within one" as a possibility. For a sweep row it is a certainty: twenty-odd
+    candidates for one query fold into a single normalised entry, and their
+    runtimes differ because that is the point of running them.
+
+    Reporting it is a false positive by construction, and a loud one — measured
+    29 noisy findings on this database, 14 of them the tool observing itself.
+    """
+    sweep = row(
+        query="EXPLAIN (FORMAT JSON, ANALYZE) SELECT ...",
+        calls=145, mean_ms=10.0, stddev_ms=10.5,
+    )
+    assert query_stats.report(_Cursor([sweep]))["noisy"] == []
+
+    user = row(query="SELECT * FROM orders", calls=145, mean_ms=10.0, stddev_ms=10.5)
+    assert query_stats.report(_Cursor([user]))["noisy"]
+
+
+def test_spilling_is_still_reported_for_sweep_traffic():
+    """
+    Unlike variance, "some candidate for this query spills to disk" is a real
+    thing to know — it is a fact about the action space, and `work_mem` is in
+    that action space precisely on that argument.
+    """
+    sweep = row(query="EXPLAIN (FORMAT JSON, ANALYZE) SELECT ...", temp=8148)
+    assert query_stats.report(_Cursor([sweep]))["spilling"]

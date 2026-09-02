@@ -143,28 +143,52 @@ It is also a **measurement hazard**: with GEQO active and the seed unpinned, the
 benchmark's paired A/B is comparing two draws from a random search. Pin
 `geqo_seed` in `app/experiment_job.py` or the numbers are noise.
 
-## A8. Index-name and regexp scan hints — implemented, needs wiring
+## A8. Index-name and regexp scan hints — done, off by default
 
-`generate_index_candidates` and `generate_disable_index_candidates` are now in
-`hints.py` but need a `{table: [index...]}` map from the catalog.
+**Catalog map: done.** `optimizer/catalog.py` has `index_map(cur)` and
+`indexes_by_alias(...)`, fetched once per process and cached, because the
+catalog does not change per query. The second function exists because
+pg_hint_plan addresses relations by the **alias** the query uses, not the table
+name -- measured, and the failure is silent: `Parallel(order_items 4 hard)` cost
+7870 and was ignored, while `Parallel(oi 4 hard)` cost 1774.
 
-```sql
-SELECT c.relname AS table, i.relname AS index
-FROM pg_index x
-JOIN pg_class c ON c.oid = x.indrelid
-JOIN pg_class i ON i.oid = x.indexrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public' AND c.relkind = 'r';
-```
+**`generate_index_candidates`: wired, default off.** `planner.py` reads
+`INCLUDE_INDEX_PINNING` (default `"0"`) and needs a live cursor; missing either
+means the family generates nothing, which is how it behaved before it existed.
+It is generated **last**, and `planner.py`'s adaptive budget truncates from the
+end -- so on any query that hits the budget this family is the first thing
+dropped. That ordering was deliberate when index pinning was the only family
+that could be empty for a reason outside the query, but it now doubles as a
+second reason the family is unmeasured. Turning it on is a measurement, not an
+edit: enable it, run `app.benchmark`, compare captured headroom against the
+family ordering that WRITEUP 2.18 established by measurement.
 
-Fetch once per process and cache — the catalog does not change per query.
+**`generate_index_regexp_candidates`: deliberately not wired.** It takes a
+`patterns` tuple that defaults to `()` and returns `[]` without one. With the
+catalog map we have the exact index names, and `IndexScan(t idx_a idx_b)` is
+strictly more precise than `IndexScanRegexp(t "idx_.*")` -- the regexp form
+would generate candidates resolving to plans the explicit form already covers,
+spending budget to say the same thing less exactly. It stays for the case where
+index names are not knowable ahead of time.
 
-`DisableIndex` has a second use worth building: it is the **missing half of the
-unused-index advisor** in `app/dbadvisor/indexes.py`. That advisor reports zero
-scans in `pg_stat_user_indexes`, which is evidence about the past.
-`DisableIndex` re-plans the workload as if the index were already dropped, which
-is evidence about the future. Dropping an index is irreversible without a
-rebuild; this makes the recommendation checkable first.
+**`DisableIndex`: blocked, and not by us.** The hint does not exist in
+pg_hint_plan **1.6.3**, which is what is installed here; the PG18 manual
+documents a newer pg_hint_plan than this server runs. It is rejected at `INFO`
+severity, which the default `client_min_messages` discards -- so an unsupported
+hint looks exactly like a hint that did nothing.
+`generate_disable_index_candidates` is kept and unwired.
+
+That blocks the genuinely interesting use: `DisableIndex` is the **missing half
+of the unused-index advisor** in `app/dbadvisor/indexes.py`. That advisor reports
+zero scans in `pg_stat_user_indexes`, which is evidence about the *past*.
+Re-planning the workload as if the index were already dropped is evidence about
+the *future*, and dropping an index is irreversible without a rebuild.
+
+There is no clean substitute on 1.6.3. `IndexScan(t <every index except X>)` is
+an allow-list, not a deny-list, and it also *forces* an index scan -- so it
+cannot express "plan this however you like, but without X", which is exactly the
+case that matters most: the one where dropping the index should send the planner
+to a sequential scan.
 
 ## A9. Skip scan — PG18
 
@@ -849,21 +873,108 @@ out that a benchmark run overlapped an aggressive vacuum on `order_items`.
 | F.30 `pg_prewarm` | 2955–2957 | read in full → B5 |
 | F.32 `pg_stat_statements` | 2959–2969 | read → B2 |
 | F.36 `pg_visibility` | 2982–2984 | read in full → B7 |
-| 27. Monitoring (`pg_stat_*` views) | 838–902 | **not yet read** |
+| 27. Monitoring (`pg_stat_*` views) | 838–902 | read → F5, F6, F7 |
 | 5.12 Partitioning | ~100–112 | **not yet read** (B10 is from §19.7 only) |
 | 30. JIT | 946–950 | **not yet read** (A2 covers `jit_above_cost`) |
 | 61. GEQO internals | — | **not yet read** (A7 is from §19.7) |
-| 69. How the Planner Uses Statistics | — | **not yet read** |
-| VI. Reference (EXPLAIN, VACUUM, CREATE INDEX/STATISTICS) | 1604+ | **not yet read** |
+| 69. How the Planner Uses Statistics | — | read in full → F1–F4 |
+| VI. Reference — EXPLAIN | 1998–2000 | read in full → C9 |
+| VI. Reference — VACUUM, CREATE INDEX/STATISTICS | 1604+ | **not yet read** |
 
-The unread chapters most likely to add something: **27** (the exact `pg_stat_*`
-columns behind every `dbadvisor` finding), **69** (how selectivity is actually
-computed, which is what `optimizer/cardinality.py` is modelling), and the
-**EXPLAIN reference page** (options this project does not pass).
+Chapters 27 and 69 were the two flagged as most likely to add something, and
+both did -- 69 gave F1-F4 (the selectivity formulas `optimizer/cardinality.py`
+is modelling, and the fact that join size is estimated before any join plan
+exists) and 27 gave F5-F7 (what `idx_scan` actually counts, which is not
+queries, and that the statistics views report asynchronously).
+
+The **EXPLAIN reference page** was the third flagged, and it gave C9: of the
+twelve options it documents, this project passes three, and `SETTINGS` is a
+PG16-available readback for whether a `Set()` hint actually bound -- the failure
+mode that has cost this project the most time.
+
+Still unread: **5.12** (partitioning; B10 comes from 19.7 only), **30** (JIT;
+A2 already covers `jit_above_cost`), **61** (GEQO internals; A7 comes from
+19.7), and the VACUUM / CREATE INDEX / CREATE STATISTICS reference pages.
 
 The rest of the 3156 pages — client interfaces, procedural languages,
 replication, data types, SQL syntax reference — was swept for planner-relevant
 material and has none that bears on this project.
+
+## C9. `EXPLAIN (SETTINGS)` — the direct test that a `Set()` hint bound — PG16 ✓
+
+From the EXPLAIN reference page (manual p. 1999), checked against every EXPLAIN
+this project issues:
+
+| where | options |
+|---|---|
+| `plan_extractor.get_plan` — the main path | `FORMAT JSON`, plus `ANALYZE, BUFFERS` when analyzing |
+| `main.py` `/query/analyze` | `FORMAT JSON, VERBOSE` |
+
+Against the full option list — `ANALYZE, VERBOSE, COSTS, SETTINGS,
+GENERIC_PLAN, BUFFERS, SERIALIZE, WAL, TIMING, SUMMARY, MEMORY, FORMAT` —
+`SERIALIZE` (C1) and `MEMORY` are PG17+, `WAL` is irrelevant to a read-only
+`SELECT` workload, `COSTS`/`TIMING`/`SUMMARY` default to what is wanted, and
+`VERBOSE` is already used where it earns its cost. One remaining option is worth
+having.
+
+> **SETTINGS** — Include information on configuration parameters. Specifically,
+> include options affecting query planning **with value different from the
+> built-in default**. This parameter defaults to FALSE.
+
+Available since PG12, so it works on this server.
+
+**Why it matters here specifically.** The single most expensive recurring bug
+class in this project is the *silent* one: a hint that was ignored is
+indistinguishable from a hint that ran and changed nothing. It has now happened
+three separate ways —
+
+* `Parallel(order_items 4 hard)` addressed a table by name where the query used
+  the alias `oi`. Cost 7870, silently unchanged; `Parallel(oi 4 hard)` cost 1774.
+* `DisableIndex` does not exist in pg_hint_plan 1.6.3. Rejected at `INFO`
+  severity, which the default `client_min_messages` discards.
+* Stacked hint comments: pg_hint_plan reads only the **first** `/*+ ... */` and
+  discards the rest without complaint (fixed by merging in `apply_hint`).
+
+A large slice of the action space is `Set(...)` hints —
+`hints.ENABLE_SETTINGS`, `EXTENDED_HINT_SETS`, `COST_MODEL_SETTINGS`, and the
+resource/cost-model family that WRITEUP 2.18 measured as the most valuable of
+the three. Every one of them is exposed to exactly this failure, and nothing
+currently checks that the GUC actually took effect. `EXPLAIN (SETTINGS)` reports
+the planner GUCs that differ from their built-in defaults at plan time, which is
+a direct readback of whether the hint bound — no severity juggling, no cost
+comparison against a control, in the plan JSON the project already parses.
+
+**The check this buys.** For a candidate whose hint is `Set(enable_seqscan off)`,
+the plan's `Settings` object should contain `enable_seqscan: off`. If it does
+not, the hint did not bind, and the candidate is not what it claims to be. That
+turns an entire silent failure class into an assertion — and it can run in
+`prefilter.py`, which already exists to discard candidates that provably cannot
+differ from the baseline.
+
+**Caveat to verify before relying on it.** pg_hint_plan applies `Set()` for the
+duration of planning. Whether that is still visible to `EXPLAIN (SETTINGS)` at
+output time is a question about pg_hint_plan's implementation, not about the
+manual, and it must be measured before this is built on. If it turns out not to
+be visible, that is itself worth recording: it would mean there is no readback
+for `Set()` binding at all, and the fallback is a control comparison.
+
+Two others from the same page, noted and not pursued:
+
+* **`VERBOSE`** — already in use, and correctly scoped. `main.py:377` passes it
+  on `/query/analyze` because covering-index opportunities need the query's
+  output column list, which only `VERBOSE` reports; the comment there notes it
+  is one extra planning round trip that the analyze path can afford (it already
+  issues around thirty) and `/query/optimize` cannot. It also *"always label[s]
+  variables in expressions with their range table alias"* — the information the
+  `Parallel(oi ...)` bug turned on — but `catalog.py::indexes_by_alias` already
+  gets that from `scan_relations` without the round trip, and `VERBOSE` would
+  roughly double the size of every plan JSON stored in `plan_execution_log`.
+* **`GENERIC_PLAN`** (PG16) — plans a statement containing `$1` placeholders
+  without values. It pairs with A3 (`plan_cache_mode`) and would let the advisor
+  show how a prepared statement plans versus how the literal-value query plans.
+  Cannot be combined with `ANALYZE`, so it is a second EXPLAIN per query, and
+  nothing in this workload is currently parameterized.
+
 
 ---
 
@@ -1514,3 +1625,115 @@ in place.
 ## Totals
 
 851 backend tests, 85 frontend, 15 integration.
+
+---
+
+# Round six — the rest of the backlog, and two bugs it exposed
+
+## Identity: chained passes were three different queries
+
+The `apply_hint` bug had a second half. `query_template` normalised literals but
+kept the hint comment, so the fingerprint changed every pass:
+
+    pass 1 (bare)   adhoc:c047519472b703a65c7118fcbd4c2f4e
+    pass 2          adhoc:988d3b8e205ba3509f222cd3fde00af5
+    pass 3          adhoc:2df438b04eb11d355f379fa1743d6e85
+
+Everything per-query keys on that id. So each pass reached the **regression
+guard**, the **decision cache** and the **regret curve** as a brand-new query --
+the guard could not have blocked a bad hint however many times it had seen one.
+Silently, because a fresh id is indistinguishable from a first visit.
+
+Hints are now stripped from the identity. A hint says *how* to run a query, not
+*which* query it is.
+
+The existing test asserted the opposite -- "stripping it would make a hinted and
+an unhinted execution indistinguishable" -- and that premise was already false:
+`main.py` logs the baseline **and every candidate** with the same `sql_text`,
+recording the difference in the `hint`, `is_baseline` and `is_chosen` columns.
+`query_id` is deliberately shared, because that is what makes served-vs-native
+pairing possible at all. pg_stat_statements takes the same view.
+
+## `count_findings` was undercounting by 39
+
+It enumerated section names, so the four sections added after it -- maintenance,
+workload, physical, observability -- did not count. The live report said **4
+findings** while 43 existed. A headline that undercounts is worse than none,
+because the number looks authoritative.
+
+Now counted structurally: a finding is a dict in a list. That skips the scalars
+sections carry alongside (`pgstattuple_available`, `current`, the `note`
+explaining an empty panel) without naming those either, and a section written
+next week counts without anyone remembering to add it.
+
+## And then the honest number was too loud
+
+43 findings, **29 of them "noisy"**, 14 of those the tool observing itself.
+
+The noisy check's own note offers "the spread may be between plans rather than
+within one" as a possibility. For an optimizer-sweep row it is a **certainty**:
+twenty-odd candidates for one query fold into a single normalised entry, and
+their runtimes differ because that is the point of running them. Reporting it is
+a false positive by construction. Suppressed for sweep traffic; 43 → 30.
+
+`spilling` is still reported for sweep traffic, because "some candidate for this
+query spills to disk" is a real fact about the action space -- and `work_mem` is
+in that action space on exactly that argument.
+
+## New: observability settings
+
+`dbadvisor/observability.py`. `server_config` checks what makes the database
+fast; these are what make it *diagnosable*, and all of them ship off or
+effectively off:
+
+| setting | default | what its absence costs |
+|---|---|---|
+| `track_io_timing` | off | every I/O-time column reads zero, so slow-because-disk looks identical to slow-because-CPU -- the exact 80.5%-vs-26.0% question |
+| `log_temp_files` | -1 | which queries actually spill, rather than gambling `work_mem` on all of them |
+| `log_lock_waits` | off | lock time is invisible to every plan-level measurement and looks like plan noise |
+| `log_autovacuum_min_duration` | **10 min** | an aggressive freeze scan landing mid-benchmark, appearing as unexplained variance |
+| `log_min_duration_statement` | -1 | what is actually slow |
+| `compute_query_id` | auto | joining a logged slow statement to its accumulated statistics |
+
+Every finding states its cost, because "turn on more logging" is advice that has
+taken production systems down. The ten-minute autovacuum default is treated as
+off, because it is not `-1` and a naive check reads it as enabled.
+
+## New: B10 partitioning, D9 multicolumn cap
+
+**Partitioning** (`physical.partition_candidates`). §11.8 Example 11.4 is direct:
+a fan of partial indexes on a large table is "a bad idea" because the planner
+"will laboriously test each one", and partitioning is its named alternative.
+Also the only thing that unlocks `enable_partitionwise_join` and
+`enable_partitionwise_aggregate` -- family 11, the two planner features that
+ship off.
+
+Proposes **no DDL**: it is a schema redesign with migration cost. Finds nothing
+on this database, correctly -- the largest table is 21 MB against a 100 MB
+floor. Verified the logic at a lowered threshold, where it found
+`plan_execution_log` -- this project's own log table, now excluded for the same
+reason `extended_stats` excludes it.
+
+**Multicolumn cap.** §11.3: *"Indexes with more than three columns are unlikely
+to be helpful unless the usage of the table is extremely stylized."* A
+five-column predicate now yields a three-column index and says why, plus the
+§11.5 trade-off: separate single-column indexes combined with a BitmapAnd may
+serve a mixed workload better, at the cost of an extra scan and a lost ordering.
+
+## Totals
+
+876 backend tests, 85 frontend, 15 integration. `/dbadvisor` returns seven
+sections and a headline that is finally correct.
+
+## What is left, and why
+
+- **PG17/PG18 items** (A9, A10, C1, C2, C3, C5) -- blocked on a server upgrade.
+  `Disabled: true` in EXPLAIN (C2) is the one worth upgrading *for*: it turns
+  "this candidate did nothing" from an inference into a fact.
+- **B13 non-durable settings** -- deliberately not done. `fsync=off` on a
+  database bind-mounted into the repo is a real risk for a benchmark
+  convenience; it needs a separate compose profile, not a change to this one.
+- **Join-order duplicate prediction** -- 56 of 83 candidates on a four-table
+  join are still duplicates, and they are `Leading()` variants. Whether two join
+  orders produce the same plan is what the planner decides; anything less than a
+  proof shrinks the action space silently.

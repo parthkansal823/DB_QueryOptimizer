@@ -325,20 +325,78 @@ def test_the_definition_quotes_identifiers():
 # -- the combined report ----------------------------------------------------
 
 
+def _finding(name="x"):
+    return {"table": name, "severity": "low"}
+
+
 def test_findings_are_counted_across_every_section():
     findings = {
-        "indexes": {"unused": [1, 2], "duplicates": [1], "redundant": []},
-        "tables": {"stale_statistics": [1], "bloated": [], "heavily_scanned": [1]},
-        "server_config": {"findings": [1, 2, 3]},
-        "extended_statistics": [1],
+        "indexes": {
+            "unused": [_finding(), _finding()],
+            "duplicates": [_finding()],
+            "redundant": [],
+        },
+        "tables": {
+            "stale_statistics": [_finding()],
+            "bloated": [],
+            "heavily_scanned": [_finding()],
+        },
+        "server_config": {"findings": [_finding(), _finding(), _finding()]},
+        "extended_statistics": [_finding()],
     }
 
     assert count_findings(findings) == 9
 
 
+def test_a_new_section_is_counted_without_being_named():
+    """
+    The counter used to enumerate section names, so the four sections added
+    after it — maintenance, workload, physical, observability — did not count.
+    The live report said "4 findings" while `observability` alone held four
+    more. A headline that undercounts is worse than none, because the number
+    looks authoritative.
+    """
+    findings = {
+        "server_config": {"findings": [_finding()]},
+        "a_section_nobody_has_written_yet": {"anything": [_finding(), _finding()]},
+    }
+
+    assert count_findings(findings) == 3
+
+
+def test_scalars_beside_the_findings_are_not_counted():
+    """
+    Sections carry values that are not findings: `pgstattuple_available`, the
+    `current` settings map, the `note` explaining why a panel is empty. A
+    finding is a dict in a list, which skips all of them without naming them
+    either.
+    """
+    findings = {
+        "physical": {"brin_candidates": [_finding()], "pgstattuple_available": True},
+        "observability": {
+            "findings": [_finding()],
+            "current": {"track_io_timing": "off"},
+        },
+        "workload": {"spilling": [], "note": "pg_stat_statements is not installed."},
+    }
+
+    assert count_findings(findings) == 2
+
+
+def test_a_list_of_plain_values_inside_a_finding_is_not_counted():
+    """`statistics_visibility` puts a list of table names inside one finding."""
+    findings = {
+        "server_config": {
+            "findings": [{"setting": "statistics visibility", "tables": ["a", "b", "c"]}]
+        }
+    }
+
+    assert count_findings(findings) == 1
+
+
 def test_counting_survives_a_partial_report():
     """`report(include_statistics=False)` omits a section entirely."""
-    assert count_findings({"server_config": {"findings": [1]}}) == 1
+    assert count_findings({"server_config": {"findings": [_finding()]}}) == 1
     assert count_findings({}) == 0
 
 

@@ -1,0 +1,69 @@
+{
+  "model_backend": "bootstrapped-ensemble[8x lightgbm]",
+  "pairwise_ranker": "trained",
+  "join_cardinality_corrector": "trained",
+  "conformal_gate": {
+    "alpha": 0.1,
+    "q": 0.19323017639390555,
+    "n_calibration": 2479,
+    "target_coverage": 0.9,
+    "held_out_coverage": 0.8736017897091722
+  },
+  "action_space": {
+    "filtered": true,
+    "dropped_rows": 980,
+    "kept_rows": 11592,
+    "reason": "INCLUDE_JOIN_METHODS is off, so forced join-method candidates are never served. Training on them shifts every prediction upward toward their much slower mean, which is what stopped the safety gate from ever firing."
+  },
+  "point_calibration": {
+    "intercept": -0.004575341055846782,
+    "slope": 1.0174943165012285,
+    "n_calibration": 2479,
+    "fitted": true,
+    "before": {
+      "mean_log_error": -0.00042972752676930615,
+      "systematic_factor": 0.9995703647928798,
+      "mean_absolute_log_error": 0.12476605175931771,
+      "min_predicted_ratio": 0.36656945053171364
+    },
+    "after": {
+      "mean_log_error": 1.5095719036321158e-15,
+      "systematic_factor": 1.0000000000000016,
+      "mean_absolute_log_error": 0.12408759161761108,
+      "min_predicted_ratio": 0.3585456311156737
+    }
+  },
+  "uncertainty_scale": 3.7660141157958216,
+  "n_rows_raw": 12572,
+  "reps_aggregated_to_median": true,
+  "n_rows_total": 3438,
+  "n_rows_train": 2544,
+  "n_rows_test": 894,
+  "n_features": 62,
+  "test_mae_log_ratio": 0.16396685863988933,
+  "test_typical_multiplicative_error": 1.1781752681148567,
+  "test_mean_uncertainty_log_ratio": 0.0683486296802152,
+  "n_tables_in_schema": 6,
+  "n_held_out_queries": 36,
+  "avg_latency_ms": {
+    "native": 196.04906944444443,
+    "heuristic": 208.84125,
+    "oracle_best_possible": 155.99319444444444,
+    "learned_greedy": 193.32880555555556,
+    "learned_thompson": 194.735,
+    "learned_risk_averse": 189.55329166666667,
+    "learned_pairwise_rank": 189.1895277777778
+  },
+  "headroom_captured_vs_oracle": {
+    "learned_greedy": 0.06791173302015913,
+    "learned_thompson": 0.032805910355083095,
+    "learned_risk_averse": 0.16216791613659076,
+    "learned_pairwise_rank": 0.17124932776194798
+  },
+  "beats_or_ties_heuristic_rate": {
+    "learned_greedy": 0.5555555555555556,
+    "learned_thompson": 0.6388888888888888,
+    "learned_risk_averse": 0.5,
+    "learned_pairwise_rank": 0.7777777777777778
+  }
+}

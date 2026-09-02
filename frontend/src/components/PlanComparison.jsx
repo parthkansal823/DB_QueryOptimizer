@@ -21,10 +21,10 @@ function PlanPanel({ title, plan, badge, badgeClass, emptyNote }) {
         <dt>Join types</dt>
         <dd>{plan.join_types?.length ? plan.join_types.join(", ") : "-"}</dd>
         {plan.hint && (
-          <>
+          <div className="fact">
             <dt>Hint</dt>
             <dd>{plan.hint}</dd>
-          </>
+          </div>
         )}
       </dl>
     </div>
@@ -71,10 +71,10 @@ function DecisionNote({ decision }) {
       )}
       <dl className="decision-facts">
         {decision.policy && (
-          <>
+          <div className="fact">
             <dt>Policy</dt>
             <dd>{decision.policy}</dd>
-          </>
+          </div>
         )}
         {/* Which bound authorised (or refused) the deviation. "mean + z x sigma"
             assumes the ensemble's spread is a calibrated standard deviation;
@@ -83,38 +83,38 @@ function DecisionNote({ decision }) {
             same prediction, so which one ran is part of explaining the
             decision rather than a detail. */}
         {decision.gate && (
-          <>
+          <div className="fact">
             <dt>Gate</dt>
             <dd>
               {decision.gate === "conformal"
                 ? "conformal (measured bound)"
                 : "fixed z (mean + z x sigma)"}
             </dd>
-          </>
+          </div>
         )}
         {speedup != null && (
-          <>
+          <div className="fact">
             <dt>Predicted speed vs PostgreSQL</dt>
             <dd>
               {speedup.toFixed(2)}&times;
               {pessimistic != null && ` (pessimistically ${pessimistic.toFixed(2)}×)`}
             </dd>
-          </>
+          </div>
         )}
         {required != null && (
-          <>
+          <div className="fact">
             <dt>Needed to switch</dt>
             <dd>&lt; {required.toFixed(2)}&times;</dd>
-          </>
+          </div>
         )}
         {speedup == null && score != null && (
-          <>
+          <div className="fact">
             <dt>Model score</dt>
             <dd>
               {score.toFixed(2)}
               {uncertainty != null && ` ± ${uncertainty.toFixed(2)}`}
             </dd>
-          </>
+          </div>
         )}
       </dl>
       {speedup != null && pessimistic != null && pessimistic > speedup * 1.25 && (

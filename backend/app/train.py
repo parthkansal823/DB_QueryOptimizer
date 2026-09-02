@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import os
+import re
 import pickle
 import random
 
@@ -31,6 +32,7 @@ from app.db import get_cursor
 from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
 from app.optimizer.cardinality import JoinCardinalityCorrector
+from app.optimizer import calibration
 from app.optimizer.conformal import ConformalGate, sigma_scale
 from app.optimizer.features import build_feature_columns, featurize, to_vector
 from app.optimizer.ranker import PairwisePlanRanker
@@ -48,6 +50,75 @@ FETCH_SQL = """
       AND query_id IS NOT NULL
       AND query_id NOT LIKE %s
 """
+
+# Train on the action space that will actually be served.
+#
+# `docs/WRITEUP.md` 2.9 documents the train/serve difference and calls it
+# harmless: `app.collect_data` gathers the forced join-method family
+# (`HashJoin`/`NestLoop`/`MergeJoin` per join-order prefix) while
+# `INCLUDE_JOIN_METHODS` is off at serving, so the model is never *asked* to
+# score a family it has not seen. That is true, and it is only about coverage.
+#
+# It is not harmless for the predicted **level**, which is the number the safety
+# gate reads. Measured over 12,826 collected candidates:
+#
+#     join-method candidates    n=980     mean ratio 5.49   median 3.16
+#     everything else           n=11846   mean ratio 1.97   median 1.10
+#
+# A squared-loss model shrinks its predictions toward the mean of what it was
+# trained on. Including that family moves the training mean from 1.97 to 2.24 --
+# a factor of 1.137 -- and every served prediction is lifted with it. The
+# measured systematic bias at serving was **x1.152**, which that accounts for
+# almost exactly.
+#
+# The consequence was that the gate could not fire. Across 321 served
+# candidates the model's most optimistic prediction anywhere was 0.817x while
+# the gate deviates below 0.80x, and 64 of those candidates were genuinely
+# faster than 0.8x. Not a confidence problem, and not a bad ranker: the same
+# model captures 79% of the oracle headroom, because ranking is unaffected by a
+# shift that applies to everything.
+#
+# So the rows for a family that will not be served are dropped, and which
+# families those are is read from `optimizer/planner.py` -- the same flags the
+# serving path uses -- rather than hardcoded here, so the two cannot drift.
+# Anchored at a word boundary, because a plain substring test matches the
+# *negative* forms too: "NestLoop(" is inside "NoNestLoop(". Those are a
+# different family, they are served when `INCLUDE_NEGATIVE_JOINS` is on, and
+# dropping their rows would be the opposite mistake -- training a model on
+# fewer families than it will be asked about rather than more.
+_JOIN_METHOD_RE = re.compile(r"\b(?:HashJoin|NestLoop|MergeJoin)\s*\(")
+
+
+def _is_join_method_hint(hint: str | None) -> bool:
+    return bool(hint) and _JOIN_METHOD_RE.search(hint) is not None
+
+
+def rows_for_served_action_space(rows: list[dict]) -> tuple[list[dict], dict]:
+    """
+    Drop candidates from families the serving path does not offer.
+
+    Returns the kept rows and a report, because silently training on a subset
+    is the same class of mistake as silently serving one -- and a run that drops
+    a thousand rows should say so.
+    """
+    from app.optimizer import planner
+
+    if planner.INCLUDE_JOIN_METHODS:
+        return rows, {"filtered": False, "reason": "join methods are served"}
+
+    kept = [r for r in rows if not _is_join_method_hint(r.get("hint"))]
+    dropped = len(rows) - len(kept)
+    return kept, {
+        "filtered": True,
+        "dropped_rows": dropped,
+        "kept_rows": len(kept),
+        "reason": (
+            "INCLUDE_JOIN_METHODS is off, so forced join-method candidates are "
+            "never served. Training on them shifts every prediction upward "
+            "toward their much slower mean, which is what stopped the safety "
+            "gate from ever firing."
+        ),
+    }
 # `adhoc:` rows are dashboard traffic (Phase 5's /query/analyze), which now
 # carries a fingerprint id so it can be grouped for per-query statistics --
 # see `logging_store.query_fingerprint`. They stay out of training regardless:
@@ -350,6 +421,7 @@ def train(
     eval_path: str = EVAL_PATH,
     n_models: int = 8,
     aggregate_reps: bool = True,
+    latest_run_only: bool = False,
     conformal_alpha: float = DEFAULT_CONFORMAL_ALPHA,
 ) -> dict:
     rows = _load_rows()
@@ -357,8 +429,33 @@ def train(
         raise RuntimeError("plan_execution_log is empty -- run `python -m app.collect_data` first.")
 
     n_raw_rows = len(rows)
+
+    # Before aggregation, so a family that is not served contributes nothing at
+    # all -- not even to a median.
+    rows, action_space_report = rows_for_served_action_space(rows)
+    if action_space_report.get("filtered"):
+        print(
+            f"action space: dropped {action_space_report['dropped_rows']} rows for "
+            f"families the serving path does not offer, kept "
+            f"{action_space_report['kept_rows']}"
+        )
+
     if aggregate_reps:
-        rows = _aggregate_repetitions(rows)
+        # `latest_run_only` matters when the *database* changed between
+        # collections, not just the workload. Training normally wants every
+        # measurement it can get -- more repetitions make a better median. That
+        # holds only while the thing being measured is the same thing.
+        #
+        # Measured here: two collections a few hours apart, with indexes created
+        # and dropped, a VACUUM, a prewarm and two extensions installed in
+        # between. Folding them together gives each (query, hint) a median
+        # across two different databases, and the resulting model captured
+        # **6.8%** of the oracle headroom against **77.9%** for one trained on a
+        # single run. `_aggregate_repetitions` already warned about exactly this
+        # ("the same native query in this log ranges from 2.4 ms to 13.7 ms
+        # across runs collected months and workloads apart"); the option was
+        # only ever wired up for calibration.
+        rows = _aggregate_repetitions(rows, latest_run_only=latest_run_only)
 
     table_cardinalities = _discover_cardinalities()
     feature_columns = build_feature_columns(list(table_cardinalities))
@@ -387,6 +484,8 @@ def train(
     # `optimizer/conformal.py` for why that matters here specifically.
     conformal = None
     uncertainty_scale = 1.0
+    point_calibration = calibration.PointCalibration()
+    calibration_report = None
     try:
         oob_means, oob_stds = ensemble.oob_mean_std(X_train)
         usable = [
@@ -398,14 +497,54 @@ def train(
             oob_m = [row[0] for row in usable]
             oob_s = [row[1] for row in usable]
             oob_y = [row[2] for row in usable]
+
+            # Correct the predicted *level* before anything is fitted on top of
+            # it. Measured across 321 candidates on the workload, the raw model
+            # predicted every one of them at 0.826x native or worse, while 54
+            # were genuinely under 0.8x -- so the gate, which deviates below
+            # 0.80x, could not fire on any query at any confidence setting.
+            # That was "why is it never confident", and it was never about
+            # confidence. See `optimizer/calibration.py`.
+            #
+            # The map is affine and increasing, so it cannot reorder candidates
+            # and cannot change which plan the argmin picks -- only where those
+            # predictions sit relative to a threshold.
+            point_calibration = calibration.fit(oob_m, oob_y)
+            calibration_report = calibration.report(point_calibration, oob_m, oob_y)
+            if point_calibration.fitted:
+                before = calibration_report["before"]
+                after = calibration_report["after"]
+                print(
+                    f"point calibration: slope={point_calibration.slope:.3f} "
+                    f"intercept={point_calibration.intercept:+.3f} "
+                    f"on {point_calibration.n} out-of-bag rows"
+                )
+                print(
+                    f"  systematic error x{before['systematic_factor']:.3f} "
+                    f"-> x{after['systematic_factor']:.3f}; "
+                    f"most optimistic prediction "
+                    f"{before['min_predicted_ratio']:.3f}x "
+                    f"-> {after['min_predicted_ratio']:.3f}x native"
+                )
+            else:
+                print("point calibration: not fitted (too few rows, or an unusable slope)")
+
+            # The conformal bound is fitted on the calibrated means, so the
+            # interval brackets the number the gate will actually see. Fitting
+            # it on raw means and then shifting the point underneath it would
+            # silently invalidate its coverage guarantee.
+            oob_calibrated = point_calibration.apply(oob_m)
+
             # Absolute rather than sigma-normalised: on this model the spread
             # is four times smaller than the error and near-zero on some rows,
             # which made the normalised bound explode. See conformal.py.
-            conformal = ConformalGate(alpha=conformal_alpha).fit(oob_m, oob_s, oob_y)
+            conformal = ConformalGate(alpha=conformal_alpha).fit(
+                oob_calibrated, oob_s, oob_y
+            )
             # Separate from the conformal bound and used by the default gate:
             # puts `confidence_z` back into real standard deviations, so the
             # knob `app.calibrate` sweeps actually moves decisions.
-            uncertainty_scale = sigma_scale(oob_m, oob_s, oob_y)
+            uncertainty_scale = sigma_scale(oob_calibrated, oob_s, oob_y)
     except (RuntimeError, ValueError) as exc:  # too few rows, or every row in-bag
         print(f"[warn] conformal gate not calibrated: {exc}")
 
@@ -477,6 +616,14 @@ def train(
             "trained" if join_corrector is not None else "not trained"
         ),
         "conformal_gate": conformal_report or "not calibrated",
+        # Which candidate families this model was trained on, against
+        # which ones the serving path will offer it. See
+        # `rows_for_served_action_space`.
+        "action_space": action_space_report,
+        # What correcting the predicted level changed. The headline number is
+        # `after.min_predicted_ratio`: below the gate's threshold the gate can
+        # fire, above it the gate is decorative whatever `confidence_z` says.
+        "point_calibration": calibration_report or "not calibrated",
         # >1 means the ensemble's spread understates its real error by this
         # factor; `learned.py` multiplies sigma by it so `confidence_z` is
         # denominated in standard deviations rather than in whatever the
@@ -484,6 +631,7 @@ def train(
         "uncertainty_scale": uncertainty_scale,
         "n_rows_raw": n_raw_rows,
         "reps_aggregated_to_median": aggregate_reps,
+        "latest_run_only": latest_run_only,
         "n_rows_total": len(rows),
         "n_rows_train": len(X_train),
         "n_rows_test": len(X_test),
@@ -506,6 +654,10 @@ def train(
                 "ranker": ranker,
                 "join_corrector": join_corrector,
                 "conformal": conformal,
+                # Applied to every prediction before the gate reads it -- see
+                # `optimizer/calibration.py`. Absent in an older bundle, where
+                # `learned.py` falls back to the identity.
+                "point_calibration": point_calibration,
                 "uncertainty_scale": uncertainty_scale,
                 "target": "log_ratio_vs_native",
                 # Which queries the model never saw. `app.calibrate` needs this
@@ -529,10 +681,22 @@ if __name__ == "__main__":
     parser.add_argument("--model-out", default=MODEL_PATH, help="where to pickle the trained model bundle")
     parser.add_argument("--eval-out", default=EVAL_PATH, help="where to write the evaluation JSON")
     parser.add_argument(
+        "--latest-run-only",
+        action="store_true",
+        help="train on each query's most recent collection only -- for when the "
+             "database changed between collections, since a median across two "
+             "different databases is a label for neither",
+    )
+    parser.add_argument(
         "--n-models", type=int, default=8, help="bootstrapped ensemble size (drives uncertainty estimates)"
     )
     args = parser.parse_args()
 
-    results = train(model_path=args.model_out, eval_path=args.eval_out, n_models=args.n_models)
+    results = train(
+        model_path=args.model_out,
+        eval_path=args.eval_out,
+        n_models=args.n_models,
+        latest_run_only=args.latest_run_only,
+    )
     print(json.dumps(results, indent=2))
     print(f"\nModel written to {args.model_out}")

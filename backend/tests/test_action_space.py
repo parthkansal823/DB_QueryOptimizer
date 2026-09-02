@@ -162,19 +162,42 @@ def test_the_budget_can_be_turned_off():
     assert planner.budget_for(1.0) == planner.UNBUDGETED_CANDIDATES
 
 
-def test_truncation_keeps_join_orders_and_drops_resource_settings_first():
+def test_truncation_keeps_the_families_that_actually_win():
     """
-    The bias is deliberate, not incidental. Resource settings are exactly the
-    candidates that cannot help a small query -- more `work_mem` or four
-    parallel workers does nothing for a join over a few thousand rows, while
-    reordering it might.
+    The budget truncates from the end, so generation order decides what a query
+    never gets to try. That order is now set by measurement.
+
+    It used to run join orders, then operator toggles, then resources, on the
+    argument that "resource settings are exactly the candidates that cannot help
+    a small query" -- more `work_mem` does nothing for a join over a few
+    thousand rows, while reordering it might. Plausible, and measured over 2,364
+    collected candidates on this database, wrong:
+
+        resource / cost model   n=542    mean ratio 0.99   median 0.93
+        join order              n=486    mean ratio 1.27   median 1.12
+        operator toggle        n=1328    mean ratio 2.91   median 1.58
+
+    The resource family is the only one whose median is *below* native, and it
+    was the one being discarded -- on every query in the workload, and on seven
+    of eight it was the only thing discarded.
     """
     planner.INCLUDE_TUNING = True
     budget = planner.budget_for(50.0)
     kept = _hints()[:budget]
 
-    assert any("Leading(" in h for h in kept)
-    assert not any("work_mem" in h for h in kept)
+    assert any("Leading(" in h for h in kept), "join orders are still generated first"
+    assert any("work_mem" in h for h in kept), (
+        "the resource family has the best measured outcomes and must survive "
+        "a small budget"
+    )
+
+
+def test_operator_toggles_are_what_a_tight_budget_gives_up():
+    """The family with the worst measured mean is the one truncated first."""
+    planner.INCLUDE_TUNING = True
+    kept = _hints()[: planner.budget_for(50.0)]
+
+    assert not any("enable_" in h for h in kept)
 
 
 def test_a_budgeted_action_space_is_a_subset_of_the_collected_one():

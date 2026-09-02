@@ -1,64 +1,214 @@
+/*
+ * Design tokens.
+ *
+ * The old dashboard had one problem underneath all the others: everything was a
+ * card, every card had the same weight, and so nothing had any. A panel saying
+ * "Nothing to compare yet" occupied the same bordered rectangle, with the same
+ * padding and the same heading size, as the panel showing a 36x speedup. The
+ * page could not tell you what to look at because it did not know.
+ *
+ * The fix is a scale for each dimension that carries meaning, and then using
+ * them consistently:
+ *
+ *   type      four sizes, not one. A number that is the answer is set large;
+ *             the sentence qualifying it is set small. Both were 14px before.
+ *   space     a 4px grid. Density is a signal -- a dense block reads as data,
+ *             an airy one as structure -- and it only works if it is deliberate.
+ *   surface   three levels (page, panel, inset) instead of one border colour
+ *             doing all the work.
+ *   accent    exactly one, used for the primary action and for a measured win.
+ *             Everything else is ink on paper. Colour that appears everywhere
+ *             tells you nothing.
+ *
+ * Both themes are defined here in full. Nothing may define a colour only inside
+ * a media query -- that is how a page ends up unreadable in the theme its author
+ * was not using.
+ */
+
 :root {
   color-scheme: light;
-  --surface-1: #fcfcfb;
-  --surface-2: #f9f9f7;
-  --text-primary: #0b0b0b;
-  --text-secondary: #52514e;
-  --text-muted: #898781;
-  --gridline: #e1e0d9;
-  --baseline-axis: #c3c2b7;
-  --border: rgba(11, 11, 11, 0.1);
 
-  --series-native: #2a78d6; /* categorical slot 1 - blue */
-  --series-chosen: #eb6834; /* categorical slot 2 - orange */
-  --series-oracle: #1baf7a; /* categorical slot 3 - aqua; sub-3:1 on light, so
-                               only used where labels or the table give relief */
-  --series-candidate: #b7d3f6; /* sequential step 150 - muted, non-winning candidates */
-  --series-neutral: #898781; /* muted ink - "nothing happened" segments */
-  --status-good: #0ca30c;
-  --status-warning: #fab219;
-  --status-critical: #d03b3b;
+  /* -- surfaces: page, raised panel, recessed inset ---------------------- */
+  --surface-page: #fbfbfa;
+  --surface-panel: #ffffff;
+  --surface-inset: #f4f4f2;
+  --surface-hover: #eeeeeb;
+
+  /* -- ink: four weights, so hierarchy does not need bold everywhere ----- */
+  --ink-strong: #16161a;
+  --ink: #3d3d44;
+  --ink-muted: #6e6e78;
+  --ink-faint: #9a9aa3;
+
+  /* -- lines: hairline for structure, stronger for emphasis -------------- */
+  --line: #e6e6e2;
+  --line-strong: #d2d2cc;
+
+  /* -- the one accent ---------------------------------------------------- */
+  --accent: #1f6feb;
+  --accent-hover: #1a5fd0;
+  --accent-ink: #ffffff;
+  --accent-wash: #eef4fe;
+
+  /* -- status: only where a value genuinely carries a verdict ------------ */
+  --good: #17803d;
+  --good-wash: #ecf7f0;
+  --warn: #9a6700;
+  --warn-wash: #fdf6e6;
+  --bad: #b4232a;
+  --bad-wash: #fdeeee;
+
+  /* -- chart series ------------------------------------------------------ */
+  --series-native: #2a78d6;
+  --series-chosen: #eb6834;
+  --series-oracle: #1baf7a;
+  --series-candidate: #c9d7ea;
+  --series-neutral: #9a9aa3;
+  --gridline: #ececea;
+  --baseline-axis: #c3c2b7;
+
+  /* Kept: several components still reference these names. */
+  --surface-1: var(--surface-panel);
+  --surface-2: var(--surface-page);
+  --text-primary: var(--ink-strong);
+  --text-secondary: var(--ink);
+  --text-muted: var(--ink-muted);
+  --border: var(--line);
+  --status-good: var(--good);
+  --status-warning: var(--warn);
+  --status-critical: var(--bad);
+
+  /* -- type scale -------------------------------------------------------- */
+  --text-xs: 0.75rem;    /* 12px - captions, table headers, badges */
+  --text-sm: 0.8125rem;  /* 13px - secondary prose, notes */
+  --text-base: 0.875rem; /* 14px - body */
+  --text-md: 1rem;       /* 16px - panel headings */
+  --text-lg: 1.375rem;   /* 22px - section headings */
+  --text-xl: 2rem;       /* 32px - the number that is the answer */
+
+  --leading-tight: 1.25;
+  --leading: 1.55;
+
+  /* -- 4px spacing grid -------------------------------------------------- */
+  --s1: 0.25rem;
+  --s2: 0.5rem;
+  --s3: 0.75rem;
+  --s4: 1rem;
+  --s5: 1.5rem;
+  --s6: 2rem;
+  --s7: 3rem;
+  --s8: 4rem;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", Menlo, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --surface-1: #1a1a19;
-    --surface-2: #0d0d0d;
-    --text-primary: #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted: #898781;
-    --gridline: #2c2c2a;
-    --baseline-axis: #383835;
-    --border: rgba(255, 255, 255, 0.1);
 
-    --series-native: #3987e5;
-    --series-chosen: #d95926;
-    --series-oracle: #199e70;
-    --series-candidate: #2c2c2a;
-    --series-neutral: #898781;
-    --status-good: #0ca30c;
-    --status-warning: #fab219;
-    --status-critical: #d03b3b;
+    --surface-page: #0c0c0e;
+    --surface-panel: #141417;
+    --surface-inset: #1b1b1f;
+    --surface-hover: #232329;
+
+    --ink-strong: #f2f2f4;
+    --ink: #c4c4cc;
+    --ink-muted: #8b8b95;
+    --ink-faint: #62626c;
+
+    --line: #26262b;
+    --line-strong: #35353c;
+
+    --accent: #4c8ef7;
+    --accent-hover: #6ba2f9;
+    --accent-ink: #0c0c0e;
+    --accent-wash: #16233a;
+
+    --good: #4ec97e;
+    --good-wash: #12271a;
+    --warn: #e0b341;
+    --warn-wash: #2a2211;
+    --bad: #f0666d;
+    --bad-wash: #2c1416;
+
+    --series-native: #4c8ef7;
+    --series-chosen: #f0813f;
+    --series-oracle: #2fc78c;
+    --series-candidate: #2a3a52;
+    --series-neutral: #8b8b95;
+    --gridline: #232329;
+    --baseline-axis: #383835;
   }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-page: #0c0c0e;
+  --surface-panel: #141417;
+  --surface-inset: #1b1b1f;
+  --surface-hover: #232329;
+
+  --ink-strong: #f2f2f4;
+  --ink: #c4c4cc;
+  --ink-muted: #8b8b95;
+  --ink-faint: #62626c;
+
+  --line: #26262b;
+  --line-strong: #35353c;
+
+  --accent: #4c8ef7;
+  --accent-hover: #6ba2f9;
+  --accent-ink: #0c0c0e;
+  --accent-wash: #16233a;
+
+  --good: #4ec97e;
+  --good-wash: #12271a;
+  --warn: #e0b341;
+  --warn-wash: #2a2211;
+  --bad: #f0666d;
+  --bad-wash: #2c1416;
+
+  --series-native: #4c8ef7;
+  --series-chosen: #f0813f;
+  --series-oracle: #2fc78c;
+  --series-candidate: #2a3a52;
+  --series-neutral: #8b8b95;
+  --gridline: #232329;
+  --baseline-axis: #383835;
 }
 
 * {
   box-sizing: border-box;
 }
 
-body {
-  margin: 0;
-  background: var(--surface-2);
-  color: var(--text-primary);
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+html {
+  -webkit-text-size-adjust: 100%;
 }
 
-/* Wider than it was. The analytics panels now sit two to a row on a desktop
-   screen, and 1080px left them squeezed while the rest of the window sat
-   empty. */
+body {
+  margin: 0;
+  background: var(--surface-page);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: var(--text-base);
+  line-height: var(--leading);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 #root {
-  max-width: 1240px;
+  max-width: 1120px;
   margin: 0 auto;
-  padding: 24px 24px 64px;
+  padding: 0 var(--s5) var(--s8);
+}
+
+@media (max-width: 640px) {
+  #root {
+    padding: 0 var(--s4) var(--s7);
+  }
 }
