@@ -42,6 +42,8 @@ export default function DatabaseAdvisor({ findings, onRefresh, busy, deep, onDee
   const config = findings.server_config ?? {};
   const idx = findings.indexes ?? {};
   const tbl = findings.tables ?? {};
+  const maint = findings.maintenance ?? {};
+  const work = findings.workload ?? {};
   const nothing = (findings.n_findings ?? 0) === 0;
 
   return (
@@ -159,6 +161,112 @@ export default function DatabaseAdvisor({ findings, onRefresh, busy, deep, onDee
             </div>
           ))}
         </Section>
+      )}
+
+      {/* Maintenance state the two counters above cannot see. The visibility
+          map is the interesting one: it decides whether an index-only scan can
+          skip the heap at all, so a stale one is the reason an IndexOnlyScan
+          candidate lost. */}
+      {(maint.never_analyzed?.length ||
+        maint.wraparound_risk?.length ||
+        maint.index_only_scan_readiness?.length ||
+        maint.hot_update_pressure?.length) > 0 && (
+        <Section
+          title="Maintenance"
+          blurb="Vacuum and analyze decide what the planner is allowed to choose, not just how much disk is wasted."
+        >
+          {(maint.never_analyzed ?? []).map((t) => (
+            <div key={`never-${t.table}`} className="finding finding-high">
+              <strong>{t.table}</strong> — {t.kind}, never analyzed
+              <div>{t.note}</div>
+              <Fix statement={`${t.fix};`} />
+            </div>
+          ))}
+          {(maint.wraparound_risk ?? []).map((t) => (
+            <div
+              key={`xid-${t.table}`}
+              className={`finding finding-${t.severity === "high" ? "high" : "medium"}`}
+            >
+              <strong>{t.table}</strong> — {(t.fraction_of_limit * 100).toFixed(0)}% of the way to a
+              forced anti-wraparound vacuum
+              <div>{t.note}</div>
+              <Fix statement={`${t.fix};`} />
+            </div>
+          ))}
+          {(maint.hot_update_pressure ?? []).map((t) => (
+            <div key={`hot-${t.table}`} className="finding finding-medium">
+              <strong>{t.table}</strong> — only {(t.hot_fraction * 100).toFixed(0)}% of updates were
+              heap-only
+              <div>{t.note}</div>
+            </div>
+          ))}
+          {(maint.index_only_scan_readiness ?? []).map((t) => (
+            <div key={`vm-${t.table}`} className="finding finding-low">
+              <strong>{t.table}</strong> — {(t.visible_fraction * 100).toFixed(0)}% of pages marked
+              all-visible
+              <div>{t.note}</div>
+              <Fix statement={`${t.fix};`} />
+            </div>
+          ))}
+        </Section>
+      )}
+
+      {/* Whole-workload readings from pg_stat_statements. Every one of these
+          carries a caveat the panel has to repeat: hints are comments, so
+          pg_stat_statements folds every candidate for a query into one row. */}
+      {(work.planning_heavy?.length ||
+        work.spilling?.length ||
+        work.cold?.length ||
+        work.jit_dominated?.length ||
+        work.noisy?.length) > 0 && (
+        <Section
+          title="Across the whole workload"
+          blurb="Read from pg_stat_statements, so this covers every query the server has run — not only the one in the box above. Hints are comments, which means each row folds together every plan variant of its query."
+        >
+          {(work.planning_heavy ?? []).map((q, i) => (
+            <div key={`plan-${i}`} className="finding finding-high">
+              <strong>{(q.planning_fraction * 100).toFixed(0)}% of its time planning</strong> over{" "}
+              {q.calls} calls
+              <pre className="sql-block">{q.query}</pre>
+              <div>{q.note}</div>
+            </div>
+          ))}
+          {(work.spilling ?? []).map((q, i) => (
+            <div key={`spill-${i}`} className="finding finding-medium">
+              <strong>{q.temp_blocks_written.toLocaleString()} temp blocks written</strong>
+              {q.from_optimizer_sweep && " (this optimizer's own candidate sweep)"}
+              <pre className="sql-block">{q.query}</pre>
+              <div>{q.note}</div>
+            </div>
+          ))}
+          {(work.cold ?? []).map((q, i) => (
+            <div key={`cold-${i}`} className="finding finding-medium">
+              <strong>{(q.cache_hit_ratio * 100).toFixed(0)}% cache hit ratio</strong> —{" "}
+              {q.blocks_read.toLocaleString()} pages read from storage
+              <pre className="sql-block">{q.query}</pre>
+              <div>{q.note}</div>
+            </div>
+          ))}
+          {(work.jit_dominated ?? []).map((q, i) => (
+            <div key={`jit-${i}`} className="finding finding-medium">
+              <strong>{(q.jit_fraction * 100).toFixed(0)}% of execution spent JIT compiling</strong>
+              <pre className="sql-block">{q.query}</pre>
+              <div>{q.note}</div>
+            </div>
+          ))}
+          {(work.noisy ?? []).map((q, i) => (
+            <div key={`noisy-${i}`} className="finding finding-low">
+              <strong>varies by {(q.relative_stddev * 100).toFixed(0)}% of its own mean</strong> over{" "}
+              {q.calls} calls
+              <pre className="sql-block">{q.query}</pre>
+              <div>{q.note}</div>
+            </div>
+          ))}
+        </Section>
+      )}
+
+      {work.note && (
+        <p className="decision-caution">{work.note}</p>
       )}
     </div>
   );

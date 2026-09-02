@@ -33,6 +33,72 @@ def _split_hint(query: str) -> tuple[str, str]:
     return match.group(1), query[match.end():]
 
 
+# Work the executor actually did, in 8kB blocks.
+#
+# `EXPLAIN (ANALYZE, BUFFERS)` has been requested by `get_plan` all along and
+# the numbers were thrown away. They are worth keeping because they answer a
+# question wall-clock time cannot.
+#
+# This project's central difficulty is that its objective is noisy. The same
+# query timed twice on this database differs by around 13%; a measured "80.5%
+# improvement" turned out to be 26.0% once cold-cache bias was removed; and the
+# whole confidence apparatus in `optimizer/conformal.py` exists to put a bound
+# on a target that moves. Runtime mixes two different things -- how good the
+# plan is, and what happened to be in memory when it ran.
+#
+# `Shared Read Blocks` does not mix them. It is the number of 8kB pages the
+# query had to fetch because they were not already in shared buffers, which is
+# a property of the plan and the data rather than of the moment. Two runs of the
+# same plan agree on it; two different plans disagree on it for a reason.
+#
+# Not a replacement for timing -- a plan can read fewer pages and still be
+# slower, and CPU-bound work does not show up here at all. It is the second
+# opinion for the case `experiment_job.py` currently has to call *unresolved*:
+# two candidates whose runtimes are inside the noise band, where the one doing
+# measurably less I/O is the better bet.
+#
+# `Temp` blocks are the other half. A hash join that spills or a sort that goes
+# to an external merge writes temp blocks, which is the cliff `work_mem` falls
+# off -- and unlike the runtime it is unambiguous about *why* the query was slow.
+_BUFFER_KEYS = {
+    "shared_hit_blocks": "Shared Hit Blocks",
+    "shared_read_blocks": "Shared Read Blocks",
+    "shared_dirtied_blocks": "Shared Dirtied Blocks",
+    "shared_written_blocks": "Shared Written Blocks",
+    "temp_read_blocks": "Temp Read Blocks",
+    "temp_written_blocks": "Temp Written Blocks",
+}
+
+
+def _extract_buffers(plan: dict) -> dict:
+    """
+    Buffer counters from the root node, which are already cumulative.
+
+    "The buffer numbers displayed show the count of the non-distinct buffers
+    hit, read, dirtied, and written for the given node **and all of its child
+    nodes**" -- so the root carries the whole query's totals and no walk is
+    needed.
+
+    Every key is absent rather than zero when BUFFERS was not collected (a plain
+    EXPLAIN, or an older server). Zero is a real measurement -- "this query read
+    nothing from disk" -- and must not be confused with "nobody looked".
+    """
+    if "Shared Hit Blocks" not in plan:
+        return {}
+    buffers = {name: int(plan.get(key) or 0) for name, key in _BUFFER_KEYS.items()}
+    total = buffers["shared_hit_blocks"] + buffers["shared_read_blocks"]
+    # The share of pages already in memory. This is the number that says whether
+    # a timing comparison was fair: two plans measured at different cache hit
+    # ratios were not measured under the same conditions.
+    buffers["cache_hit_ratio"] = (
+        buffers["shared_hit_blocks"] / total if total else None
+    )
+    buffers["spilled_to_disk"] = (
+        buffers["temp_read_blocks"] + buffers["temp_written_blocks"]
+    ) > 0
+    return buffers
+
+
 def get_plan(cursor, query: str, analyze: bool = True) -> dict:
     """Run EXPLAIN on `query` and return a structured summary of the plan."""
     options = "FORMAT JSON"
@@ -58,6 +124,7 @@ def get_plan(cursor, query: str, analyze: bool = True) -> dict:
         "tables_scanned": _extract_tables(plan),
         "scan_relations": _extract_scan_relations(plan),
         "join_graph": extract_join_graph(plan),
+        **_extract_buffers(plan),
     }
 
 
@@ -149,3 +216,59 @@ def _extract_scan_relations(plan: dict) -> dict[str, str]:
     for child in plan.get("Plans", []):
         relations.update(_extract_scan_relations(child))
     return relations
+
+
+def parallel_shortfall(plan: dict) -> dict | None:
+    """
+    Did a plan built for N workers actually get N workers?
+
+    Manual §15.2: the planner requests workers, and the request can be refused
+    when `max_worker_processes` or `max_parallel_workers` is exhausted. When it
+    is, "the leader will execute the portion of the plan below the Gather node
+    entirely by itself, almost as if the Gather node were not present", and the
+    manual is explicit about the consequence: *"The optimal plan may depend on
+    the number of workers that are available, so this can result in poor query
+    performance."*
+
+    That matters here more than in most systems, because this project actively
+    forces parallel plans -- `Set(max_parallel_workers_per_gather 4)` in
+    `hints.TUNING_SETTINGS`, and `Parallel(t 4 hard)` in the per-table family,
+    which overrides Postgres's own size heuristic. If the workers are then not
+    granted, the candidate is measured under conditions the planner never
+    assumed, and a real regression gets attributed to the plan shape rather than
+    to a busy server. Two benchmark runs competing for the same worker pool is
+    enough to cause it.
+
+    Returns None when the plan is not parallel or got everything it asked for.
+    """
+    worst = None
+    stack = [plan.get("raw_plan", plan)]
+    while stack:
+        node = stack.pop()
+        planned = node.get("Workers Planned")
+        if planned:
+            # `Workers Launched` only appears under EXPLAIN ANALYZE -- a plain
+            # EXPLAIN has nothing to report, and absence there is not a
+            # shortfall.
+            launched = node.get("Workers Launched")
+            if launched is not None and launched < planned:
+                shortfall = {
+                    "node_type": node.get("Node Type"),
+                    "workers_planned": int(planned),
+                    "workers_launched": int(launched),
+                }
+                if worst is None or shortfall["workers_launched"] < worst["workers_launched"]:
+                    worst = shortfall
+        stack.extend(node.get("Plans", []))
+
+    if worst is None:
+        return None
+    worst["note"] = (
+        f"this plan was built assuming {worst['workers_planned']} parallel "
+        f"workers and got {worst['workers_launched']}. The leader ran the rest "
+        "alone, so the timing measures a plan executing under conditions the "
+        "planner did not assume -- it is not evidence about the plan. Raise "
+        "max_worker_processes / max_parallel_workers, or stop competing runs, "
+        "before trusting a parallel comparison."
+    )
+    return worst

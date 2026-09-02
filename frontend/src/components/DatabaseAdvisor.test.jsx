@@ -120,3 +120,153 @@ describe("database health", () => {
     expect(screen.getByText(/would need a full ANALYZE/)).toBeInTheDocument();
   });
 });
+
+// -- maintenance and workload sections --------------------------------------
+//
+// Neither existed until the PostgreSQL manual turned up the state they read.
+// The visibility map is the one that ties back to the optimizer: it decides
+// whether an index-only scan can skip the heap, so a stale one is the reason an
+// IndexOnlyScan candidate lost rather than a curiosity about vacuum.
+
+describe("maintenance findings", () => {
+  it("shows a partitioned parent autovacuum will never analyze", () => {
+    render(
+      <DatabaseAdvisor
+        findings={{
+          n_findings: 1,
+          maintenance: {
+            never_analyzed: [
+              {
+                table: "events",
+                kind: "partitioned table",
+                severity: "high",
+                fix: 'ANALYZE "events"',
+                note: "changes to child tables do not trigger autoanalyze on the parent",
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("events")).toBeInTheDocument();
+    expect(screen.getByText(/partitioned table, never analyzed/)).toBeInTheDocument();
+    expect(screen.getByText(/do not trigger autoanalyze/)).toBeInTheDocument();
+  });
+
+  it("reports how close a table is to a forced anti-wraparound vacuum", () => {
+    render(
+      <DatabaseAdvisor
+        findings={{
+          n_findings: 1,
+          maintenance: {
+            wraparound_risk: [
+              {
+                table: "orders",
+                severity: "high",
+                fraction_of_limit: 0.95,
+                fix: 'VACUUM (FREEZE, ANALYZE) "orders"',
+                note: "the oldest unfrozen row here is 190,000,000 transactions old",
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/95% of the way to a forced/)).toBeInTheDocument();
+  });
+
+  it("explains why an index-only scan would not pay yet", () => {
+    render(
+      <DatabaseAdvisor
+        findings={{
+          n_findings: 1,
+          maintenance: {
+            index_only_scan_readiness: [
+              {
+                table: "churn",
+                visible_fraction: 0.0,
+                fix: 'VACUUM (ANALYZE) "churn"',
+                note: "an index-only scan would still have to check the heap",
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/0% of pages marked/)).toBeInTheDocument();
+  });
+
+  it("says nothing when maintenance is healthy", () => {
+    render(<DatabaseAdvisor findings={{ n_findings: 0, maintenance: {} }} />);
+    expect(screen.queryByText("Maintenance")).not.toBeInTheDocument();
+  });
+});
+
+describe("workload findings", () => {
+  it("labels the optimizer's own candidate sweep", () => {
+    // On a dashboard-driven database the sweep *is* most of the workload.
+    // Hiding it would misrepresent the panel; leaving it unlabelled would make
+    // it read as user traffic.
+    render(
+      <DatabaseAdvisor
+        findings={{
+          n_findings: 1,
+          workload: {
+            spilling: [
+              {
+                query: "EXPLAIN (FORMAT JSON, ANALYZE) SELECT ...",
+                calls: 145,
+                temp_blocks_written: 118088,
+                from_optimizer_sweep: true,
+                note: "some plan for this query wrote 118,088 temporary blocks",
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/this optimizer's own candidate sweep/)).toBeInTheDocument();
+    expect(screen.getByText(/118,088 temp blocks written/)).toBeInTheDocument();
+  });
+
+  it("repeats the caveat that a row folds every plan variant together", () => {
+    render(
+      <DatabaseAdvisor
+        findings={{
+          n_findings: 1,
+          workload: {
+            noisy: [
+              {
+                query: "SELECT ...",
+                calls: 145,
+                relative_stddev: 1.05,
+                from_optimizer_sweep: false,
+                note: "most of that spread is the difference between plans",
+              },
+            ],
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/folds together every plan variant/)).toBeInTheDocument();
+  });
+
+  it("shows why the workload panel is empty when the extension is missing", () => {
+    // An empty panel and "not installed" are different answers.
+    render(
+      <DatabaseAdvisor
+        findings={{
+          n_findings: 0,
+          workload: { note: "pg_stat_statements is not installed." },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/pg_stat_statements is not installed/)).toBeInTheDocument();
+  });
+});

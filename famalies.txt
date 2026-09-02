@@ -13,37 +13,90 @@ Three names, all correct, used in different places:
 - **Query hints** or **plan hints** — an individual one. In PostgreSQL these
   are `pg_hint_plan` directives: a `/*+ ... */` comment before the statement.
 
-pg_hint_plan has its own taxonomy, and it is worth knowing because it defines
-what is *possible* rather than what this project happens to use:
+pg_hint_plan's own taxonomy, which defines what is *possible* rather than what
+this project happens to use:
 
 | pg_hint_plan category | what it controls | used here |
 |---|---|---|
-| Scan method hints | how one table is read | yes |
-| Join method hints | how two relations are joined | yes |
-| Join order hints | the shape of the join tree | yes |
+| Scan method hints | how one table is read | yes, all 10 |
+| Join method hints | how two relations are joined | yes, all 6 |
+| Join order hints | the shape of the join tree | yes, both forms |
 | Row number correction hints | the planner's cardinality estimate | yes |
-| Parallel query hints | per-table parallel workers | partly (via GUC) |
+| Parallel query hints | per-table worker count | yes |
 | GUC hints (`Set`) | any planner or executor setting | yes |
+| Disable-index hints | plan as if an index were dropped | **not on this server** |
 
 A hint is a comment. PostgreSQL without the extension ignores it entirely,
 which is why the "optimized" SQL this system hands you is safe to commit.
 
 ---
 
-## The seven families
+## Two rules that make the difference between a hint and a comment
 
-Counts are for a four-table query. They grow with table count.
+Both were learned the hard way here, and both fail **silently** — no error, no
+warning, and a plan identical to the one you would have got with no hint, which
+is indistinguishable from a hint that applied and changed nothing.
 
-| # | family | count | example |
-|---|---|---|---|
-| 1 | Join order (left-deep) | 8 | `/*+ Leading(c a d b) */` |
-| 2 | Join order (bushy) | 2 | `/*+ Leading(((a b) (c d))) */` |
-| 3 | Join method | 12 | `/*+ Leading(d b a c) HashJoin(d b) ... */` |
-| 4 | Scan method | 9 | `/*+ SeqScan(a) */` |
-| 5 | Operator toggles | 15 | `/*+ Set(enable_nestloop off) */` |
-| 6 | Resource and cost model | 7 | `/*+ Set(work_mem 65536) */` |
-| 7 | Cardinality correction | 1 | `/*+ Rows(a b *10) */` |
-| | **total** | **54** | |
+### Rule 1 — a hint names the query's alias, never the table
+
+`FROM order_items oi` makes the relation `oi`. Measured on this schema, same
+request, two spellings:
+
+```
+/*+ Parallel(oi 4 hard) */            cost 1774.2      ← bound
+/*+ Parallel(order_items 4 hard) */   cost 7870.2      ← ignored (= baseline)
+```
+
+A 4.4× improvement sat behind a naming mistake that produced no output of any
+kind. `optimizer/catalog.py` exists for exactly this: it reads index names from
+`pg_index` and rekeys them through the baseline plan's own alias mapping, so
+the catalog-driven families cannot get it wrong.
+
+### Rule 2 — the documentation is not the authority; the installed extension is
+
+`DisableIndex` is in the current pg_hint_plan documentation. This server runs
+1.6.3, which has never had it:
+
+```
+INFO:  pg_hint_plan: hint syntax error at or near "DisableIndex(u users_pkey)"
+DETAIL:  Unrecognized hint keyword "DisableIndex".
+```
+
+Severity **INFO** — discarded by the default `client_min_messages`. Every
+keyword in this file was checked against the running extension with
+`pg_hint_plan.debug_print = on`; 31 of 32 were accepted, and
+`test_integration_hints.py::test_every_generated_candidate_is_a_keyword_this_server_knows`
+now re-checks the whole action space on every run.
+
+---
+
+## The twelve families
+
+Server: PostgreSQL 16.15, pg_hint_plan 1.6.3. Counts are for a four-table query.
+"Measured" is the cost of a real candidate against a baseline of **7870.2** on
+`orders ⋈ users ⋈ order_items ⋈ products`.
+
+| # | family | flag | default | measured |
+|---|---|---|---|---|
+| 1 | Join order, left-deep | always on | on | 12841–14266 |
+| 2 | Join order, bushy | `INCLUDE_BUSHY` | off | 12233.5 |
+| 3 | Join method, forced | `INCLUDE_JOIN_METHODS` | off | 13625–4.5e8 |
+| 4 | Join method, negative | `INCLUDE_NEGATIVE_JOINS` | off | 8972.1 |
+| 5 | Scan method, per table | `INCLUDE_SCAN_METHODS` | off | 7930–11040 |
+| 6 | Scan method, negative | `INCLUDE_NEGATIVE_SCANS` | off | 7930.0 |
+| 7 | Index pinning | `INCLUDE_INDEX_PINNING` | off | 7930.0 |
+| 8 | Memoize | `INCLUDE_MEMOIZE` | off | inert here |
+| 9 | Per-table parallelism | `INCLUDE_PARALLEL` | off | **1774.2** |
+| 10 | Operator toggles (off) | `include_hint_sets` | on | 12233–14414 |
+| 11 | Settings turned on | `INCLUDE_ENABLE_SETTINGS` | off | inert here |
+| 12 | Resource / cost model | `INCLUDE_TUNING` | on | 7869.9–13625 |
+| — | Cardinality correction | `ENABLE_ROWS_CORRECTION` | on | null result |
+
+**Everything new defaults to off, deliberately.** Widening the action space
+without retraining has been measured to hurt here: it sent 17 of 25 queries into
+the safety veto, because the model was scoring plan shapes it had never been
+shown (`docs/WRITEUP.md` §2.9). Turn one on, re-run `python -m app.collect_data`,
+and settle it with `python -m app.experiment`.
 
 ---
 
@@ -56,17 +109,16 @@ Counts are for a four-table query. They grow with table count.
 Names the order tables enter the join. PostgreSQL builds it **left-deep**:
 `((orders ⋈ users) ⋈ products)`.
 
-This is the family the project started with, and the one the whole premise
-rests on: PostgreSQL picks a join order by minimising estimated cost, and when
-the estimate is wrong the order is wrong with it.
+The family the project started with, and the one the whole premise rests on:
+PostgreSQL picks a join order by minimising estimated cost, and when the
+estimate is wrong the order is wrong with it.
 
 Orders are drawn only from the query's own join graph, read off the baseline
-plan's join conditions. A `Leading()` that introduces a table sharing no
-predicate with those already placed forces a cartesian product, which
-PostgreSQL prices at `disable_cost` (~1e10) and never picks — so blind
-permutation sampling spends most of the budget on candidates that cannot be
-used. On a 6-table chain join there are 720 orderings and only 32 connected
-ones.
+plan's join conditions. A `Leading()` introducing a table that shares no
+predicate with those already placed forces a cartesian product, which PostgreSQL
+prices at `disable_cost` (~1e10) and never picks — so blind permutation sampling
+spends most of the budget on candidates that cannot be used. On a 6-table chain
+join there are 720 orderings and only 32 connected ones.
 
 ### 2. Join order — bushy
 
@@ -75,66 +127,190 @@ ones.
 ```
 
 The nested form specifies the join *tree*, not just an order. Two pairs are
-built independently and then joined — a shape no left-deep ordering can
-express.
+built independently and then joined — a shape no left-deep ordering can express.
 
 It matters when both halves filter down hard. A left-deep tree has to carry the
 first table's rows through every subsequent join; a bushy one builds two small
 intermediates and joins those.
 
-The project already knew this mattered before it could produce one:
-`plan_tree.py` computes `tree_bushiness` as a model feature and its own comment
-reads *"0.0 = perfectly left-deep (what Leading() produces)"*. The feature
-encoder was measuring a property the generator could not vary. Neo and Bao both
-search bushy plans.
+The project knew this mattered before it could produce one: `plan_tree.py`
+computes `tree_bushiness` as a model feature and its own comment reads *"0.0 =
+perfectly left-deep (what Leading() produces)"*. The encoder was measuring a
+property the generator could not vary. Neo and Bao both search bushy plans.
 
-Only balanced splits where both halves are internally connected *and* connected
+Only balanced splits where both halves are internally connected **and** connected
 to each other are produced — anything else is a cross product.
 
-### 3. Join method
+### 3. Join method — forced
 
 ```
 /*+ Leading(a b c) HashJoin(a b) HashJoin(a b c) */
 ```
-
-Forces the algorithm used to join a given set of relations:
 
 - **Hash join** — builds a hash table from one side. Fast for large unsorted
   inputs; spills to disk in batches if the build side does not fit `work_mem`.
 - **Nested loop** — scans the inner side once per outer row. Excellent when the
   outer side is tiny and the inner is indexed; catastrophic when the outer side
   turns out large, which is exactly what a bad cardinality estimate causes.
+  Measured here at cost **4.5e8** against a baseline of 7870 — a 57,000×
+  mispricing, and the single clearest illustration of why this family needs the
+  regression guard in front of it.
 - **Merge join** — needs both sides sorted. Cheap when they already are.
 
 `Leading()` builds a left-deep tree, so the join nodes are the growing prefixes
-`(a b)`, `(a b c)` — forcing one method across all of them approximates "use
-this method throughout".
+`(a b)`, `(a b c)`. Off by default at serving time: twelve extra planning round
+trips, and `optimizer_overhead_ms` is what the production path lives on.
 
-Off by default at serving time: it adds twelve planning round trips, and
-`optimizer_overhead_ms` is what the production path lives or dies by.
-
-### 4. Scan method — per table
+### 4. Join method — negative
 
 ```
-/*+ SeqScan(orders) */    /*+ IndexScan(orders) */    /*+ BitmapScan(orders) */
+/*+ NoNestLoop(orders users order_items) */
 ```
 
-How one table is read, leaving every other table alone.
+Family 3 has to pin a join order to attach its method hints to, so a candidate
+meant to answer *"would a hash join be better here"* also silently answers *"and
+in this order"* — a loss cannot be attributed to either.
 
-This is the surgical version of family 5. `Set(enable_seqscan off)` bans
-sequential scans for the **whole statement**, including on the small lookup
-table where one is obviously right. `IndexScan(orders)` says "stop scanning
-*this* table sequentially" and nothing else — which on a join between a large
-filtered table and a small one is usually what was wanted.
+The negative forms need no `Leading()` at all. `NoNestLoop(a b c)` bans nested
+loops among those relations however the planner chooses to order them, which
+isolates the operator question from the ordering question.
+
+It is also the form that matches the real failure mode: a nested loop chosen
+because the outer side was estimated at 3 rows and returned 30,000 is a
+disaster, and what is wanted is not a specific replacement but simply *not that*.
+
+Measured: `NoNestLoop(o oi p u)` → 8972.1. The other two are no-ops on this
+query, correctly — the baseline uses neither.
+
+### 5. Scan method — per table
+
+```
+/*+ SeqScan(orders) */   /*+ IndexScan(orders) */
+/*+ BitmapScan(orders) */  /*+ IndexOnlyScan(orders) */
+```
+
+The surgical version of family 10. `Set(enable_seqscan off)` bans sequential
+scans for the **whole statement**, including on the small lookup table where one
+is obviously right. `IndexScan(orders)` says "stop scanning *this* table
+sequentially" and nothing else.
 
 - **Seq scan** — read every page. Right for most of a table, or a small one.
-- **Index scan** — walk the index, fetch matching rows. Right for a few rows;
-  random I/O, so `random_page_cost` decides how the planner prices it.
+- **Index scan** — walk the index, fetch matching rows. Random I/O, so
+  `random_page_cost` decides how the planner prices it.
 - **Bitmap scan** — collect matching pages from the index, then read them in
-  physical order. The middle ground, and often the right one when the planner
-  is choosing badly between the other two.
+  physical order. Often the right answer when the planner is choosing badly
+  between the other two.
+- **Index-only scan** — answers from the index alone, never touching the heap.
+  The one scan type the others cannot substitute for. PostgreSQL only picks it
+  when it believes the visibility map is current, which is a judgement about
+  **vacuum state**, not about the query — so `VACUUM` can be the fix, and
+  `pg_visibility` says whether it would be.
 
-### 5. Operator toggles — statement-wide
+`TidScan` is generated but out of the default tuple: it only applies to queries
+with a `ctid` predicate, and there are none here.
+
+### 6. Scan method — negative
+
+```
+/*+ NoSeqScan(orders) */  /*+ NoIndexScan(orders) */  /*+ NoBitmapScan(orders) */
+```
+
+`IndexScan(orders)` asks for an index scan. If no index is usable that is not a
+request the planner can honour, so it prices the alternatives at `disable_cost`
+and returns a plan chosen under a constraint that was never satisfiable — a
+wasted candidate that still cost a planning round trip.
+
+`NoSeqScan(orders)` says only "not a sequential scan" and leaves the planner
+free to choose among index, index-only and bitmap. Strictly weaker, and usually
+what was actually wanted: *this particular* table is being scanned when it
+should not be.
+
+`NoIndexScan` already covers index-only scans, so `NoIndexOnlyScan` is only
+distinct when you want to forbid the index-only variant while still permitting a
+plain index scan — available, but out of the default tuple.
+
+### 7. Index pinning
+
+```
+/*+ IndexScan(o orders_pkey) */   /*+ IndexOnlyScan(o orders_pkey) */
+```
+
+Every family above chooses an access *method*. When a table carries several
+indexes the harder question is **which one**, and that is a separate decision the
+planner also makes from estimates: it prices each candidate index by the
+selectivity it expects and picks the cheapest. A correlated pair of columns — the
+failure this whole project is built around — makes a two-column index look far
+less selective than it is, so the planner reaches for a different index, or for a
+sequential scan.
+
+The only family that needs to know something about the schema rather than the
+query. `optimizer/catalog.py` reads `pg_index` once per process and rekeys it by
+alias (Rule 1 above).
+
+`IndexScanRegexp` / `BitmapScanRegexp` / `IndexOnlyScanRegexp` restrict to
+indexes matching a name pattern instead. All three are accepted by this server
+and implemented, but off by default: where index names are known — and they are,
+from the catalog — naming them outright is strictly more precise. They earn
+their place only for a naming convention meant to outlive a particular index.
+
+**`DisableIndex(t idx)` is not available here.** It plans as though the index
+were not there, which is the missing half of the unused-index finding in
+`dbadvisor/indexes.py`: that advisor reports zero scans in
+`pg_stat_user_indexes`, which is evidence about the past and says nothing about
+whether some query would have been slower without it. Dropping an index is
+irreversible without a rebuild, so being able to check first matters. Generator
+kept, not wired in, blocked on a pg_hint_plan upgrade.
+
+### 8. Memoize
+
+```
+/*+ Memoize(orders users) */   /*+ NoMemoize(orders users) */
+```
+
+Memoize (PG14+) caches the inner side of a nested loop across repeated outer
+values. Whether it pays depends entirely on how many **distinct** values the
+outer side has — a high-repeat outer side turns N inner scans into a handful, a
+unique one adds a hash table nobody reads.
+
+The planner decides from `ndistinct`, which is the single statistic most often
+wrong on the correlated columns this project targets, so it is a decision worth
+putting in the action space.
+
+Inert on the test query, correctly: that plan has no Memoize node and none is
+reachable. `Memoize()` is documented as permissive rather than forcing — it
+*allows* the topmost join to memoize, and the planner may still decline.
+
+### 9. Per-table parallelism
+
+```
+/*+ Parallel(oi 4 hard) */   /*+ Parallel(oi 0) */
+```
+
+**The largest measured win of any new family: 7870.2 → 1774.2, a 4.4×
+improvement.**
+
+Family 12 already varies `max_parallel_workers_per_gather`, but that is a
+statement-wide **ceiling**, and only a ceiling: PostgreSQL still applies its own
+table-size heuristic and refuses to parallelise a table it considers too small,
+so `Set(max_parallel_workers_per_gather 4)` on such a table changes nothing at
+all.
+
+`Parallel(table 4 hard)` overrides the heuristic and demands the workers. That
+is the point — the heuristic is a rule about table size, and the cases worth
+attacking are where a small table is expensive (a costly filter or function) or
+a large one is cheap. `Parallel(table 0)` removes a Gather whose startup cost is
+not repaid.
+
+`soft` respects the planner's own judgement, which makes it the safe default and
+also, mostly, a no-op; `hard` is the one that adds something to the space.
+`Parallel(t 0)` takes no qualifier — there is nothing left for hard/soft to
+qualify, and the qualified form is a parse error rather than a no-op.
+
+**Caveat worth knowing** (manual §15.2): a plan built for 4 workers that gets 0
+runs entirely in the leader and can be *worse* than the serial plan.
+`Workers Planned` vs `Workers Launched` in the plan JSON detects it.
+
+### 10. Operator toggles — statement-wide, off
 
 ```
 /*+ Set(enable_nestloop off) */
@@ -142,100 +318,121 @@ filtered table and a small one is usually what was wanted.
 ```
 
 Bao's own action space, and the reason it exists: join *order* alone is a weak
-space. On a two-table query there are two orderings and PostgreSQL already
-picks the better one, so every "candidate" comes back as the same plan and the
+space. On a two-table query there are two orderings and PostgreSQL already picks
+the better one, so every "candidate" comes back as the same plan and the
 optimizer cannot possibly improve anything. Toggling a whole class of operator
-off makes the planner re-plan under a restriction, which produces a genuinely
-different plan with a genuinely different cost.
+off makes the planner re-plan under a restriction.
 
-PostgreSQL never truly disables an operator — it prices it at `disable_cost`
-and lets the arithmetic bury it — so no combination here can fail to produce a
-plan.
+PostgreSQL never truly disables an operator — it prices it at `disable_cost` and
+lets the arithmetic bury it — so no combination here can fail to produce a plan.
+That also means a toggle can be *honoured and ignored*: `Set(enable_seqscan off)`
+measured at cost **1.0000098e10**, which is `disable_cost` plus the real cost —
+the planner had no alternative and used a sequential scan anyway. PG17+ marks
+this as `Disabled: true` in EXPLAIN; on PG16 the giveaway is the 1e10 prefix.
 
-Twelve join/scan combinations, plus:
+Twelve join/scan combinations, plus `enable_material`, `enable_memoize`,
+`enable_hashagg`, `enable_incremental_sort`.
 
-- `enable_material` — materialising an inner side to avoid re-scanning it.
-- `enable_memoize` (PG14+) — caches the inner side of a nested loop across
-  repeated parameter values. A large win when the outer side repeats, pure
-  overhead when it does not, and the planner decides from the estimate.
-- `enable_hashagg` — hash aggregation can spill; a sorted group-by sometimes
-  wins.
-- `enable_incremental_sort` — exploits an already-partially-sorted input, and
-  loses to a plain sort when the planner is wrong about how sorted it is.
+Nine of the server's 21 `enable_*` GUCs are used. The other twelve are listed in
+`docs/TECHNIQUES_BACKLOG.md` §A1.
 
-### 6. Resource and cost model
+### 11. Settings turned on
 
 ```
-/*+ Set(work_mem 65536) */    /*+ Set(max_parallel_workers_per_gather 4) */
-/*+ Set(jit off) */           /*+ Set(geqo_threshold 20) */
+/*+ Set(enable_partitionwise_join on) */
+/*+ Set(enable_partitionwise_aggregate on) */
 ```
 
-Every family above changes the *shape* of the plan. None of them changes what
-the executor is given to work with, and on a starved server that is the larger
-lever.
+Family 10 is built entirely from flags to switch **off**, which quietly assumes
+every planner feature ships on. Two do not: `enable_partitionwise_join` and
+`enable_partitionwise_aggregate` both default to **off**, so no combination of
+`off` toggles can reach the plan shapes they unlock — joining matching partitions
+pairwise instead of appending first, and aggregating per partition.
 
-- **`work_mem`** (in kB) — a hash join whose table does not fit spills to disk
-  in batches; a sort that does not fit becomes an external merge. Both are
-  large, cliff-edged effects the planner prices only through its estimate of
-  the input size. Measured here: cost 23264 → 17792 on a three-table join.
-- **`max_parallel_workers_per_gather`** — forcing workers on turns a sequential
-  scan of a large table parallel; forcing them off removes a Gather whose
-  startup cost is not repaid on a small result.
+They ship off for a reason the manual is explicit about: planning gets
+significantly more expensive, and the number of nodes bounded by `work_mem` grows
+with the partition count, so memory can climb sharply. That is an argument for
+measuring them per query, which is what this project is for, rather than setting
+them globally.
+
+Inert on this schema — there are no partitioned tables. Accepted by the server,
+so the family is real; it is waiting for a schema that can use it.
+
+### 12. Resource and cost model
+
+```
+/*+ Set(work_mem 65536) */      /*+ Set(max_parallel_workers_per_gather 4) */
+/*+ Set(jit off) */             /*+ Set(geqo_threshold 20) */
+/*+ Set(random_page_cost 1.1) */  /*+ Set(join_collapse_limit 1) */
+```
+
+Every family above changes the *shape* of the plan. None changes what the
+executor is given to work with, and on a starved server that is the larger lever.
+
+- **`work_mem`** (kB) — a hash join whose table does not fit spills to disk in
+  batches; a sort that does not fit becomes an external merge. Large, cliff-edged
+  effects the planner prices only through its estimate of the input size.
+- **`max_parallel_workers_per_gather`** — the ceiling, not the decision. See
+  family 9.
 - **`random_page_cost`** — 4.0 encodes a seek-heavy spinning disk. On SSD it
-  prices index scans far above what they cost, biasing everything toward
-  sequential scans.
+  prices index scans far above what they cost. Measured 7870.2 → 7869.9 here,
+  which is the honest result: this query is not index-bound.
 - **`join_collapse_limit 1`** — pins the join order written in the query and
-  stops subquery pull-up. Genuinely different from any `Leading()` hint.
+  stops subquery pull-up. Genuinely different from any `Leading()` hint, and
+  measured at 13625.5. **Watch out**: setting it at or above `geqo_threshold`
+  can trigger GEQO, whose plans are non-deterministic.
 - **`jit off`** — JIT is a fixed cost paid before the first row, priced by the
   planner's cost estimate. On a query the planner *thinks* is expensive and is
-  not, compiling can take longer than executing.
+  not, compiling can take longer than executing. No-op on this query — it is
+  below `jit_above_cost`.
 - **`geqo_threshold 20`** — above 12 joined relations PostgreSQL abandons
   exhaustive search for a genetic algorithm: fast, approximate, and
   **non-deterministic**, so the same query can get different plans on different
-  runs. This is the setting that matters most on JOB's 8-to-17 table queries.
+  runs. No-op on four tables; the setting that matters most on JOB's 8-to-17
+  table queries.
 
-### 7. Cardinality correction
+### Cardinality correction
 
 ```
 /*+ Rows(orders users *10) */
 ```
 
 The only family that does not force anything. It hands the planner a corrected
-row estimate and lets it decide for itself, so the plan that comes back can be
-one no `Leading()` or `Set()` can express.
+row estimate and lets it decide, so the plan that comes back can be one no
+`Leading()` or `Set()` can express.
 
 Produced by `optimizer/cardinality.py`, which learns PostgreSQL's own q-error
 from `Plan Rows` against `Actual Rows` — the root cause Leis et al. identified.
 
-Written up as a **null result** in `docs/WRITEUP.md` §2.8.1: it is verified to
-bind (a join estimated at 4 rows reports 400 under `Rows(o u *100)`) and beats
-native by up to 83% on the correlation traps, but it raises the oracle ceiling
-by **0.0%**, because every win it found was already reachable through the
-existing hints. Kept for the JOB-scale case it was built for.
+Written up as a **null result** in `docs/WRITEUP.md` §2.8.1: verified to bind (a
+join estimated at 4 rows reports 400 under `Rows(o u *100)`) and beats native by
+up to 83% on the correlation traps, but raises the oracle ceiling by **0.0%**,
+because every win it found was already reachable through the existing hints.
+Kept for the JOB-scale case it was built for.
 
-`app/dbadvisor/extended_stats.py` attacks the same problem permanently, with
+`dbadvisor/extended_stats.py` attacks the same problem permanently, with
 `CREATE STATISTICS`, rather than one query at a time.
 
 ---
 
 ## How a query's action space is assembled
 
-`optimizer/planner.py::candidate_hints` builds the list, and then:
+`optimizer/planner.py::candidate_hints` builds the list, then:
 
 1. **The regression guard removes families that have lost on this query.**
-   Blocking a whole query is blunt — usually one *kind* of action is bad on it,
-   not all of them.
+   Blocking a whole query is blunt — usually one *kind* of action is bad on it.
 2. **The budget truncates by estimated cost.** A query PostgreSQL prices at a
    few hundred cost units cannot repay a twenty-candidate search, and the
-   families are ordered so the resource settings — the ones that cannot help a
-   small query — are dropped first.
+   families are ordered so the ones that cannot help a small query are dropped
+   first. Index pinning is generated last for a second reason: it is the only
+   family that can come back empty for a cause outside the query (no catalog map
+   supplied).
 3. **Duplicate plans are dropped.** Most hints on a simple query reproduce the
    native plan; counting those as candidates makes the action space look bigger
    than it is and guarantees a 0% improvement.
 
 The same function serves `/query/optimize` and `/query/analyze`, so the two
-cannot explore different spaces — that kind of train/serve skew is what
-`docs/WRITEUP.md` §2.9 documents.
+cannot explore different spaces — that train/serve skew is what §2.9 documents.
 
 ---
 
@@ -244,93 +441,65 @@ cannot explore different spaces — that kind of train/serve skew is what
 - **Query rewriting.** Changing the SQL rather than the plan — pushing down a
   predicate, turning a subquery into a join. Higher ceiling, and it has to
   preserve semantics exactly, which a hint gets for free.
-- **`IndexOnlyScan` / `NoIndexScan` / per-table `Parallel()`.** pg_hint_plan
-  supports them; they are not generated yet.
+- **`DisableIndex`.** Blocked on a pg_hint_plan upgrade, see family 7.
 - **Materialized views, partitioning, sharding.** Schema redesigns, not plan
-  choices.
+  choices — though partitioning would activate family 11.
 - **Multi-query optimization.** Sharing work across a workload rather than
   optimising each query alone.
 
 ---
 
-## Turning families on and off
-
-| setting | default | family |
-|---|---|---|
-| `INCLUDE_JOIN_METHODS` | off | 3 |
-| `INCLUDE_TUNING` | on | 6 |
-| `ENABLE_ROWS_CORRECTION` | on | 7 |
-| `ADAPTIVE_CANDIDATE_BUDGET` | on | truncation |
-
-All are editable from the dashboard's settings panel and persist in
-`models/settings.json`.
-
-**Widening the action space is not free**, and the project has been bitten by
-it: doing so without retraining sent 17 of 25 queries into the safety veto,
-because the model was scoring plan types it had never seen. If you turn a
-family on, re-run `app.collect_data` — and settle whether it actually helped
-with `app.experiment`, not by reading three numbers off one run.
-
----
-
 ## Where these come from — sources
 
-### The hint syntax itself (family 1–7, all of it)
+### The hint syntax itself
 
-- **pg_hint_plan, official documentation** — the complete hint list, the six
-  categories in the table at the top of this file, and the exact syntax for
-  `Leading`, the nested bushy form, `HashJoin`/`NestLoop`/`MergeJoin`,
-  `SeqScan`/`IndexScan`/`BitmapScan`/`IndexOnlyScan`, `Rows`, `Parallel`, `Set`.
+- **pg_hint_plan hint list** — the complete reference, and the six categories in
+  the table at the top of this file.
   https://pg-hint-plan.readthedocs.io/en/latest/hint_list.html
-- **pg_hint_plan source** — when the docs and the behaviour disagree, this is
-  what is actually running. https://github.com/ossc-db/pg_hint_plan
-- **Why hints get silently ignored** (the §2.0 bug this project hit):
+  ⚠ Documents the *latest* version. This server runs 1.6.3 — see Rule 2.
+- **pg_hint_plan source** — when docs and behaviour disagree, this is what is
+  running. https://github.com/ossc-db/pg_hint_plan
+- **Why hints get silently ignored**
   https://pg-hint-plan.readthedocs.io/en/latest/hint_details.html
 
-### The settings behind families 5 and 6
+### The settings behind families 10, 11 and 12
 
-- **PostgreSQL: Planner Method Configuration** — every `enable_*` toggle,
-  including `enable_memoize`, `enable_hashagg`, `enable_incremental_sort`.
+- **Planner Method Configuration** — all 21 `enable_*` toggles.
   https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-ENABLE
-- **PostgreSQL: Planner Cost Constants** — `random_page_cost`, `seq_page_cost`,
-  `cpu_tuple_cost`.
+- **Planner Cost Constants** — `random_page_cost`, `parallel_setup_cost`,
+  `effective_cache_size`.
   https://www.postgresql.org/docs/current/runtime-config-query.html#RUNTIME-CONFIG-QUERY-CONSTANTS
-- **PostgreSQL: Genetic Query Optimizer** — what `geqo_threshold` switches on,
-  and why it is non-deterministic.
-  https://www.postgresql.org/docs/current/geqo.html
-- **PostgreSQL: `work_mem`** — the spill-to-disk cliff.
+- **Genetic Query Optimizer** — what `geqo_threshold` switches on, and why it is
+  non-deterministic. https://www.postgresql.org/docs/current/geqo.html
+- **`work_mem`**
   https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-WORK-MEM
-- **PostgreSQL: JIT** — `jit`, `jit_above_cost`, and why it can cost more than
-  it saves. https://www.postgresql.org/docs/current/jit-decision.html
-- **PostgreSQL: `join_collapse_limit` / `from_collapse_limit`** — the explicit
-  join-order pin. https://www.postgresql.org/docs/current/explicit-joins.html
+- **JIT decision** https://www.postgresql.org/docs/current/jit-decision.html
+- **Explicit joins / collapse limits**
+  https://www.postgresql.org/docs/current/explicit-joins.html
+- **Parallel Query** — why a plan built for 4 workers may get 0.
+  https://www.postgresql.org/docs/current/parallel-query.html
 
 ### The idea of an "action space"
 
-- **Bao: Making Learned Query Optimization Practical** — Marcus, Negi,
-  Mao, Tatbul, Kraska, Alizadeh. SIGMOD 2021. Where the term comes from, and
-  where family 5 (statement-wide operator toggles as the action space) is from.
+- **Bao: Making Learned Query Optimization Practical** — Marcus et al., SIGMOD
+  2021. Where the term comes from, and where family 10 is from.
   https://arxiv.org/abs/2004.03814
-- **Neo: A Learned Query Optimizer** — Marcus et al., VLDB 2019. Learns the
-  plan tree end to end, which is where bushy search (family 2) and plan-tree
-  encoding come from. https://arxiv.org/abs/1904.03711
+- **Neo: A Learned Query Optimizer** — Marcus et al., VLDB 2019. Bushy search
+  (family 2) and plan-tree encoding. https://arxiv.org/abs/1904.03711
 - **Lero: A Learning-to-Rank Query Optimizer** — Zhu et al., VLDB 2023. The
-  pairwise ranking objective used in `learned_pairwise_rank`.
+  pairwise objective used in `learned_pairwise_rank`.
   https://arxiv.org/abs/2302.06873
 
-### Why cardinality correction (family 7) exists
+### Why cardinality correction exists
 
-- **How Good Are Query Optimizers, Really?** — Leis, Gubichev, Mirchev,
-  Boncz, Kemper, Neumann. VLDB 2015. The paper that established estimation
-  error, not the search or cost model, as the dominant source of bad plans.
-  https://www.vldb.org/pvldb/vol9/p204-leis.pdf
-- **Join Order Benchmark (JOB)** — the 113 queries from that paper.
+- **How Good Are Query Optimizers, Really?** — Leis et al., VLDB 2015. The paper
+  that established estimation error, not search or the cost model, as the
+  dominant source of bad plans. https://www.vldb.org/pvldb/vol9/p204-leis.pdf
+- **Join Order Benchmark** — the 113 queries from that paper.
   https://github.com/gregrahn/join-order-benchmark
-- **PostgreSQL: `CREATE STATISTICS`** — the permanent fix `dbadvisor` proposes
-  instead of a per-query `Rows()` hint.
+- **`CREATE STATISTICS`** — the permanent fix `dbadvisor` proposes instead.
   https://www.postgresql.org/docs/current/sql-createstatistics.html
-- **PostgreSQL: Row Estimation Examples** — how the estimates being corrected
-  are computed in the first place.
+- **Row Estimation Examples** — how the estimates being corrected are computed.
   https://www.postgresql.org/docs/current/row-estimation-examples.html
 
 ### In this repository
@@ -338,8 +507,11 @@ with `app.experiment`, not by reading three numbers off one run.
 | where | what |
 |---|---|
 | `backend/app/optimizer/hints.py` | every family is generated here |
-| `backend/app/optimizer/planner.py` | how the per-query list is assembled |
-| `backend/app/optimizer/cardinality.py` | family 7 |
+| `backend/app/optimizer/catalog.py` | the alias rekeying, and why (Rule 1) |
+| `backend/app/optimizer/planner.py` | per-query assembly, budget, flags |
+| `backend/app/optimizer/cardinality.py` | `Rows()` corrections |
+| `backend/tests/test_hint_families.py` | unit tests for all twelve |
+| `backend/tests/test_integration_hints.py` | keyword acceptance against the live server |
+| `docs/TECHNIQUES_BACKLOG.md` | everything from the manual not yet built |
 | `docs/WRITEUP.md` §2.8.1 | the `Rows()` null result |
 | `docs/WRITEUP.md` §2.9 | train/serve skew in the action space |
-| `docs/DATABASE_OPTIMIZATION.md` | the schema-level fixes, not plan hints |

@@ -40,7 +40,14 @@ INDEX_USAGE_SQL = """
         i.indisunique                              AS is_unique,
         i.indisprimary                             AS is_primary,
         pg_get_indexdef(s.indexrelid)              AS definition,
-        COALESCE(t.seq_scan, 0) + COALESCE(t.idx_scan, 0) AS table_reads
+        COALESCE(t.seq_scan, 0) + COALESCE(t.idx_scan, 0) AS table_reads,
+        -- PG16+ records *when* an index was last scanned, not only how often.
+        -- A counter of zero is ambiguous -- it also means `pg_stat_reset()` ran
+        -- this morning -- but a null timestamp beside a table that has been
+        -- read thousands of times is evidence the counter alone cannot give.
+        s.last_idx_scan,
+        COALESCE(t.n_tup_upd, 0)     AS updates,
+        COALESCE(t.n_tup_hot_upd, 0) AS hot_updates
     FROM pg_stat_user_indexes s
     JOIN pg_index i ON i.indexrelid = s.indexrelid
     LEFT JOIN pg_stat_user_tables t ON t.relid = s.relid
@@ -69,12 +76,59 @@ INDEX_COLUMNS_SQL = """
 MIN_TABLE_READS = 50
 
 
+def _unused_note(table, table_reads, last_scan, updates, hot_updates) -> str:
+    """
+    Why this index looks droppable, and what it is actually costing.
+
+    Two things the previous wording left out.
+
+    **The evidence is stronger than a zero counter.** `pg_stat_user_indexes`
+    counters reset on `pg_stat_reset()` and on a restore, so zero on its own is
+    ambiguous. PostgreSQL 16 added `last_idx_scan`, a timestamp -- a null
+    timestamp next to a table that has been read thousands of times is a
+    different claim from "the counter happens to read zero".
+
+    **The cost is not mainly disk.** §11.1: "Indexes can also prevent the
+    creation of heap-only tuples." Every index on a table blocks the HOT
+    optimization for updates touching its columns, so the update has to write a
+    new entry into *every* index and leave a dead row for VACUUM. That is a cost
+    paid on every write, where disk is a fixed cost you can shrug at -- and it is
+    measurable right here from `n_tup_upd` against `n_tup_hot_upd`.
+    """
+    reads = int(table_reads or 0)
+    updates = int(updates or 0)
+    hot = int(hot_updates or 0)
+
+    if last_scan:
+        evidence = (
+            f"last scanned {last_scan}, and not since -- while {table} was read "
+            f"{reads:,} times."
+        )
+    else:
+        evidence = (
+            f"never scanned in the recorded history, while {table} was read "
+            f"{reads:,} times. Counters reset on `pg_stat_reset()` and on a "
+            "restore, so check how long they have been running before acting."
+        )
+
+    if updates >= 1000 and hot < updates * 0.5:
+        non_hot = updates - hot
+        evidence += (
+            f" Worth acting on: only {hot / updates:.0%} of this table's "
+            f"{updates:,} updates were heap-only, so {non_hot:,} of them had to "
+            "write into every index on the table. That is the recurring cost of "
+            "keeping this one, and it is larger than the disk it occupies."
+        )
+    return evidence
+
+
 def unused(cur, schema: str = "public") -> list[dict]:
     """Indexes the planner has never chosen, on tables that are being read."""
     cur.execute(INDEX_USAGE_SQL, (schema,))
     found = []
     for (
         table, index, scans, size, is_unique, is_primary, definition, table_reads,
+        last_scan, updates, hot_updates,
     ) in cur.fetchall():
         if scans or is_primary:
             continue
@@ -89,11 +143,9 @@ def unused(cur, schema: str = "public") -> list[dict]:
             # A unique index is a constraint too, so dropping it changes what
             # the database will accept -- not only how fast it goes.
             "enforces_uniqueness": bool(is_unique),
-            "note": (
-                "never chosen by the planner since statistics were last reset. "
-                "Counters reset on `pg_stat_reset()` and on a restore, so check "
-                "how long they have been running before acting."
-            ),
+            "last_scanned": str(last_scan) if last_scan else None,
+            "table_reads": int(table_reads or 0),
+            "note": _unused_note(table, table_reads, last_scan, updates, hot_updates),
         })
     return sorted(found, key=lambda r: -r["size_bytes"])
 

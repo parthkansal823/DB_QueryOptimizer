@@ -173,5 +173,73 @@ def report(cur) -> dict:
         "current": {
             name: f"{entry['setting']}{entry['unit'] or ''}" for name, entry in current.items()
         },
-        "findings": findings,
+        "findings": findings + statistics_visibility(cur),
     }
+
+
+# Statistics that are present, and that the planner is not allowed to read.
+#
+# §69.3 documents a failure mode with no error attached to it. Selectivity
+# estimation runs the query's own operator against stored `pg_statistic` values,
+# so an operator could leak them. To prevent that, the planner will only use
+# stored statistics when the current role either has `SELECT` on the table (or
+# the columns involved) or the operator is `LEAKPROOF`. Otherwise:
+#
+#   "the selectivity estimator will behave as if no statistics are available,
+#    and the planner will proceed with default or fall-back assumptions...
+#    There is no direct feedback about that, except that the plan might be
+#    suboptimal."
+#
+# For this project that is worse than for most. Every estimate the model learns
+# to correct, every q-error the advisor measures, and every `CREATE STATISTICS`
+# recommendation assumes the planner *read* the statistics. Under a restricted
+# role it silently did not, and the whole system would be learning to compensate
+# for a permissions boundary rather than for a correlated column.
+#
+# It bites specifically when queries go through a security-barrier view over a
+# table the role cannot read directly -- which is exactly how a reporting user
+# is usually set up.
+STATISTICS_VISIBILITY_SQL = """
+    SELECT c.relname,
+           has_table_privilege(current_user, c.oid, 'SELECT') AS readable
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = %s
+      AND c.relkind IN ('r', 'm', 'p')
+"""
+
+
+def statistics_visibility(cur, schema: str = "public") -> list[dict]:
+    """
+    Tables whose statistics the planner will refuse to use for this role.
+
+    Returns nothing on the common case of a superuser or an owner, which is why
+    it is cheap to leave switched on.
+    """
+    try:
+        cur.execute(STATISTICS_VISIBILITY_SQL, (schema,))
+        rows = cur.fetchall()
+    except Exception:  # noqa: BLE001 - a catalog we cannot read is not a finding
+        return []
+
+    unreadable = [name for name, readable in rows if not readable]
+    if not unreadable:
+        return []
+
+    return [{
+        "setting": "statistics visibility",
+        "severity": "high",
+        "tables": sorted(unreadable),
+        "note": (
+            f"the current role cannot SELECT from {len(unreadable)} table(s) in "
+            f"this schema ({', '.join(sorted(unreadable)[:4])}"
+            + (", ..." if len(unreadable) > 4 else "")
+            + "). For those, PostgreSQL will plan as if no statistics existed at "
+            "all -- §69.3 -- unless the operator involved is LEAKPROOF, and it "
+            "gives no warning when it does so. Every estimate this project "
+            "learns to correct assumes the planner read the statistics; here it "
+            "did not, so the model would be compensating for a permissions "
+            "boundary rather than for a correlated column. Grant SELECT, or run "
+            "the optimizer as a role that has it."
+        ),
+    }]

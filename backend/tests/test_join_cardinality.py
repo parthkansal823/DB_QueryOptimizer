@@ -219,14 +219,36 @@ def _without_corrector(plan):
     return candidate_hints(_Optimizer(), _baseline(plan), ["a", "b"])
 
 
-def test_without_a_corrector_the_action_space_is_unchanged():
+def test_without_a_corrector_the_action_space_adds_nothing():
+    """
+    No corrector, nothing extra -- the served space is the generated one, minus
+    only candidates `optimizer/prefilter.py` can prove cannot change the plan.
+
+    This used to assert plain equality with `generate_candidates`. The prefilter
+    made that false by design: a `Set(enable_x off)` on a plan containing no
+    node of that type returns the native plan, so it is dropped before an
+    EXPLAIN round trip is spent discovering that.
+
+    Equality is not the property worth guarding anyway. What matters is that
+    the corrector adds nothing here and that nothing goes missing for any *other*
+    reason -- so every difference has to come with a proof, which is what
+    `is_provable_noop` returns.
+    """
     from app.optimizer.hints import generate_candidates
     from app.optimizer.planner import candidate_hints
+    from app.optimizer.prefilter import is_provable_noop
 
     plan = _join([_scan("a", 100), _scan("b", 100)], 10)
-    assert candidate_hints(_Optimizer(), _baseline(plan), ["a", "b"]) == generate_candidates(
-        ["a", "b"], include_tuning=True
-    )
+    baseline = _baseline(plan)
+    served = candidate_hints(_Optimizer(), baseline, ["a", "b"])
+    generated = generate_candidates(["a", "b"], include_tuning=True)
+
+    assert set(served) <= set(generated), "serving must not invent candidates"
+    for hint in set(generated) - set(served):
+        assert is_provable_noop(hint, baseline), (
+            f"{hint} disappeared from the served action space without a proof "
+            "that it could not have changed the plan"
+        )
 
 
 def test_a_trained_corrector_adds_exactly_one_candidate():

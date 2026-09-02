@@ -110,11 +110,48 @@ def test_an_escaped_quote_inside_a_string_does_not_split_it():
     assert query_template("SELECT * FROM t WHERE s = 'O''Brien'").count("?") == 1
 
 
-def test_a_hint_is_preserved():
-    """A hint is part of what ran. `plan_extractor` splits it off where that
-    matters; stripping it here would make a hinted and an unhinted execution of
-    the same text indistinguishable."""
-    assert "Leading(a b)" in query_template("/*+ Leading(a b) */ SELECT * FROM a, b")
+def test_a_hint_is_not_part_of_the_identity():
+    """
+    A hint says *how* to run the query, not *which* query it is. The hinted and
+    unhinted forms return the same rows, and this system runs both deliberately
+    in order to compare them.
+
+    This used to assert the opposite, on the reasoning that stripping the hint
+    would make a hinted and an unhinted execution indistinguishable. That was
+    already not how the system works: `main.py` logs the baseline *and* every
+    candidate with the same `sql_text`, and records the difference in the
+    `hint`, `is_baseline` and `is_chosen` columns. `query_id` is deliberately
+    shared, because that is what makes served-vs-native pairing possible at all.
+
+    Keeping the hint in the id broke the case the reasoning never considered: a
+    query that arrives *already hinted*, which is what the optimiser's own
+    output is. Three chained passes produced three ids, so each one reached the
+    regression guard, the decision cache and the regret curve as a brand-new
+    query — silently, because a fresh id is indistinguishable from a first
+    visit.
+    """
+    bare = "SELECT * FROM a, b"
+    assert query_template(f"/*+ Leading(a b) */ {bare}") == query_template(bare)
+
+
+def test_stacked_hints_are_all_stripped():
+    """The shape older builds produced by prepending a second hint comment."""
+    bare = "SELECT * FROM a, b"
+    stacked = "\n".join(
+        ["/*+ Set(enable_hashjoin off) */", "/*+ Leading(a b) */", bare]
+    )
+    assert query_template(stacked) == query_template(bare)
+
+
+def test_a_bushy_hint_is_stripped_too():
+    """Two levels of nesting; a one-level pattern leaves half of it behind."""
+    bare = "SELECT * FROM a, b, c, d"
+    assert query_template(f"/*+ Leading(((a b) (c d))) */ {bare}") == query_template(bare)
+
+
+def test_an_ordinary_comment_is_left_alone():
+    """Only `/*+ ... */` is a hint. A plain comment is part of the text."""
+    assert "note" in query_template("/* note */ SELECT * FROM a")
 
 
 def test_an_empty_query_does_not_raise():

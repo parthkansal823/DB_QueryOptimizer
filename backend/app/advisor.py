@@ -32,6 +32,8 @@ from __future__ import annotations
 
 # Below this ratio between estimated and actual rows, the planner was close
 # enough that no amount of statistics would have changed the plan.
+from app.index_advice import index_recommendation
+
 QERROR_THRESHOLD = 5.0
 
 # A sequential scan discarding at least this fraction of what it reads is a
@@ -76,7 +78,11 @@ def _columns_in_filter(filter_text: str) -> list[str]:
     return found
 
 
-def analyze_plan(plan: dict) -> list[dict]:
+def analyze_plan(
+    plan: dict,
+    c_locale: bool = False,
+    already_indexed: set[tuple[str, str]] | None = None,
+) -> list[dict]:
     """Recommendations derived from one executed plan (needs ANALYZE)."""
     recommendations: list[dict] = []
     seen: set[tuple] = set()
@@ -140,6 +146,17 @@ def analyze_plan(plan: dict) -> list[dict]:
                 discarded = removed / read
                 if discarded >= SEQ_SCAN_DISCARD_THRESHOLD:
                     columns = _columns_in_filter(filter_text)
+                    # A single column that already carries a unique index of its
+                    # own needs nothing. §11.6: "There's no need to manually
+                    # create indexes on unique columns; doing so would just
+                    # duplicate the automatically-created index." Every primary
+                    # key is such a column, and recommending one is always wrong.
+                    if (
+                        already_indexed
+                        and len(columns) == 1
+                        and (relation, columns[0]) in already_indexed
+                    ):
+                        columns = []
                     if columns:
                         key = ("index", relation, tuple(columns))
                         if key not in seen:
@@ -156,12 +173,37 @@ def analyze_plan(plan: dict) -> list[dict]:
                                 "why": (
                                     f"Sequential scan on {relation} read {read:,.0f} rows and threw "
                                     f"away {removed:,.0f} of them ({discarded:.0%}). An index on "
-                                    f"{column_list} would let PostgreSQL fetch only what matches."
+                                    f"{column_list} would let PostgreSQL fetch only what matches"
+                                    + (
+                                        " -- but "
+                                        + index_recommendation(
+                                            relation, columns, filter_text, c_locale
+                                        )["why_this_type"]
+                                        if index_recommendation(
+                                            relation, columns, filter_text, c_locale
+                                        )["index_type"]
+                                        != "btree"
+                                        else ""
+                                    )
+                                    + "."
                                 ),
-                                "ddl": (
-                                    f"CREATE INDEX CONCURRENTLY idx_{relation}_{'_'.join(columns)} "
-                                    f"ON {relation} ({column_list});"
-                                ),
+                                # Which *kind* of index, not just which
+                                # columns. A plain B-tree does not serve an
+                                # anchored LIKE outside the C locale, cannot
+                                # serve an unanchored one at all, and cannot
+                                # serve a predicate wrapped in a function.
+                                # Measured on this database: in all three cases
+                                # the naive B-tree was built and the planner
+                                # went on sequentially scanning -- so the next
+                                # advisor run would report it as unused and
+                                # suggest dropping it. See `app/index_advice.py`.
+                                **{
+                                    k: v
+                                    for k, v in index_recommendation(
+                                        relation, columns, filter_text, c_locale
+                                    ).items()
+                                    if k != "why_this_type"
+                                },
                                 "impact": "Turns a full-table read into a targeted lookup.",
                             })
 

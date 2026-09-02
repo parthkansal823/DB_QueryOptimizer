@@ -52,7 +52,7 @@ COLUMNS = "indkey"
 
 def test_an_index_the_planner_never_chooses_is_reported():
     cur = _Cursor({USAGE: [
-        ("orders", "idx_unused", 0, 8192, False, False, "CREATE INDEX ...", 500),
+        ("orders", "idx_unused", 0, 8192, False, False, "CREATE INDEX ...", 500, None, 0, 0),
     ]})
 
     found = indexes.unused(cur)
@@ -64,7 +64,7 @@ def test_a_primary_key_is_never_reported_as_unused():
     """It is a constraint before it is an index, and dropping it changes what
     the database will accept."""
     cur = _Cursor({USAGE: [
-        ("orders", "orders_pkey", 0, 8192, True, True, "CREATE UNIQUE INDEX ...", 500),
+        ("orders", "orders_pkey", 0, 8192, True, True, "CREATE UNIQUE INDEX ...", 500, None, 0, 0),
     ]})
 
     assert indexes.unused(cur) == []
@@ -72,7 +72,7 @@ def test_a_primary_key_is_never_reported_as_unused():
 
 def test_a_unique_index_is_reported_but_flagged():
     cur = _Cursor({USAGE: [
-        ("orders", "orders_email_key", 0, 8192, True, False, "CREATE UNIQUE INDEX ...", 500),
+        ("orders", "orders_email_key", 0, 8192, True, False, "CREATE UNIQUE INDEX ...", 500, None, 0, 0),
     ]})
 
     assert indexes.unused(cur)[0]["enforces_uniqueness"] is True
@@ -81,7 +81,7 @@ def test_a_unique_index_is_reported_but_flagged():
 def test_an_idle_table_does_not_make_its_indexes_look_useless():
     """"Never scanned" on a table nobody reads says nothing about the index."""
     cur = _Cursor({USAGE: [
-        ("archive", "idx_archive", 0, 8192, False, False, "CREATE INDEX ...", 3),
+        ("archive", "idx_archive", 0, 8192, False, False, "CREATE INDEX ...", 3, None, 0, 0),
     ]})
 
     assert indexes.unused(cur) == []
@@ -279,16 +279,42 @@ def test_qerror_does_not_divide_by_zero():
     assert stats._qerror(0, 0) == 1.0
 
 
-def test_the_definition_asks_for_all_three_kinds():
-    """`dependencies` fixes the multiplied-selectivity problem this project is
-    about; `ndistinct` fixes group-by and join estimates over the same columns;
-    `mcv` covers a dependency that holds for common values only. One ANALYZE
-    covers all three."""
+def test_the_definition_asks_for_the_kind_that_was_measured():
+    """
+    `_probe_query` builds `WHERE left = %s AND right = %s` — pure equality. So
+    the before/after q-error this module reports is evidence about
+    `dependencies` and nothing else.
+
+    This used to request all three kinds on the strength of that one number.
+    `ndistinct` only helps `GROUP BY a, b` and the manual is explicit that on
+    columns nobody groups by "the ANALYZE cycles are just wasted"; `mcv` stores
+    the actual values and costs more in ANALYZE, storage *and* planning time.
+    Bundling them under a measurement that covers neither overstates the case.
+    """
     definition = stats._definition("users", ["city", "country"])
 
-    for kind in ("dependencies", "ndistinct", "mcv"):
-        assert kind in definition
+    assert "dependencies" in definition
+    assert "ndistinct" not in definition
+    assert "mcv" not in definition
     assert '"city"' in definition and '"country"' in definition
+
+
+def test_the_other_two_kinds_are_offered_with_their_trigger():
+    """
+    Not dropped — each has a real case, and each says what that case is so a
+    reader can tell whether it applies to their workload.
+    """
+    optional = stats.optional_kinds("users", ["city", "country"])
+    kinds = {o["kind"]: o for o in optional}
+
+    assert set(kinds) == {"ndistinct", "mcv"}
+    assert "GROUP BY city, country" in kinds["ndistinct"]["when"]
+    assert "range clauses" in kinds["mcv"]["when"]
+    # Each still carries dependencies: the two are stored together and cost one
+    # ANALYZE between them.
+    for entry in optional:
+        assert "dependencies" in entry["ddl"]
+        assert entry["kind"] in entry["ddl"]
 
 
 def test_the_definition_quotes_identifiers():

@@ -19,6 +19,7 @@ from app.logging_store import log_execution
 from app.optimizer.hints import apply_hint, generate_candidates
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
+from app.measurement import make_deterministic
 
 # Three, not one. Training on single executions taught the model that
 # whichever candidate got the luckiest timing was genuinely fastest, and
@@ -60,6 +61,9 @@ def collect(
 
     with get_cursor() as cur:
         cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
+        # Pin what would otherwise differ between runs -- see
+        # `app/measurement.py::DETERMINISTIC_SESSION`.
+        make_deterministic(cur)
         for qi, item in enumerate(workload):
             # Checked between queries rather than mid-query: the per-query
             # commit below is what makes stopping here leave a consistent,

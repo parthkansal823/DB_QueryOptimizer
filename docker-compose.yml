@@ -15,7 +15,30 @@ services:
     command:
       - postgres
       - -c
-      - shared_preload_libraries=pg_hint_plan
+      # `pg_stat_statements` also has to be preloaded -- it hooks the executor,
+      # so `CREATE EXTENSION` alone gives you a view with nothing in it. It is
+      # the single highest-signal thing available here: per-query planning time
+      # separated from execution time (this project's whole cost is
+      # `optimizer_overhead_ms`, and this measures the baseline it is added to),
+      # shared block hits against reads (the cache-state bias that turned a
+      # reported 80.5% improvement into a real 26.0%), temp blocks (a query
+      # spilling because `work_mem` is too small, measured rather than guessed),
+      # per-query JIT cost, `parallel_workers_to_launch` against
+      # `parallel_workers_launched`, and `stddev_exec_time` -- variance from the
+      # server, free, where `benchmark.py` re-runs queries to compute its own.
+      - shared_preload_libraries=pg_hint_plan,pg_stat_statements
+      - -c
+      # The normalized query identity PostgreSQL computes itself, from the
+      # post-parse-analysis tree rather than from the text. `app/query_template.py`
+      # implements this by hand; the built-in one distinguishes queries whose
+      # text matches but whose meaning differs under a different `search_path`,
+      # and merges `IN (1,2,3)` with `IN (1,2,3,4)`. Worth comparing the two.
+      - compute_query_id=on
+      - -c
+      # Required for the per-query I/O time columns. Off by default because the
+      # clock reads are not free; `pg_test_timing` measures the overhead on a
+      # given machine, and on Linux with a vDSO clocksource it is small.
+      - track_io_timing=on
     environment:
       POSTGRES_DB: lqo
       POSTGRES_USER: postgres

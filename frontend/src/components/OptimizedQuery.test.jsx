@@ -53,3 +53,40 @@ describe("faster version of your query", () => {
     expect(screen.getByText(/Nothing beat PostgreSQL/)).toBeInTheDocument();
   });
 });
+
+// -- chaining a second pass --------------------------------------------------
+//
+// Pasting this panel's own output back in is the obvious way to keep improving a
+// query, and it used to throw the previous hint away: pg_hint_plan reads only
+// the first `/*+ ... */` comment and silently ignores the rest.
+
+describe("a query that arrives already hinted", () => {
+  const best = {
+    hint: "/*+ Leading(oi p o u) */",
+    optimized_sql: "/*+ Set(enable_hashjoin off) Leading(oi p o u) */\nSELECT 1",
+    baseline_ms: 30,
+    optimized_ms: 1,
+    speedup: 30,
+    percent_faster: 96.7,
+    baseline_cost: 100,
+    optimized_cost: 120,
+  };
+
+  it("says which hints were carried forward", () => {
+    render(<OptimizedQuery best={best} incomingHints={["Set(enable_hashjoin off)"]} />);
+    expect(screen.getByText(/Building on your hint/)).toBeInTheDocument();
+    expect(screen.getByText("Set(enable_hashjoin off)")).toBeInTheDocument();
+  });
+
+  it("states that the baseline is still the unhinted query", () => {
+    // Otherwise the speedup would be read as "faster than my last pass", when
+    // it is measured from where PostgreSQL started.
+    render(<OptimizedQuery best={best} incomingHints={["Set(enable_hashjoin off)"]} />);
+    expect(screen.getByText(/unhinted/)).toBeInTheDocument();
+  });
+
+  it("says nothing on a first pass", () => {
+    render(<OptimizedQuery best={best} incomingHints={[]} />);
+    expect(screen.queryByText(/Building on your hint/)).not.toBeInTheDocument();
+  });
+});

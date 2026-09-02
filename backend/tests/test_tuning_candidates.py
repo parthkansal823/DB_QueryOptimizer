@@ -122,13 +122,33 @@ def test_an_explicit_argument_overrides_the_flag():
 
 
 def test_the_family_only_adds_to_the_space():
+    """
+    Switching the family on may only add. Every setting has to arrive, unless
+    `optimizer/prefilter.py` can prove it cannot change this plan.
+
+    The count used to be exact (`narrow + len(TUNING_SETTINGS)`). The prefilter
+    made that false for a good reason -- the parallel settings cannot matter to
+    a plan with no Gather node, so spending an EXPLAIN round trip on them buys
+    the native plan back. Asserting the proof rather than the count keeps the
+    guarantee that matters: nothing vanishes silently.
+    """
+    from app.optimizer.prefilter import is_provable_noop
+
     planner.INCLUDE_TUNING = False
     narrow = _served_hints()
     planner.INCLUDE_TUNING = True
     wide = _served_hints()
 
     assert set(narrow) <= set(wide)
-    assert len(wide) == len(narrow) + len(TUNING_SETTINGS)
+
+    for guc, value in TUNING_SETTINGS:
+        hint = f"/*+ Set({guc} {value}) */"
+        if hint in wide:
+            continue
+        assert is_provable_noop(hint, BASELINE), (
+            f"{hint} is missing from the served action space and the prefilter "
+            "offers no proof that it could not have changed the plan"
+        )
 
 
 def test_generate_candidates_keeps_it_opt_in():

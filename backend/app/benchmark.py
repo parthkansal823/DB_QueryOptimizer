@@ -28,6 +28,7 @@ from app.optimizer.learned import LearnedOptimizer
 from app.optimizer.regression_guard import RegressionGuard
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
+from app.measurement import make_deterministic
 
 
 # A single candidate must not be able to stall the whole run.
@@ -107,6 +108,9 @@ def run(
 
     with get_cursor() as cur:
         cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
+        # Pin what would otherwise differ between runs -- see
+        # `app/measurement.py::DETERMINISTIC_SESSION`.
+        make_deterministic(cur)
         guard = RegressionGuard()
         if use_guard:
             blocked = guard.refresh(cur)

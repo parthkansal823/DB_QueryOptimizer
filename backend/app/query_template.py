@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import re
 
+from app.optimizer.hints import split_hints
+
 # Order matters. Strings are consumed first so that a number *inside* a string
 # ('order-2024') is never mistaken for a numeric literal, and the IN-list rule
 # runs after both so it sees a list of placeholders rather than raw values.
@@ -70,13 +72,38 @@ _WHITESPACE = re.compile(r"\s+")
 
 def query_template(sql: str) -> str:
     """
-    The query with its parameters removed, whitespace-normalised.
+    The query with its parameters and plan hints removed, whitespace-normalised.
 
     Not intended to be executable -- it is an identity, not a statement.
+
+    **Hints are stripped, and that is the point of this being an identity.** A
+    `/*+ ... */` comment says *how* to run the query, not *which* query it is:
+    the hinted and unhinted forms return the same rows, and this system runs
+    both of them deliberately, on purpose, to compare them.
+
+    Leaving the hint in split a query's history every time someone fed the
+    optimiser's own output back in to improve it further -- the workflow that
+    turned up the `apply_hint` bug. Three chained passes produced three
+    different ids:
+
+        pass 1 (bare)   adhoc:c047519472b703a65c7118fcbd4c2f4e
+        pass 2          adhoc:988d3b8e205ba3509f222cd3fde00af5
+        pass 3          adhoc:2df438b04eb11d355f379fa1743d6e85
+
+    Everything per-query keys on that id. So each pass arrived as a brand-new
+    query: the regression guard had no history and could not have blocked a bad
+    hint however many times it had seen one, the decision cache missed, and
+    `/stats/trend` and the regret curve split one query into three. All silently,
+    because a fresh id is indistinguishable from a first visit.
+
+    pg_stat_statements takes the same view for the same reason -- it normalises
+    comments away entirely, which is why every candidate for a query folds into
+    one row there (`dbadvisor/query_stats.py`).
     """
     if not sql:
         return ""
 
+    _, sql = split_hints(sql)
     templated = _DOLLAR_QUOTED.sub("?", sql)
     templated = _SINGLE_QUOTED.sub("?", templated)
     templated = _NUMBER.sub("?", templated)

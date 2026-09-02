@@ -272,6 +272,35 @@ FIELDS: dict[str, dict] = {
         "env": "INCLUDE_INDEX_PINNING",
         "default": False,
     },
+    "include_extended_toggles": {
+        "type": "bool",
+        "label": "More operator toggles",
+        "group": "Action space",
+        "help": (
+            "Six planner switches beyond the core set: bitmap scans, index-only "
+            "scans, explicit sorts, gather merge, parallel hash, and presorted "
+            "aggregates. Narrow -- each only matters on a plan that already uses "
+            "that node type, and all six were no-ops on the sample four-table "
+            "join. Worth it on query shapes the core set does not reach."
+        ),
+        "env": "INCLUDE_EXTENDED_TOGGLES",
+        "default": False,
+    },
+    "include_cost_model": {
+        "type": "bool",
+        "label": "Cost-model constants",
+        "group": "Action space",
+        "help": (
+            "Re-prices the planner's assumptions rather than forcing a plan: "
+            "parallel_setup_cost and min_parallel_table_scan_size are what "
+            "actually decide whether a parallel plan is considered (the worker "
+            "ceiling only caps it), and seq_page_cost / cpu_tuple_cost describe "
+            "a machine with a slow disk and cheap CPU, which this one is not. "
+            "Measured 7870 -> 6423 on the sample join."
+        ),
+        "env": "INCLUDE_COST_MODEL",
+        "default": False,
+    },
     "adaptive_candidate_budget": {
         "type": "bool",
         "label": "Scale candidates to query cost",

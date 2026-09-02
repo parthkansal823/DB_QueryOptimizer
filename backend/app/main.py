@@ -14,11 +14,17 @@ from app import (
 )
 from app import settings as app_settings
 from app import dbadvisor, hypothetical
+from app.measurement import blocks_verdict, fairness
 from app.advisor import analyze_plan, missing_fk_indexes
+from app.index_advice import (
+    already_uniquely_indexed,
+    covering_opportunities,
+    database_is_c_locale,
+)
 from app.db import get_cursor
 from app.logging_store import log_execution, query_fingerprint
 from app.optimizer.decision_cache import DecisionCache
-from app.optimizer.hints import apply_hint, plan_fingerprint
+from app.optimizer.hints import apply_hint, plan_fingerprint, split_hints
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer import planner
 from app.optimizer.planner import candidate_hints, optimize_and_execute
@@ -112,6 +118,8 @@ def _apply_settings(values: dict) -> None:
     planner.INCLUDE_PARALLEL = values["include_parallel"]
     planner.INCLUDE_ENABLE_SETTINGS = values["include_enable_settings"]
     planner.INCLUDE_INDEX_PINNING = values["include_index_pinning"]
+    planner.INCLUDE_EXTENDED_TOGGLES = values["include_extended_toggles"]
+    planner.INCLUDE_COST_MODEL = values["include_cost_model"]
     planner.ADAPTIVE_CANDIDATE_BUDGET = values["adaptive_candidate_budget"]
     planner.RUNTIME_TIMEOUT_FACTOR = values["runtime_timeout_factor"]
     planner.SHADOW_SAMPLE_RATE = values["shadow_sample_rate"]
@@ -274,8 +282,24 @@ def analyze_query(req: QueryRequest):
     a dev/demo dashboard but is NOT what you'd do in production (there
     you'd only execute the chosen plan). Worth a sentence in your writeup.
     """
+    # A query that arrives already carrying a hint is the second pass of an
+    # obvious workflow: optimise, copy the optimised SQL, paste it back in to
+    # improve it further. Two things have to happen for that to mean anything.
+    #
+    # First, `apply_hint` merges rather than stacks -- pg_hint_plan reads only
+    # the first `/*+ ... */` comment and silently discards the rest, so the old
+    # behaviour threw away the hint the user pasted in.
+    #
+    # Second, the *baseline* has to be the unhinted query. Planning `req.sql` as
+    # it arrived makes the previous pass's chosen plan the thing every candidate
+    # is compared against, and the panel labels it "native" -- so a second pass
+    # would report a speedup measured from an already-optimised plan, and would
+    # keep reporting "no improvement available" once it had found the best one.
+    # Both numbers would be wrong in a way nothing on the page could reveal.
+    incoming_hints, bare_sql = split_hints(req.sql)
+
     with get_cursor() as cur:
-        baseline_plan = get_plan(cur, req.sql)
+        baseline_plan = get_plan(cur, bare_sql)
         tables = baseline_plan["tables_scanned"]
 
         # Full action space: join orders *and* Bao-style operator toggles.
@@ -284,8 +308,12 @@ def analyze_query(req: QueryRequest):
         # look bigger than it is and guarantees a 0% improvement.
         candidate_plans = []
         seen_plans = {plan_fingerprint(baseline_plan)}
-        for hint in candidate_hints(optimizer, baseline_plan, tables):
+        for hint in candidate_hints(optimizer, baseline_plan, tables, cur=cur):
             try:
+                # Merged onto whatever the user pasted in, so a second pass
+                # refines the first hint rather than replacing it. `apply_hint`
+                # keeps both unless they conflict, in which case the newly
+                # chosen one wins -- pg_hint_plan's own last-one-wins rule.
                 plan = get_plan(cur, apply_hint(req.sql, hint))
             except Exception:  # noqa: BLE001 - one bad hint shouldn't fail the request
                 continue
@@ -327,6 +355,31 @@ def analyze_query(req: QueryRequest):
     # /query/analyze executes everything, so it knows the real answer with
     # hindsight, and there is no reason to withhold it just because the model
     # was not confident enough to select it.
+    # The locale decides whether an anchored LIKE needs `text_pattern_ops`, and
+    # the unique-index set stops the advisor recommending an index on a primary
+    # key that already has one. Both are catalog reads; failing either is a
+    # reason to give slightly blunter advice, not to fail the request.
+    try:
+        with get_cursor() as advice_cur:
+            c_locale = database_is_c_locale(advice_cur)
+            already_indexed = already_uniquely_indexed(advice_cur)
+    except Exception:  # noqa: BLE001
+        c_locale, already_indexed = False, set()
+    recommendations = analyze_plan(
+        baseline_plan["raw_plan"], c_locale=c_locale, already_indexed=already_indexed
+    )
+    # Covering-index opportunities need the query's output columns, which only
+    # `EXPLAIN VERBOSE` reports. That is one extra planning round trip -- which
+    # /query/analyze can afford (it already issues around thirty) and
+    # /query/optimize cannot, so this is deliberately only on the analyze path.
+    try:
+        with get_cursor() as verbose_cur:
+            verbose_cur.execute(f"EXPLAIN (FORMAT JSON, VERBOSE) {req.sql}")
+            verbose_plan = verbose_cur.fetchone()[0][0]["Plan"]
+        recommendations += covering_opportunities({"raw_plan": verbose_plan})
+    except Exception:  # noqa: BLE001 - an extra suggestion is not worth a failed request
+        pass
+
     best_measured = None
     if candidate_plans:
         fastest = min(candidate_plans, key=lambda p: p["actual_total_time_ms"])
@@ -346,10 +399,34 @@ def analyze_query(req: QueryRequest):
                 "optimized_cost": fastest["total_cost"],
                 "baseline_est_rows": baseline_plan["raw_plan"].get("Plan Rows"),
                 "baseline_actual_rows": baseline_plan["raw_plan"].get("Actual Rows"),
+                # Whether this speedup is about the plan or about what happened
+                # to be in memory.
+                #
+                # This is the number the dashboard puts in front of people, and
+                # it is a single-run comparison -- exactly the shape of
+                # measurement that once produced a reported 80.5% improvement
+                # that was really 26.0%, because one side read from memory and
+                # the other from disk (docs/WRITEUP.md). The paired design in
+                # experiment.py fixes that over many runs; nothing fixed it
+                # here, and this panel is what most people ever look at.
+                #
+                # `EXPLAIN (ANALYZE, BUFFERS)` was already being collected. The
+                # hit ratios say whether the two sides were comparable, and the
+                # block counts are a second opinion that is stable across runs
+                # where timing is not (measured: 0.0% spread against ~5%).
+                "fairness": fairness(
+                    baseline_plan, fastest, "native", "optimized"
+                ),
+                "work": blocks_verdict(
+                    baseline_plan, fastest, "native", "optimized"
+                ),
             }
 
     return {
         "baseline": baseline_plan,
+        # What the query arrived with, if anything. The baseline above is the
+        # *unhinted* plan whatever the input was, so "native" means native.
+        "incoming_hints": incoming_hints,
         "candidates": candidate_plans,
         "chosen_index": chosen_index,
         "chosen_plan": candidate_plans[chosen_index] if chosen_index is not None else None,
@@ -361,7 +438,10 @@ def analyze_query(req: QueryRequest):
         "best_measured": best_measured,
         # Database-level fixes: hints repair one query, these repair the
         # reason a hint was needed (see app/advisor.py).
-        "recommendations": analyze_plan(baseline_plan["raw_plan"]),
+        # The locale decides whether an anchored LIKE needs `text_pattern_ops`,
+        # and the unique-index set stops the advisor recommending an index on a
+        # primary key that already has one.
+        "recommendations": recommendations,
     }
 
 

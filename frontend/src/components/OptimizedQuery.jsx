@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-export default function OptimizedQuery({ best, decision, candidatesTried }) {
+export default function OptimizedQuery({ best, decision, candidatesTried, incomingHints }) {
   const [copied, setCopied] = useState(false);
 
   if (!best) {
@@ -65,6 +65,31 @@ export default function OptimizedQuery({ best, decision, candidatesTried }) {
           <div className="stat-sub">{best.percent_faster.toFixed(0)}% less time</div>
         </div>
       </div>
+
+      {incomingHints?.length > 0 && (
+        // Pasting this panel's own output back in is the obvious way to keep
+        // improving a query, and it used to throw the previous hint away:
+        // pg_hint_plan reads only the FIRST hint comment and silently ignores
+        // any that follow, so prepending a second one discarded the first.
+        // They are merged into one comment now, and this says what was kept so
+        // the chaining is visible rather than implicit.
+        //
+        // (Written with line comments on purpose: a block comment describing
+        // hint syntax contains the sequence that ends a block comment, which is
+        // how this broke the first time.)
+        <p className="decision-caution">
+          <strong>Building on your hint.</strong> This query already carried{" "}
+          {incomingHints.map((h, i) => (
+            <span key={h}>
+              {i > 0 && ", "}
+              <code>{h}</code>
+            </span>
+          ))}
+          . The baseline below is still the <em>unhinted</em> query, so the speedup is measured
+          from where PostgreSQL started — not from your last pass. The new hint is merged into
+          the same comment rather than added as a second one, which pg_hint_plan would ignore.
+        </p>
+      )}
 
       <div className="sql-block-header">
         <span className="subhead" style={{ margin: 0 }}>Drop-in replacement</span>

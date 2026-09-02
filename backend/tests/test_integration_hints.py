@@ -217,3 +217,144 @@ def test_explain_without_analyze_executes_nothing(cur):
     plan = get_plan(cur, TWO_TABLE_SQL, analyze=False)
     assert plan["actual_total_time_ms"] is None
     assert "Actual Rows" not in plan["raw_plan"]
+
+
+# -- every keyword this project emits is one the server recognises ----------
+#
+# The nastiest failure in this area is not a hint that is applied and does
+# nothing. It is a hint the extension does not recognise at all: pg_hint_plan
+# reports an unknown keyword at **INFO** severity, which the default
+# `client_min_messages` discards, so the statement plans unhinted and looks
+# exactly like a hint that bound and changed nothing.
+#
+# That is how `DisableIndex` got added from the current pg_hint_plan
+# documentation and reached the generator before anyone noticed the extension
+# installed here (1.6.3) has never had it. Documentation is not the authority on
+# what this server accepts; this test is.
+
+
+def _rejected_keywords(cur, hint: str, sql: str) -> list[str]:
+    """Any pg_hint_plan parse complaint raised while planning `sql` with `hint`."""
+    conn = cur.connection
+    cur.execute("SET pg_hint_plan.debug_print = on")
+    cur.execute("SET client_min_messages = 'log'")
+    del conn.notices[:]
+    try:
+        cur.execute("EXPLAIN " + apply_hint(sql, hint))
+        cur.fetchall()
+        return [n for n in conn.notices if "syntax error" in n or "Unrecognized" in n]
+    finally:
+        cur.execute("SET pg_hint_plan.debug_print = off")
+        cur.execute("SET client_min_messages = 'notice'")
+
+
+def test_every_generated_candidate_is_a_keyword_this_server_knows(cur):
+    """
+    Generate the whole action space with every family switched on, and assert
+    the server parses all of it.
+
+    This is the guard that would have caught `DisableIndex` immediately, and it
+    catches the next one for free -- a pg_hint_plan downgrade, a keyword renamed
+    upstream, or a family added from documentation for a version this server is
+    not running.
+    """
+    tables = ["o", "u", "oi", "p"]
+    join_graph = {"o": ["u", "oi"], "u": ["o"], "oi": ["o", "p"], "p": ["oi"]}
+    candidates = generate_candidates(
+        tables,
+        join_graph=join_graph,
+        include_join_methods=True,
+        include_tuning=True,
+        include_bushy=True,
+        include_scan_methods=True,
+        include_negative_scans=True,
+        include_negative_joins=True,
+        include_memoize=True,
+        include_parallel=True,
+        include_enable_settings=True,
+        table_indexes={"o": ["orders_pkey"], "u": ["users_pkey"]},
+    )
+    assert candidates
+
+    rejected = {}
+    for candidate in candidates:
+        complaints = _rejected_keywords(cur, candidate, FOUR_TABLE_SQL)
+        if complaints:
+            rejected[candidate] = complaints[0].strip()
+    assert not rejected, f"pg_hint_plan does not recognise: {rejected}"
+
+
+def test_disable_index_is_not_in_the_action_space(cur):
+    """
+    The keyword this server rejects, pinned from both directions: the generator
+    still produces it (the technique is real and it exists in newer
+    pg_hint_plan), and `generate_candidates` still refuses to emit it.
+
+    If a pg_hint_plan upgrade makes this test's first assertion fail, that is
+    the signal to add an `include_disable_index` flag -- not to delete the test.
+    """
+    from app.optimizer.hints import generate_disable_index_candidates
+
+    hint = generate_disable_index_candidates({"u": ["users_pkey"]})[0]
+    assert _rejected_keywords(cur, hint, FOUR_TABLE_SQL), (
+        "pg_hint_plan now accepts DisableIndex -- wire the family in"
+    )
+
+    everything = generate_candidates(
+        ["o", "u", "oi", "p"],
+        join_graph={"o": ["u", "oi"], "u": ["o"], "oi": ["o", "p"], "p": ["oi"]},
+        include_bushy=True,
+        include_scan_methods=True,
+        include_negative_scans=True,
+        include_negative_joins=True,
+        include_memoize=True,
+        include_parallel=True,
+        include_enable_settings=True,
+        table_indexes={"u": ["users_pkey"]},
+    )
+    assert not any("DisableIndex" in c for c in everything)
+
+
+# -- the alias rule ---------------------------------------------------------
+
+
+def test_a_hint_naming_the_relation_instead_of_the_alias_does_nothing(cur):
+    """
+    The silent 4.4x miss, pinned.
+
+    `FROM order_items oi` makes the relation `oi` as far as pg_hint_plan is
+    concerned. `Parallel(order_items 4 hard)` is not an error and not a warning
+    -- it is discarded, and the plan comes back byte-identical to the baseline.
+    Measured on this schema: the aliased form planned at 1774, the relation-name
+    form at 7870, the same cost as no hint at all.
+    """
+    baseline = get_plan(cur, FOUR_TABLE_SQL, analyze=False)
+    by_alias = get_plan(
+        cur, apply_hint(FOUR_TABLE_SQL, "/*+ Parallel(oi 4 hard) */"), analyze=False
+    )
+    by_relation = get_plan(
+        cur,
+        apply_hint(FOUR_TABLE_SQL, "/*+ Parallel(order_items 4 hard) */"),
+        analyze=False,
+    )
+    assert by_relation["total_cost"] == baseline["total_cost"]
+    assert by_alias["total_cost"] != baseline["total_cost"]
+
+
+def test_catalog_indexes_are_keyed_the_way_a_hint_needs_them(cur):
+    """
+    `indexes_by_alias` reads the catalog and rekeys it through the baseline
+    plan's own alias mapping, so the pinning family cannot reproduce the bug
+    above.
+    """
+    from app.optimizer.catalog import index_map, indexes_by_alias, reset_cache
+
+    reset_cache()
+    baseline = get_plan(cur, FOUR_TABLE_SQL, analyze=False)
+    by_alias = indexes_by_alias(baseline.get("scan_relations"), index_map(cur))
+
+    assert by_alias, "no indexes found for a query over four indexed tables"
+    # Aliases, not relation names: the query says `FROM orders o`.
+    assert "o" in by_alias
+    assert "orders" not in by_alias
+    assert "orders_pkey" in by_alias["o"]

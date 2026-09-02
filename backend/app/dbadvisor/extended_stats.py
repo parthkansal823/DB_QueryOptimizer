@@ -111,6 +111,16 @@ def _qerror(estimated: float, actual: float) -> float:
     return max(estimated / actual, actual / estimated)
 
 
+# Node types whose reported actuals are not an estimate of anything.
+#
+# BitmapAnd and BitmapOr "always report their actual row counts as zero, due to
+# implementation limitations" (PostgreSQL manual, 14.1.3 Caveats). Comparing an
+# estimate against a hardcoded zero produces an arbitrarily large q-error that
+# says nothing about the planner, and since this function takes the worst value
+# over the whole tree, one such node is enough to decide the entire measurement.
+_ROWS_NOT_MEANINGFUL = frozenset({"BitmapAnd", "BitmapOr"})
+
+
 def _plan_qerror(cur, sql: str) -> float | None:
     """
     The worst row-estimate error anywhere in the plan.
@@ -125,6 +135,10 @@ def _plan_qerror(cur, sql: str) -> float | None:
     are applied and where their selectivities are multiplied together. Taking
     the worst over the whole tree finds it without having to know which node
     shape the planner chose.
+
+    Taking the worst over the whole tree also means every node has to be a node
+    where the comparison is meaningful, and three kinds are not. See
+    `_ROWS_NOT_MEANINGFUL`, the loops note below, and the `Limit` skip.
     """
     cur.execute(f"EXPLAIN (FORMAT JSON, ANALYZE) {sql}")
     row = cur.fetchone()
@@ -132,17 +146,34 @@ def _plan_qerror(cur, sql: str) -> float | None:
         return None
 
     worst = 1.0
-    stack = [row[0][0]["Plan"]]
+    # Carry a flag for "somewhere above this node there is a Limit", because a
+    # stopped-early subtree reports actuals that were never meant to be
+    # complete: the manual notes the child's cost and row count are printed "as
+    # though it were run to completion", while the Limit stopped it short. The
+    # gap looks exactly like an overestimate and is not one.
+    stack = [(row[0][0]["Plan"], False)]
     while stack:
-        node = stack.pop()
-        # `Actual Rows` is per loop; multiply back out so a node executed 100
-        # times is compared against what it actually produced in total.
-        loops = float(node.get("Actual Loops") or 1)
-        worst = max(
-            worst,
-            _qerror(node.get("Plan Rows"), (node.get("Actual Rows") or 0) * loops),
-        )
-        stack.extend(node.get("Plans", []))
+        node, under_limit = stack.pop()
+        node_type = node.get("Node Type", "")
+
+        if not under_limit and node_type not in _ROWS_NOT_MEANINGFUL:
+            # Both sides per-execution. `Actual Rows` is an average over
+            # `Actual Loops` and `Plan Rows` is the estimate for one execution,
+            # so they compare directly -- multiplying only the actual side by
+            # the loop count (which this did) manufactures a q-error of exactly
+            # `loops` on every correctly-estimated node. Measured on this
+            # database: an Index Only Scan estimated at 1 row, returning 1 row,
+            # executed 124931 times, reported a q-error of 124931. Being the
+            # worst in the tree, that one artifact then *was* the measurement
+            # for any probe whose plan contained a nested loop.
+            #
+            # `optimizer/cardinality.py::scan_nodes_with_actuals` found and
+            # fixed this same bug; this copy never got the fix.
+            worst = max(worst, _qerror(node.get("Plan Rows"), node.get("Actual Rows")))
+
+        below_limit = under_limit or node_type == "Limit"
+        for child in node.get("Plans", []):
+            stack.append((child, below_limit))
     return worst
 
 
@@ -265,19 +296,80 @@ def _stats_name(table: str, columns: list[str]) -> str:
     return "lqo_stx_" + table + "_" + "_".join(columns)
 
 
-def _definition(table: str, columns: list[str], name: str | None = None) -> str:
-    """
-    The statement a user would run to keep this.
+# What the measurement actually validates.
+#
+# `_probe_query` builds `WHERE left = %s AND right = %s` -- pure equality with
+# sampled values. So the before/after q-error this module reports is evidence
+# about **`dependencies`** and nothing else. `ndistinct` and `mcv` were being
+# requested alongside it on the same recommendation, which reads as though the
+# measurement covered them.
+#
+# It does not, and the manual is specific about when each is worth its cost
+# (14.2.2, 69.2):
+#
+#   dependencies  Equality clauses only, and it assumes the values are
+#                 compatible: `city = 'San Francisco' AND zip = '90210'` is
+#                 estimated as if it matched, when the true answer is zero rows.
+#                 Cheapest of the three -- it stores coefficients, not values.
+#
+#   ndistinct     Group counts for `GROUP BY a, b`. "It's advisable to create
+#                 ndistinct statistics objects only on combinations of columns
+#                 that are actually used for grouping... Otherwise the ANALYZE
+#                 cycles are just wasted."
+#
+#   mcv           Stores the actual value combinations, so it handles range
+#                 clauses and knows which combinations are impossible -- the two
+#                 things dependencies cannot do. Also the most expensive, "in
+#                 terms of building the statistics in ANALYZE, storage and
+#                 planning time".
+#
+# So the recommendation is `dependencies` -- the kind the number is about -- and
+# the other two are offered separately with the condition that would justify
+# them. Bundling all three and reporting one measurement overstates the
+# evidence.
+STATISTICS_KINDS = {
+    "dependencies": (
+        "measured above. Fixes equality predicates on correlated columns, which "
+        "is the failure this whole project is built around."
+    ),
+    "ndistinct": (
+        "add only if these columns are also grouped together (`GROUP BY "
+        "{columns}`). It fixes the estimated number of groups; on columns nobody "
+        "groups by, the ANALYZE cycles are wasted."
+    ),
+    "mcv": (
+        "add if the queries use range clauses on these columns, or if impossible "
+        "combinations occur -- `dependencies` assumes the values are compatible "
+        "and estimates a contradictory pair as though it matched. Stores the "
+        "actual values, so it costs more in ANALYZE, storage and planning time."
+    ),
+}
 
-    All three kinds are requested. `dependencies` is the one that fixes the
-    multiplied-selectivity problem this project is about; `ndistinct` fixes
-    group-by and join estimates over the same columns; `mcv` covers the case
-    where the dependency holds for common values but not in general. They are
-    stored together and cost one ANALYZE between them.
-    """
+
+def _definition(
+    table: str,
+    columns: list[str],
+    name: str | None = None,
+    kinds: tuple[str, ...] = ("dependencies",),
+) -> str:
+    """The statement a user would run to keep this. See `STATISTICS_KINDS`."""
     quoted = ", ".join(f'"{c}"' for c in columns)
     label = name or _stats_name(table, columns)
-    return f'CREATE STATISTICS "{label}" (dependencies, ndistinct, mcv) ON {quoted} FROM "{table}"'
+    kind_list = ", ".join(kinds)
+    return f'CREATE STATISTICS "{label}" ({kind_list}) ON {quoted} FROM "{table}"'
+
+
+def optional_kinds(table: str, columns: list[str]) -> list[dict]:
+    """The two kinds the equality probe says nothing about, and when to add them."""
+    column_list = ", ".join(columns)
+    return [
+        {
+            "kind": kind,
+            "when": STATISTICS_KINDS[kind].format(columns=column_list),
+            "ddl": _definition(table, columns, kinds=("dependencies", kind)),
+        }
+        for kind in ("ndistinct", "mcv")
+    ]
 
 
 def recommend(
@@ -305,3 +397,75 @@ def recommend(
         found.append(result)
 
     return sorted(found, key=lambda r: -(r.get("qerror_improvement") or 0.0))
+
+
+# Correlation read straight out of the catalog, no probe query required.
+#
+# `pg_mcv_list_items` exposes two numbers per entry: `frequency`, the fraction
+# of rows actually holding that combination of values, and `base_frequency`,
+# "the frequency computed from per-column statistics, as if there were no
+# multi-column statistics" (manual, 69.2.3). Their ratio is precisely the factor
+# by which the independence assumption was wrong -- the underestimate this whole
+# project exists to attack, measured directly rather than inferred from the gap
+# between two EXPLAIN ANALYZE runs.
+#
+# The manual's own example: {Washington, DC} occurs at 0.35% while per-column
+# statistics predict 0.0027%, "resulting in two orders of magnitude
+# under-estimates."
+#
+# This does not replace `evaluate_pair`. That runs before the object exists and
+# has to use a probe; this runs after and says whether the object the advisor
+# recommended actually captured anything. Without it the advisor recommends DDL
+# and never finds out.
+MCV_CORRELATION_SQL = """
+    SELECT m.values, m.frequency, m.base_frequency
+    FROM pg_statistic_ext s
+    JOIN pg_statistic_ext_data d ON d.stxoid = s.oid,
+         pg_mcv_list_items(d.stxdmcv) m
+    WHERE s.stxname = %s
+      AND m.base_frequency > 0
+    ORDER BY m.frequency / m.base_frequency DESC
+    LIMIT %s
+"""
+
+
+def measured_correlation(cur, stats_name: str, limit: int = 5) -> dict | None:
+    """
+    How wrong per-column statistics were, for the values where it mattered most.
+
+    Returns None when the object has no MCV list yet -- either it was created
+    without the `mcv` kind, or `ANALYZE` has not run since. That second case is
+    worth surfacing on its own: `CREATE STATISTICS` only creates a catalog entry,
+    and until ANALYZE runs the object contains nothing and changes no plan.
+    """
+    cur.execute(MCV_CORRELATION_SQL, (stats_name, limit))
+    rows = cur.fetchall()
+    if not rows:
+        return None
+
+    items = [
+        {
+            "values": list(values),
+            "actual_frequency": float(frequency),
+            "independent_estimate": float(base_frequency),
+            "underestimate_factor": float(frequency) / float(base_frequency),
+        }
+        for values, frequency, base_frequency in rows
+    ]
+    worst = max(item["underestimate_factor"] for item in items)
+    return {
+        "statistics_object": stats_name,
+        "worst_underestimate_factor": worst,
+        "items": items,
+        "note": (
+            f"per-column statistics underestimated the most correlated value "
+            f"combination by {worst:.1f}x. That factor is the error the planner "
+            "was making before this object existed, read from the MCV list rather "
+            "than inferred from timing two queries."
+        ),
+    }
+
+
+def verify_recommendation(cur, table: str, columns: list[str]) -> dict | None:
+    """Read back the correlation captured by the object this module recommends."""
+    return measured_correlation(cur, _stats_name(table, columns))

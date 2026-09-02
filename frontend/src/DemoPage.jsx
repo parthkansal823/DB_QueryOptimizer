@@ -208,6 +208,7 @@ export default function DemoPage() {
               best={result.best_measured}
               decision={result.decision}
               candidatesTried={result.candidates?.length}
+              incomingHints={result.incoming_hints}
             />
           </section>
 

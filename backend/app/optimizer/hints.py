@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import re
 import random
 
 
@@ -405,12 +406,37 @@ def generate_index_candidates(
 # plan the workload as if it had already been dropped, and compare. An index
 # recommended for deletion on statistics alone is a recommendation that cannot
 # be checked before it is irreversible.
+#
+# **Not supported by the pg_hint_plan on this server, and this is why the family
+# is not wired into `generate_candidates`.** The keyword is in the current
+# pg_hint_plan documentation; the extension installed here is 1.6.3, which does
+# not have it:
+#
+#     INFO:  pg_hint_plan: hint syntax error at or near "DisableIndex(u users_pkey)"
+#     DETAIL:  Unrecognized hint keyword "DisableIndex".
+#
+# Note the severity: **INFO**. With the default `client_min_messages` that
+# message is never delivered, so an unrecognised keyword is not an error, not a
+# warning, and not a failure -- the query simply plans unhinted, exactly as if
+# the hint had been applied and changed nothing. That is the same silent failure
+# as docs/WRITEUP.md 2.0, and it is why every keyword added to this module was
+# checked against the running extension with `debug_print` on rather than
+# against the documentation. All 31 others were accepted; this one was not.
+#
+# Kept, because the technique is sound and the keyword exists upstream. Turning
+# it on is a matter of upgrading pg_hint_plan and adding an
+# `include_disable_index` flag -- not of changing anything here.
 def generate_disable_index_candidates(
     table_indexes: dict[str, list[str]] | None,
     max_tables: int = 2,
     max_indexes_per_table: int = 3,
 ) -> list[str]:
-    """`DisableIndex(t idx)`: plan as if this index had already been dropped."""
+    """
+    `DisableIndex(t idx)`: plan as if this index had already been dropped.
+
+    Requires a pg_hint_plan newer than 1.6.3 -- see the note above. Deliberately
+    left out of `generate_candidates`.
+    """
     if not table_indexes:
         return []
     candidates: list[str] = []
@@ -541,9 +567,143 @@ def generate_parallel_candidates(
     return candidates
 
 
+# A leading `/*+ ... */` block, and the directives inside one.
+_LEADING_HINT = re.compile(r"\A\s*/\*\+(?P<body>.*?)\*/\s*", re.DOTALL)
+# Directive names are matched by regex; their arguments are scanned, because a
+# regex cannot count parentheses to arbitrary depth.
+#
+# A bushy join hint nests two levels -- `Leading(((a b) (c d)))` -- and a pattern
+# allowing only one, `\((?:[^()]|\([^()]*\))*\)`, matches nothing at all on it.
+# The directive was then dropped from the merge, so chaining a second pass onto
+# a bushy result silently discarded the bushy plan. Same failure class as
+# everything else in this file: a hint that quietly stops existing.
+_DIRECTIVE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _find_directives(text: str) -> list[str]:
+    """Every `Name(...)` in `text`, with parentheses balanced to any depth."""
+    found: list[str] = []
+    position = 0
+    while True:
+        match = _DIRECTIVE_NAME.search(text, position)
+        if not match:
+            return found
+        cursor = match.end()
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != "(":
+            # A bare word -- not a directive. Step past it and keep looking.
+            position = match.end()
+            continue
+
+        depth = 0
+        end = cursor
+        for end in range(cursor, len(text)):
+            if text[end] == "(":
+                depth += 1
+            elif text[end] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+        if depth != 0:
+            # Unbalanced: not something to hand to the planner.
+            return found
+        found.append(match.group() + text[cursor : end + 1])
+        position = end + 1
+
+
+def split_hints(query: str) -> tuple[list[str], str]:
+    """
+    Peel every leading hint comment off `query`, returning (directives, sql).
+
+    Handles a *stack* of them, not just one, because a stack is exactly what a
+    user produces by feeding this system its own output back in.
+    """
+    directives: list[str] = []
+    remaining = query
+    while True:
+        match = _LEADING_HINT.match(remaining)
+        if not match:
+            return directives, remaining
+        directives.extend(_find_directives(match.group("body")))
+        remaining = remaining[match.end():]
+
+
+def _directive_key(directive: str) -> str:
+    """
+    What a later directive replaces.
+
+    `SeqScan(a)` and `SeqScan(b)` are different instructions and both survive; a
+    second `Leading(...)` replaces the first, because a query has one join order;
+    `Set(work_mem ...)` keys on the GUC, so a new value for the same setting
+    wins and a different setting is kept alongside.
+    """
+    name, _, rest = directive.partition("(")
+    name = name.strip()
+    arguments = rest[:-1].split()
+    if name == "Set":
+        return f"Set:{arguments[0] if arguments else ''}"
+    if name == "Leading":
+        return "Leading"
+    return f"{name}:{' '.join(arguments)}"
+
+
 def apply_hint(query: str, hint: str) -> str:
-    """Prepend a pg_hint_plan hint comment to a SQL query."""
-    return f"{hint}\n{query}"
+    """
+    Attach a hint to a query, **merging** with any hint it already carries.
+
+    This used to prepend unconditionally, and that is wrong in the one workflow
+    users actually reach for: optimise a query, copy the optimised SQL, paste it
+    back in to improve it further. The output already carries a hint comment, so
+    prepending produces two:
+
+        /*+ Set(enable_nestloop off) */
+        /*+ Leading(u o) */
+        SELECT ...
+
+    pg_hint_plan reads **only the first** such comment and discards the rest --
+    not as an error, not as a warning, and not in the "not used" or "error hint"
+    sections of its own debug output. The second comment simply does not exist as
+    far as it is concerned.
+
+    Measured on this server with `pg_hint_plan.debug_print = on`, one query, one
+    join, cost against `used hint:`:
+
+        native                          5332.3
+        /*+ Leading(u o) */             5332.3   used: Leading(u o)
+        /*+ Set(enable_hashjoin off) */ 14365.1  used: Set(enable_hashjoin off)
+
+        A then B, stacked               5332.3   used: Leading(u o)
+        B then A, stacked               14365.1  used: Set(enable_hashjoin off)
+        merged into one comment         14365.1  used: Leading(u o) Set(...)
+
+    Whichever comment comes first wins outright. So on the second pass the
+    optimizer's new hint was prepended, applied, and **the hint the user pasted
+    in was silently thrown away** -- the second pass did not build on the first,
+    it replaced it. Same silence as docs/WRITEUP.md 2.0, reached by an obvious
+    user action rather than by a configuration mistake.
+
+    (An earlier reading of this said pg_hint_plan rejected the whole thing and
+    planned natively. That was wrong: `error hint:` is an empty section header in
+    the debug output, printed on every statement, not a message about this one.)
+
+    Merging into a single comment is the form pg_hint_plan documents and
+    accepts: `/*+ Leading(u o) Set(enable_nestloop off) */` is one hint carrying
+    two directives. Later directives win on conflict, which matches
+    pg_hint_plan's own last-one-wins rule for a repeated hint type -- so the
+    newly chosen candidate overrides whatever the query arrived with, and
+    stacking passes converges instead of accumulating contradictions.
+    """
+    existing, bare = split_hints(query)
+    incoming = _find_directives(hint)
+    if not existing and not incoming:
+        return bare
+
+    merged: dict[str, str] = {}
+    for directive in existing + incoming:
+        merged[_directive_key(directive)] = directive
+
+    return "/*+ " + " ".join(merged.values()) + " */\n" + bare
 
 
 def corrected_cardinality_hint(rows_hints: list[str]) -> str | None:
@@ -610,6 +770,8 @@ def generate_candidates(
     include_memoize: bool = False,
     include_parallel: bool = False,
     include_enable_settings: bool = False,
+    include_extended_toggles: bool = False,
+    include_cost_model: bool = False,
     join_graph: dict[str, list[str]] | None = None,
     table_indexes: dict[str, list[str]] | None = None,
 ) -> list[str]:
@@ -646,6 +808,10 @@ def generate_candidates(
         candidates += generate_parallel_candidates(tables)
     if include_enable_settings:
         candidates += generate_enable_candidates()
+    if include_extended_toggles:
+        candidates += generate_extended_hint_sets()
+    if include_cost_model:
+        candidates += generate_cost_model_candidates()
     # Index pinning is last because it is the only family that can be empty for
     # a reason outside the query -- no catalog map was supplied -- and the
     # budget in `planner.py` truncates from the end.
@@ -768,6 +934,50 @@ TUNING_SETTINGS: tuple[tuple[str, str], ...] = (
 # `work_mem` grows with the partition count, so memory use can climb sharply.
 # That is an argument for measuring them per query, which is what this project
 # is for, rather than for setting them globally.
+# Nine of the server's 21 `enable_*` GUCs appear in `HINT_SETS`. These are the
+# rest that can change a plan on a non-partitioned schema, kept separate because
+# each one is another planning round trip and most are narrow.
+#
+# `enable_partition_pruning`, `enable_async_append` and `enable_tidscan` are
+# deliberately absent: pruning and async append need partitions or foreign
+# tables, and a TID scan needs a `ctid` predicate. On this workload all three
+# reproduce the native plan, and a candidate that cannot differ is a round trip
+# spent to learn nothing.
+EXTENDED_HINT_SETS: tuple[tuple[str, ...], ...] = (
+    # The middle ground between sequential and index scan. Banning it forces the
+    # planner to commit either way, which is exactly the choice it makes badly
+    # when a correlated predicate makes an index look less selective than it is.
+    ("enable_bitmapscan",),
+    # Distinct from `enable_indexscan`: this bans only the index-*only* variant,
+    # isolating the visibility-map decision from the access-method decision.
+    ("enable_indexonlyscan",),
+    # Discourages explicit Sort nodes, pushing the planner toward index order or
+    # hash aggregation instead.
+    ("enable_sort",),
+    # Gather Merge preserves each worker's sort order at a cost; plain Gather
+    # reads in whatever order is convenient and destroys it.
+    ("enable_gathermerge",),
+    # Without parallel hash every worker builds its own full copy of the hash
+    # table -- a large memory difference on a big build side, and the reason
+    # `NestLoop`/`MergeJoin` candidates and parallel candidates interact badly
+    # (manual 15.3.2: inner sides of nested loop and merge join are never
+    # parallel).
+    ("enable_parallel_hash",),
+    # Affects ORDER BY / DISTINCT inside aggregate calls.
+    ("enable_presorted_aggregate",),
+)
+
+
+def generate_extended_hint_sets(
+    hint_sets: tuple[tuple[str, ...], ...] = EXTENDED_HINT_SETS,
+) -> list[str]:
+    """Operator toggles beyond the Bao-style core set."""
+    return [
+        "/*+ " + " ".join(f"Set({flag} off)" for flag in flags) + " */"
+        for flags in hint_sets
+    ]
+
+
 ENABLE_SETTINGS: tuple[tuple[str, ...], ...] = (
     ("enable_partitionwise_join",),
     ("enable_partitionwise_aggregate",),
@@ -789,6 +999,85 @@ def generate_tuning_candidates(
     settings: tuple[tuple[str, str], ...] = TUNING_SETTINGS,
 ) -> list[str]:
     """One candidate per resource / cost-model setting worth trying."""
+    return [f"/*+ Set({guc} {value}) */" for guc, value in settings]
+
+
+# -- Cost-model constants ---------------------------------------------------
+#
+# `TUNING_SETTINGS` varies `random_page_cost` and a parallel worker *ceiling*.
+# Neither is what actually decides whether a parallel plan is considered, and
+# the manual is direct about it (15.3.5):
+#
+#     "If a query that is expected to do so does not produce a parallel plan,
+#      you can try reducing parallel_setup_cost or parallel_tuple_cost."
+#
+# `max_parallel_workers_per_gather` is a ceiling; these two are the price the
+# planner pays to go near it. And below `min_parallel_table_scan_size` (8MB) it
+# will not consider a parallel scan at all, whatever the ceiling says -- which
+# is why `Set(max_parallel_workers_per_gather 4)` is a measured no-op on a small
+# table and `Parallel(t 4 hard)` is not.
+#
+# The rest are the cost model itself. Their defaults describe a machine with a
+# seek-heavy spinning disk and cheap CPU; this one has 32GB of RAM, an SSD, and
+# a database that fits entirely in memory, so every default here is describing
+# the wrong machine:
+#
+#   effective_cache_size  the planner's guess at how much is already cached.
+#                         4GB default; the value below is 12GB in 8kB blocks.
+#                         Higher makes index scans look cheaper.
+#   cpu_tuple_cost        0.01 default. Raising it relative to the page costs
+#                         models a machine where CPU, not I/O, is the limit.
+#   seq_page_cost         only the *ratio* to random_page_cost matters, so
+#                         lowering both says "I/O barely costs anything", which
+#                         on a fully-cached database is true.
+#
+# The manual's warning applies and is worth keeping in view: "there is no
+# well-defined method for determining ideal values for the cost variables...
+# changing them on the basis of just a few experiments is very risky." Which is
+# an argument for measuring them per query -- this project's entire premise --
+# rather than for setting them globally on a hunch.
+#
+# Every setting below was checked against the running server for acceptance;
+# see `test_integration_hints.py`.
+COST_MODEL_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("parallel_setup_cost", "0"),
+    ("parallel_tuple_cost", "0.01"),
+    ("min_parallel_table_scan_size", "0"),
+    ("effective_cache_size", "1572864"),
+    ("cpu_tuple_cost", "0.05"),
+    ("seq_page_cost", "0.5"),
+    # The partner to `join_collapse_limit` in TUNING_SETTINGS. That one flattens
+    # explicit JOINs; this one flattens *subqueries*, which is the case a query
+    # built from a view actually hits. Lowering it stops the planner pulling a
+    # subquery into the parent, trading plan quality for a much smaller search.
+    ("from_collapse_limit", "1"),
+)
+
+# `plan_cache_mode` is deliberately NOT in the tuple above, and the reason is
+# worth writing down because it is not obvious from the GUC list.
+#
+# It chooses between a generic plan (built once, parameter values ignored,
+# reused) and a custom plan (rebuilt per execution). That is the same question
+# `app/query_template.py` answers when it gives `city='Mumbai'` and
+# `city='London'` a single `query_id` -- both assume one plan serves every
+# parameter value -- so it looks like an obvious candidate.
+#
+# But the manual says it "is considered when a cached plan is to be executed,
+# not when it is prepared", and this project plans ad-hoc statements: there is
+# no cached plan for it to apply to. Measured: accepted by pg_hint_plan, and the
+# cost is unchanged at 7870.2 for both values. A candidate that cannot differ is
+# a planning round trip spent to learn nothing -- the same reason
+# `enable_partition_pruning` is out of EXTENDED_HINT_SETS.
+#
+# Where it *would* belong is a diagnostic: if a template's members disagree
+# about the best plan, `force_custom_plan` is the fix, and that is a finding
+# about the workload rather than a candidate for one query.
+
+
+def generate_cost_model_candidates(
+    settings: tuple[tuple[str, str], ...] = COST_MODEL_SETTINGS,
+) -> list[str]:
+    """One candidate per cost-model constant worth re-pricing."""
     return [f"/*+ Set({guc} {value}) */" for guc, value in settings]
 
 

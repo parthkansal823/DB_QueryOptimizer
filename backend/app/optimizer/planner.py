@@ -33,12 +33,14 @@ path outright.
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import time
 
 from app.optimizer.catalog import index_map, indexes_by_alias
 from app.optimizer.decision_cache import STOCHASTIC_POLICIES
+from app.optimizer.prefilter import prefilter
 from app.optimizer.hints import (
     apply_hint,
     corrected_cardinality_hint,
@@ -46,6 +48,8 @@ from app.optimizer.hints import (
     plan_fingerprint,
 )
 from app.plan_extractor import get_plan
+
+log = logging.getLogger("lqo.planner")
 
 
 # Learned `Rows(...)` corrections as an extra candidate. On the synthetic
@@ -123,6 +127,13 @@ INCLUDE_MEMOIZE = os.getenv("INCLUDE_MEMOIZE", "0") != "0"
 INCLUDE_PARALLEL = os.getenv("INCLUDE_PARALLEL", "0") != "0"
 INCLUDE_ENABLE_SETTINGS = os.getenv("INCLUDE_ENABLE_SETTINGS", "0") != "0"
 INCLUDE_INDEX_PINNING = os.getenv("INCLUDE_INDEX_PINNING", "0") != "0"
+# Six more `enable_*` toggles, and the cost-model constants the manual names as
+# what actually gates a parallel plan (`parallel_setup_cost`,
+# `min_parallel_table_scan_size`) rather than the ceiling TUNING_SETTINGS varies.
+# Measured on the four-table join: seq_page_cost 7870.2 -> 6422.7,
+# min_parallel_table_scan_size -> 6637.5, parallel_setup_cost -> 6870.2.
+INCLUDE_EXTENDED_TOGGLES = os.getenv("INCLUDE_EXTENDED_TOGGLES", "0") != "0"
+INCLUDE_COST_MODEL = os.getenv("INCLUDE_COST_MODEL", "0") != "0"
 
 # Scale the candidate count to how much the query is worth optimising.
 #
@@ -237,12 +248,33 @@ def candidate_hints(
         include_memoize=INCLUDE_MEMOIZE,
         include_parallel=INCLUDE_PARALLEL,
         include_enable_settings=INCLUDE_ENABLE_SETTINGS,
+        include_extended_toggles=INCLUDE_EXTENDED_TOGGLES,
+        include_cost_model=INCLUDE_COST_MODEL,
         # Keyed by the query's own aliases, not by relation name: pg_hint_plan
         # silently ignores an index hint that names the table when the query
         # gave it an alias, which is indistinguishable from a hint that applied
         # and did nothing. See `optimizer/catalog.py`.
         table_indexes=_index_candidates_for(cur, baseline_plan),
     )
+
+    # Drop candidates the baseline plan proves cannot change anything, before
+    # paying an EXPLAIN round trip to discover it.
+    #
+    # Profiling put 75% of the optimizer's latency in those round trips, so the
+    # cheapest available improvement is issuing fewer of them -- and the
+    # dedup in `plan_query` only catches a duplicate *after* it has been
+    # planned. `optimizer/prefilter.py` carries the argument for why each rule
+    # is sound; every rule was checked against the live planner across three
+    # query shapes with zero candidates wrongly dropped.
+    #
+    # Nothing the model has been trained to score is lost: a filtered candidate
+    # is one that returns the native plan, which `plan_fingerprint` would have
+    # discarded a moment later anyway.
+    hints, filtered = prefilter(hints, baseline_plan)
+    if filtered:
+        log.debug(
+            "prefilter dropped %d/%d candidates", len(filtered), len(filtered) + len(hints)
+        )
 
     corrector = getattr(optimizer, "join_corrector", None)
     if corrector is not None and ENABLE_ROWS_CORRECTION:

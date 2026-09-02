@@ -50,9 +50,22 @@ statistics object only inside a savepoint it always rolls back, in order to
 measure.
 """
 
-from app.dbadvisor import extended_stats, indexes, server_config, tables
+from app.dbadvisor import (
+    extended_stats, indexes, maintenance, observability, physical, query_stats,
+    server_config, tables,
+)
 
-__all__ = ["extended_stats", "indexes", "report", "server_config", "tables"]
+__all__ = [
+    "extended_stats",
+    "indexes",
+    "maintenance",
+    "observability",
+    "physical",
+    "query_stats",
+    "report",
+    "server_config",
+    "tables",
+]
 
 
 def report(cur, schema: str = "public", include_statistics: bool = True) -> dict:
@@ -67,6 +80,10 @@ def report(cur, schema: str = "public", include_statistics: bool = True) -> dict
     findings = {
         "indexes": indexes.report(cur, schema),
         "tables": tables.report(cur, schema),
+        "maintenance": maintenance.report(cur, schema),
+        "workload": query_stats.report(cur, schema),
+        "physical": physical.report(cur, schema),
+        "observability": observability.report(cur),
         "server_config": server_config.report(cur),
     }
     if include_statistics:

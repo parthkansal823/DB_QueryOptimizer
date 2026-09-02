@@ -544,3 +544,973 @@ produce these combinations and pay a planning round trip to learn they are bad.
 Everything tagged PG17+/PG18 (A9, A10, C1, C2, C3, C5) is blocked on a server
 upgrade. The `Disabled: true` flag (C2) is the one worth upgrading *for* — it
 turns "the candidate did nothing" from an inference into a fact.
+
+---
+
+# Part D — From Chapter 11 (Indexes)
+
+Everything here is about what `app/dbadvisor/indexes.py` recommends, and how.
+
+## D1. `CREATE INDEX CONCURRENTLY` — PG16 ✓
+
+**The advisor currently emits DDL that takes an outage.**
+
+§11.1: *"By default, PostgreSQL allows reads to occur on the table in parallel
+with index creation, but writes (INSERT, UPDATE, DELETE) are blocked until the
+index build is finished. In production environments this is often
+unacceptable."*
+
+Every `CREATE INDEX` the dashboard hands the user blocks writes on the table for
+the duration of the build. On `order_items` (500,000 rows) that is not
+instantaneous. The advisor's own text says *"Check them before you run them:
+`CREATE INDEX` takes locks and disk space"* — which is honest but leaves the
+user to discover `CONCURRENTLY` themselves.
+
+The fix is a keyword. The caveats worth stating alongside it: it takes two table
+scans so it is slower overall, it cannot run inside a transaction block, and a
+failed build leaves an **invalid** index behind that must be dropped. That is
+still the right default for a recommendation aimed at a live database.
+
+## D2. Anchored `LIKE` needs `text_pattern_ops` off the C locale — PG16 ✓
+
+§11.2.1: a B-tree index can serve `col LIKE 'foo%'` or `col ~ '^foo'` — *"However,
+if your database does not use the C locale you will need to create the index with
+a special operator class."*
+
+So `CREATE INDEX ON t (name)` does **not** accelerate `WHERE name LIKE 'Volt%'`
+on this database; `CREATE INDEX ON t (name text_pattern_ops)` does. A prefix
+match is a common predicate and the advisor would currently recommend an index
+that cannot be used for it.
+
+Detection: an anchored LIKE/regex in the query text, plus `SHOW lc_collate` not
+being `C`. Both are one line.
+
+Unanchored (`LIKE '%bar%'`) is not indexable by B-tree at all — that is the
+`pg_trgm` case in B9.
+
+## D3. Partial indexes do not work with parameterized queries — PG16 ✓
+
+§11.8, and it lands directly on this project: *"Matching takes place at query
+planning time, not at run time. As a result, parameterized query clauses do not
+work with a partial index. For example a prepared query with a parameter might
+specify `x < ?` which will never imply `x < 2`."*
+
+`app/query_template.py` normalizes literals into parameters so that
+`city='Mumbai'` and `city='London'` share a `query_id`. A partial index
+recommendation derived from the *template* can therefore be unusable by the
+actual query, and would show as an index with zero scans — which
+`dbadvisor/indexes.py` would then report as unused and recommend dropping.
+
+Two recommendations chasing each other. Any partial-index suggestion has to be
+derived from a literal predicate and labelled as only applying when the value is
+a constant.
+
+## D4. Do not recommend a fan of partial indexes — PG16 ✓
+
+§11.8, Example 11.4, stated bluntly: a set of non-overlapping partial indexes
+(`WHERE category = 1`, `= 2`, …) is *"a bad idea"* — *"the system does not
+understand the relationship among the partial indexes, and will laboriously test
+each one to see if it's applicable."* One multicolumn `(category, data)` index is
+almost always better, and past a certain size the answer is partitioning.
+
+A guard for the advisor: if it is about to recommend more than one partial index
+on the same table differing only in the predicate constant, recommend the
+multicolumn index instead.
+
+## D5. Covering indexes with `INCLUDE` — PG16 ✓
+
+§11.9. `CREATE INDEX tab_x_y ON tab(x) INCLUDE (y)` puts `y` in the index as
+payload so `SELECT y FROM tab WHERE x = 'key'` never touches the heap.
+
+This is what makes the new `IndexOnlyScan` family (family 5 in `famalies.txt`)
+usable rather than theoretical. Detection is mechanical: the query's selected
+columns are a small superset of an existing index's key columns.
+
+Constraints to encode: B-tree, GiST and SP-GiST only; expressions are not
+allowed as included columns; the uniqueness of a `UNIQUE ... INCLUDE` index
+applies to the key columns only; and wide payload columns bloat the index and
+can exceed the index tuple size limit outright.
+
+And the condition that decides whether it pays at all — *"there is little point
+in including payload columns unless the table changes slowly enough that an
+index-only scan is likely to not need to access the heap"* — is exactly the
+visibility-map question in B7. The two findings should be produced together: a
+covering index on a table whose visibility map is stale buys nothing.
+
+## D6. Index sort order — PG16 ✓
+
+§11.4. `ORDER BY x ASC, y DESC` cannot be satisfied by any plain two-column
+index; it needs `CREATE INDEX ON t (x ASC, y DESC)`. Also `NULLS FIRST` /
+`NULLS LAST`.
+
+Narrow, but entirely invisible to an advisor that only proposes column lists —
+and the failure is a full sort the index was supposed to remove.
+
+Related, from §11.4: `ORDER BY ... LIMIT n` is the case where a matching index
+wins biggest, because an explicit sort has to process everything to find the
+first n rows.
+
+## D7. What an unused index actually costs — PG16 ✓
+
+§11.1: *"Indexes can also prevent the creation of heap-only tuples."*
+
+The advisor reports unused indexes as wasted disk. The larger cost is that every
+index on a table blocks the HOT-update optimization for updates touching its
+columns, forcing a new index entry and more bloat. That strengthens the
+recommendation and is a better reason to give than size.
+
+Also §11.6: *"There's no need to manually create indexes on unique columns;
+doing so would just duplicate the automatically-created index."* A primary key
+already has a unique B-tree — a recommendation to index a PK column is always
+wrong, and worth an explicit guard.
+
+## D8. Index types beyond B-tree, from §11.2 — PG16 ✓
+
+Expands B9 with what the manual says each is actually for:
+
+| type | for | notes |
+|---|---|---|
+| B-tree | `< <= = >= >`, `BETWEEN`, `IN`, `IS NULL`, anchored `LIKE`, sorted output | the only type that can be `UNIQUE`, and the only one that produces sorted output |
+| Hash | `=` only | no range, no sort, no uniqueness |
+| GiST | geometric, ranges, nearest-neighbour `ORDER BY location <-> point` | supports index-only scans for some operator classes only |
+| SP-GiST | quadtrees, k-d trees, radix trees | also does nearest-neighbour |
+| GIN | arrays, jsonb, full-text — values with multiple components | **cannot** do index-only scans: entries hold only part of the value |
+| BRIN | columns correlated with physical row order | tiny; `pages_per_range` is the tuning knob |
+
+The nearest-neighbour case is worth noting because no amount of B-tree advice
+helps an `ORDER BY distance LIMIT 10` query, and that is a shape an advisor
+should be able to name.
+
+## D9. Multicolumn index guidance — PG16 ✓
+
+§11.3: *"equality constraints on leading columns, plus any inequality constraint
+on the first column that does not have an equality constraint, will always be
+used to limit the portion of the index that is scanned."* Column order is the
+whole ballgame, and the advisor proposes column *sets*.
+
+Also: *"Indexes with more than three columns are unlikely to be helpful unless
+the usage of the table is extremely stylized"* — a cap worth enforcing.
+
+And §11.5 on the alternative: separate indexes on `x` and `y` can be combined
+with `BitmapAnd`, which loses index ordering (so a sort is still needed) and
+costs an extra scan. Multicolumn versus index-combination is a genuine trade-off
+the advisor currently does not present.
+
+---
+
+# Part E — From Chapter 24 (Routine Maintenance)
+
+## E1. `VACUUM` is a plan-quality tool, not just housekeeping — PG16 ✓
+
+§24.1.1 lists four reasons `VACUUM` has to run, and **two of them are about the
+planner**:
+
+2. update the statistics the planner uses;
+3. **update the visibility map, which speeds up index-only scans**;
+
+(the other two being space reuse and transaction-ID wraparound).
+
+`dbadvisor/tables.py` currently frames stale statistics and bloat as separate
+findings. They have a single cause and a single fix, and reason 3 is the one
+nothing in the project mentions at all: an `IndexOnlyScan` candidate (family 5 in
+`famalies.txt`) can only pay on a table whose visibility map is current, and
+`VACUUM` is what makes it current. That turns "this query could use an
+index-only scan but will not" into an actionable finding rather than a curiosity.
+
+## E2. The advisor's `VACUUM FULL` recommendation understates the cost — PG16 ✓
+
+§24.1.2 and its Tip: `VACUUM FULL`, `CLUSTER`, and the table-rewriting `ALTER
+TABLE` variants all take an **ACCESS EXCLUSIVE** lock and *"temporarily use extra
+disk space approximately equal to the size of the table, since the old copies of
+the table and indexes cannot be released until the new ones are complete."*
+
+So the recommendation is: take the table fully offline, and have a spare copy's
+worth of disk free. Both belong in the finding text.
+
+The manual's own preference is stronger than the advisor's: *"administrators
+should strive to use standard VACUUM and avoid VACUUM FULL"*, and *"the usual
+goal of routine vacuuming is to do standard VACUUMs often enough to avoid needing
+VACUUM FULL."* If bloat is high enough to want `VACUUM FULL`, the real finding is
+usually that autovacuum is not keeping up — which is a settings fix, not a
+one-off outage.
+
+Also §24.1.2: a table whose entire contents are periodically deleted should use
+`TRUNCATE`, which reclaims the space immediately with no `VACUUM` at all.
+
+## E3. Autovacuum never ANALYZEs three things — PG16 ✓
+
+Three explicit gaps in §24.1.3, each one a table whose statistics silently rot:
+
+- **Partitioned tables.** *"Tuples changed in partitions and inheritance children
+  do not trigger analyze on the parent table. If the parent table is empty or
+  rarely changed, it may never be processed by autovacuum."*
+- **Inheritance parents** — same mechanism.
+- **Foreign tables** — *"the autovacuum daemon does not issue ANALYZE commands
+  for foreign tables, since it has no means of determining how often that might
+  be useful."*
+
+A parent table that has never been analyzed is a planner with no idea what it is
+looking at, on the largest queries in the system. Detection is one query against
+`pg_stat_user_tables.last_analyze IS NULL` restricted to `relkind = 'p'` and
+foreign tables — cheap, and a class of finding `dbadvisor` produces none of
+today.
+
+## E4. Expression statistics for function selectivity — PG16 ✓
+
+§24.1.3, Tip: *"by default there is limited information available about the
+selectivity of functions. However, if you create a statistics object or an
+expression index that uses a function call, useful statistics will be gathered
+about the function."*
+
+A **third** use of `CREATE STATISTICS` the project does not exploit.
+`dbadvisor/extended_stats.py` proposes multi-column objects for correlated
+columns; this is a single-expression object for a predicate the planner is
+guessing at:
+
+```sql
+CREATE STATISTICS ON lower(email) FROM users;
+```
+
+`WHERE lower(email) = ...` currently gets a hardcoded default selectivity. This
+makes it measured. Detection is the same pattern as the expression-index
+recommendation in D8, and the two should be offered together — the statistics
+object is the cheaper half and does not carry write-time cost.
+
+## E5. Transaction-ID wraparound — PG16 ✓
+
+§24.1.5. Nothing in this project looks at it, and it is the one database problem
+here that ends in the server refusing to accept writes:
+
+```sql
+SELECT c.oid::regclass AS table_name,
+       greatest(age(c.relfrozenxid), age(t.relfrozenxid)) AS age
+FROM pg_class c
+LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind IN ('r', 'm')
+ORDER BY age DESC;
+
+SELECT datname, age(datfrozenxid) FROM pg_database;
+```
+
+Against `autovacuum_freeze_max_age` (default 200 million) this is a percentage
+of the way to a forced anti-wraparound vacuum; against 2 billion it is a
+percentage of the way to an outage. The escalation is documented: a `WARNING` at
+40 million transactions remaining, then `ERROR: database is not accepting
+commands` at 3 million.
+
+A single-row check with a clear threshold and a clear fix — squarely what
+`dbadvisor/server_config.py` is for.
+
+## E6. Freeze settings for append-only tables — PG16 ✓
+
+§24.1.5: for **static tables, including tables that receive inserts but no
+updates or deletes**, there is no space to reclaim, so the only thing forcing an
+autovacuum is the freeze horizon. Raising `autovacuum_freeze_max_age` (or
+lowering `vacuum_freeze_min_age`) maximises the interval between those forced
+scans.
+
+`orders` and `order_items` in this schema are append-only, and 500,000 rows is
+large enough for a full-table freeze scan to be noticeable — including, if it
+lands mid-benchmark, as unexplained variance in a measurement.
+
+The cost is bounded and stated: `pg_xact` grows to about half a gigabyte at the
+maximum setting of two billion, `pg_commit_ts` to about 20GB if
+`track_commit_timestamp` is on. The manual's own advice: *"If this is trivial
+compared to your total database size, setting autovacuum_freeze_max_age to its
+maximum allowed value is recommended."*
+
+Related knobs worth surfacing: `vacuum_freeze_table_age` (capped at 0.95 ×
+`autovacuum_freeze_max_age`), and `vacuum_max_eager_freeze_failure_rate` for
+eager freezing.
+
+## E7. `log_autovacuum_min_duration` — PG16 ✓
+
+Default 10 minutes, so most autovacuum activity is invisible. Setting it lower
+records what ran, on which table, and how long it took — which is how you find
+out that a benchmark run overlapped an aggressive vacuum on `order_items`.
+
+`VACUUM VERBOSE` reports the same detail on demand, including how
+`relfrozenxid` advanced and how many pages were newly frozen.
+
+---
+
+# Reading status
+
+| chapter / section | pages | state |
+|---|---|---|
+| 11. Indexes | 455–471 | read in full → Part D |
+| 14. Performance Tips | 529–556 | read in full → Parts A, C |
+| 15. Parallel Query | 556–562 | read in full → C7, C8 |
+| 19.7 Query Planning (all GUCs) | 671–679 | read in full → A1–A7 |
+| 24. Routine Maintenance | 789–801 | read in full → Part E |
+| F.3 `auto_explain` | 2828–2831 | read in full → B3 |
+| F.25 `pg_buffercache` | 2932–2937 | read → B6 |
+| F.29 `pg_overexplain` | 2953–2955 | read in full → C3 |
+| F.30 `pg_prewarm` | 2955–2957 | read in full → B5 |
+| F.32 `pg_stat_statements` | 2959–2969 | read → B2 |
+| F.36 `pg_visibility` | 2982–2984 | read in full → B7 |
+| 27. Monitoring (`pg_stat_*` views) | 838–902 | **not yet read** |
+| 5.12 Partitioning | ~100–112 | **not yet read** (B10 is from §19.7 only) |
+| 30. JIT | 946–950 | **not yet read** (A2 covers `jit_above_cost`) |
+| 61. GEQO internals | — | **not yet read** (A7 is from §19.7) |
+| 69. How the Planner Uses Statistics | — | **not yet read** |
+| VI. Reference (EXPLAIN, VACUUM, CREATE INDEX/STATISTICS) | 1604+ | **not yet read** |
+
+The unread chapters most likely to add something: **27** (the exact `pg_stat_*`
+columns behind every `dbadvisor` finding), **69** (how selectivity is actually
+computed, which is what `optimizer/cardinality.py` is modelling), and the
+**EXPLAIN reference page** (options this project does not pass).
+
+The rest of the 3156 pages — client interfaces, procedural languages,
+replication, data types, SQL syntax reference — was swept for planner-relevant
+material and has none that bears on this project.
+
+---
+
+# Implementation status
+
+## Built and verified
+
+| item | where | evidence |
+|---|---|---|
+| **C6** — q-error artifacts | `dbadvisor/extended_stats.py::_plan_qerror` | A nested-loop probe reported **124931**; true worst was **2.0**. Three guards added: no loop multiplication, skip `BitmapAnd`/`BitmapOr`, skip subtrees under a `Limit`. `test_qerror_artifacts.py` |
+| **A1** — six more operator toggles | `hints.EXTENDED_HINT_SETS` | All accepted by the server; all no-ops on the sample join, which is why they are opt-in |
+| **A1** — partitionwise (on-toggles) | `hints.ENABLE_SETTINGS` | The only two planner features that ship off, so no `off` toggle could reach them |
+| **A2** — cost-model constants | `hints.COST_MODEL_SETTINGS` | `seq_page_cost 0.5` → **6422.7** from 7870.2; `min_parallel_table_scan_size 0` → 6637.5; `parallel_setup_cost 0` → 6870.2 |
+| **A6** — `from_collapse_limit` | `hints.COST_MODEL_SETTINGS` | Accepted; no-op on a query with no subqueries |
+| **B7 / E1** — visibility map | `dbadvisor/maintenance.py::index_only_scan_readiness` | Fired on a never-vacuumed 500-page table at 0% all-visible |
+| **E3** — autovacuum ANALYZE gaps | `dbadvisor/maintenance.py::never_analyzed` | Fired on a real partitioned parent |
+| **E5** — XID wraparound | `dbadvisor/maintenance.py::wraparound_risk` | Thresholds unit-tested; cannot be forced live without 120M transactions |
+| **D7** — HOT-update pressure | `dbadvisor/maintenance.py::hot_update_pressure` | 15,000 updates to an indexed column → **0 HOT updates** |
+| **C7** — parallel shortfall | `plan_extractor.py::parallel_shortfall` | With `max_parallel_workers = 0`: 4 planned, **0 launched**, correctly flagged |
+| **§69.2.3** — measured correlation | `dbadvisor/extended_stats.py::measured_correlation` | `('SG','Singapore')` occurs **22×** more often than per-column statistics predict — read from `pg_mcv_list_items`, no probe query |
+
+## Corrections to earlier entries in this document
+
+- **D1 was wrong.** `advisor.py:162` and `:209` already emit `CREATE INDEX
+  CONCURRENTLY`. The only plain `CREATE INDEX` left is in `hypothetical.py`,
+  where the index is never actually built — correct as it stands.
+- **C6 named the wrong file.** `optimizer/cardinality.py` was never affected: it
+  gates on `"Relation Name" in plan`, which excludes `BitmapAnd`/`BitmapOr`, and
+  its comment shows the loops bug was already found and fixed there. The live bug
+  was the *second copy* in `dbadvisor/extended_stats.py`, which never got that
+  fix.
+- **A3 (`plan_cache_mode`) turned out to be unusable as a candidate.** Accepted
+  by pg_hint_plan, and measured at exactly the baseline cost for both values: it
+  "is considered when a cached plan is to be executed, not when it is prepared",
+  and this project plans ad-hoc statements. Removed from the candidate tuple with
+  the reason recorded in `hints.py`. It still belongs as a *diagnostic* for
+  templates whose members disagree about the best plan.
+
+## New findings from Chapters 69 and 27, not in Parts A–E
+
+### F1. The exact selectivity formulas — §69.1
+
+Worth having written down, because `optimizer/cardinality.py` is learning a
+correction to these and they are not guesses:
+
+| clause | estimate |
+|---|---|
+| range (`x < k`) | histogram bucket interpolation, MCVs excluded from the histogram |
+| equality, value in MCV list | `most_common_freqs[i]` — exact |
+| equality, value not in MCV | `(1 - sum(mcv_freqs)) / (n_distinct - num_mcv)` |
+| `A AND B` | `sel(A) × sel(B)` — **the independence assumption** |
+| join `a.x = b.x` | `(1 - null_frac1)(1 - null_frac2) / max(rows1, rows2)` |
+
+Two consequences:
+
+- An equality predicate on a **non-MCV** value depends entirely on `n_distinct`,
+  which is sampled and famously unreliable. That is the concrete mechanism
+  behind B1 (raising `default_statistics_target` / per-column `SET STATISTICS`) —
+  more MCVs means more predicates land in the exact branch instead of the
+  divided-guess branch.
+- `n_distinct` is **negative when it is a fraction** of the row count (`-1` means
+  unique, `-0.568` means 56.8% distinct). Any code reading `pg_stats.n_distinct`
+  as a count is wrong on exactly the columns that matter most.
+
+### F2. Join size is estimated before any join plan exists — §69.1
+
+*"the join relation size is estimated before any particular join plan has been
+considered."*
+
+This is the justification for how `optimizer/cardinality.py` keys its `Rows()`
+corrections — by **relation set**, not by plan node. The estimate is a property
+of which tables are joined, not of how. It also explains why `EXPLAIN` can show
+`50 × 1` at a nested loop and a join estimate that is not their product.
+
+### F3. Which kind of extended statistics to recommend — §69.2
+
+`dbadvisor/extended_stats.py` requests all three kinds on every recommendation.
+Defensible, but the manual gives each a distinct trigger and a distinct cost:
+
+| kind | fixes | limits |
+|---|---|---|
+| `dependencies` | `A AND B` equality underestimates | **equality only**; assumes the values are compatible, so `city='SF' AND zip='90210'` is estimated as if it matched |
+| `ndistinct` | `GROUP BY a, b` group-count estimates | only worth it on columns actually grouped — "otherwise the ANALYZE cycles are just wasted" |
+| `mcv` | both, plus **range clauses**, and knows which value combinations are impossible | most expensive in ANALYZE, storage **and planning time** |
+
+The two things `mcv` does that `dependencies` cannot: `a = 1 AND b = 10` on
+perfectly-correlated columns is correctly estimated at ~0 rows, and `a <= 49 AND
+b > 49` is handled at all.
+
+### F4. Statistics silently unavailable on a permissions boundary — §69.3
+
+If the current user lacks `SELECT` on the table or columns and the operator is
+not `LEAKPROOF`, *"the selectivity estimator will behave as if no statistics are
+available"*, and *"There is no direct feedback about that, except that the plan
+might be suboptimal."*
+
+A silent, permissions-dependent degradation to default estimates — worth a
+`diagnostics.py` check whenever the optimizer runs as a different role than the
+application.
+
+### F5. `idx_scan` is not a count of queries — §27.2.20
+
+Three corrections to how `dbadvisor/indexes.py` reads index usage:
+
+- *"Index scans may sometimes perform multiple index searches per execution.
+  Each index search increments `idx_scan`"* — an `IN (...)` list, an
+  `OR`-to-array rewrite, or a skip scan all inflate it. `idx_scan` is not
+  comparable to a query count.
+- A bitmap scan increments `idx_tup_read` for the index and `idx_tup_fetch` for
+  the **table**, but **not** `idx_tup_fetch` for the index. So a heavily-used
+  index can show `idx_tup_fetch = 0`.
+- *"The optimizer also accesses indexes to check for supplied constants whose
+  values are outside the recorded range"* — the planner itself touches indexes,
+  so a nonzero counter does not prove a query used one.
+
+`last_idx_scan` and `last_seq_scan` (PG16+) are the better signal: a timestamp
+survives reasoning that a counter reset destroys.
+
+### F6. `pg_stat_all_tables` columns worth using — §27.2.19
+
+- `n_mod_since_analyze` — the exact ANALYZE-staleness number (`tables.py` uses
+  this already).
+- `n_ins_since_vacuum` — insert-only tables need vacuum for the visibility map
+  and the freeze horizon, tracked separately from updates and deletes.
+- `n_tup_newpage_upd` — updates whose new version landed on a different heap
+  page. Distinguishes "an indexed column changed" from "the page was full", and
+  the second is fixed by lowering `fillfactor`.
+- `total_vacuum_time` / `total_autovacuum_time` / `total_analyze_time` — how
+  much wall-clock maintenance is actually costing, which is the missing half of
+  every "just run VACUUM" recommendation.
+
+### F7. The statistics views report asynchronously — measured
+
+`pg_stat_user_tables` showed `(0, 0, 0)` for a table that had just taken 15,000
+committed updates in the same session, and `pg_stat_clear_snapshot()` did not
+change it. A second connection a moment later showed `(15000, 0, 10000)`.
+
+Any advisor check that reads a counter it has just caused will read zero. That
+is why `index_only_scan_readiness` sizes tables from `pg_class.relpages` rather
+than `n_live_tup` — one is written by VACUUM, the other by the cumulative
+statistics system, and only the first is immediately visible.
+
+---
+
+# Would C++ help? — measured, not argued
+
+The question came up, and it is answerable rather than a matter of taste.
+Profiling one four-table query through the full serving path, 20 runs, median:
+
+| stage | ms | share | what is actually running |
+|---|---|---|---|
+| 1. baseline `EXPLAIN` | 0.57 | 2% | PostgreSQL + libpq |
+| 2. generate candidate hints | 0.66 | 3% | **Python** |
+| 3. `EXPLAIN` × 31 candidates | 19.13 | **75%** | PostgreSQL + libpq |
+| 4. features + model inference | 5.16 | 20% | Python → **LightGBM (already C++)** |
+| **total** | **25.52** | | 32 round trips to PostgreSQL |
+
+**77% of the time is PostgreSQL planning and network round trips.** No language
+change touches that number — it is the server doing work in C, plus 32 trips
+across a socket.
+
+Of the 23% that is Python-side, most is stage 4, and the model there is
+LightGBM, whose inference is already compiled C++ behind a thin binding. The
+part that is genuinely interpreted Python is the plan-tree walk that builds the
+feature vector, plus stage 2's string assembly at **0.66 ms — 3% of the total**.
+
+So the ceiling on rewriting every line of Python in this project is somewhere
+under 23%, and realistically far less. Meanwhile the 75% sits untouched.
+
+## Where the real win is, and it is not a language
+
+**Fewer round trips.** 31 candidates produced **12 distinct plans** — 19 of the
+32 trips bought a plan already seen. `plan_fingerprint` deduplicates, but only
+*after* paying for the EXPLAIN. Predicting which hints collapse to the same plan
+before planning them is worth more than any rewrite, and it is arithmetic, not a
+language.
+
+**Or move inside the planner.** The version of this that eliminates round trips
+entirely is a PostgreSQL extension using the `planner_hook`, the way
+`pg_hint_plan` itself works and the way Bao's production form works — choose
+among plans while already inside the planner, with the paths in hand and no
+socket involved.
+
+That is worth knowing precisely because it is the one place a compiled language
+genuinely enters: **PostgreSQL's extension API is C, not C++.** Extensions are
+built against `postgres.h` with C linkage, and the backend is not exception-safe
+in the way C++ assumes — `elog(ERROR)` unwinds with `longjmp`, which walks
+straight past C++ destructors. Extensions that do use C++ have to wrap every
+call at a C boundary and catch everything before it crosses back.
+
+So "use C++" and "make this fast" point in different directions. The fast path is
+a C extension, and the honest current answer is that the Python is not what is
+slow.
+
+## What is worth doing first, in order
+
+1. **Predict duplicate plans before planning them.** 19 of 32 round trips here
+   produced nothing. Pure algorithm.
+2. **Tighten the adaptive budget.** `ADAPTIVE_CANDIDATE_BUDGET` already scales
+   candidates to estimated cost; 31 candidates for a query that plans in 0.57 ms
+   is the case it exists to prevent, and it did not.
+3. **Cache aggressively.** `decision_cache.py` exists for repeat traffic and
+   costs nothing on a hit.
+4. **Then, if it still matters, the planner hook** — in C.
+
+Rewriting the 3% is the last thing on this list, not the first.
+
+---
+
+# Round two — round trips and index type
+
+## The prefilter: dropping candidates before paying for them
+
+Profiling put **75%** of the optimizer's latency in EXPLAIN round trips, and
+found 31 candidates producing 12 distinct plans. `plan_fingerprint` catches
+duplicates *after* the round trip. `optimizer/prefilter.py` catches a subset of
+them before.
+
+**The argument.** PostgreSQL does not remove a disabled operator; it prices it at
+`disable_cost` and lets the arithmetic bury it. So if the baseline plan contains
+no node of the type being disabled, its cost is unchanged by the ban — and it
+was already the cheapest, so it stays the cheapest. `Set(enable_mergejoin off)`
+on a plan with no Merge Join cannot do anything.
+
+**Verified, not argued.** A harness planned every candidate the prefilter
+dropped, across three query shapes, and compared against the baseline
+fingerprint and cost. **It caught two real bugs in the first version:**
+
+1. `Set(enable_nestloop off) Set(enable_mergejoin off)` was dropped because the
+   *second* flag was a no-op — while the first took a 7870 plan to 12234.
+   Reasoning per-flag and returning on the first match is wrong: a combination
+   candidate is precisely where the flags are meant to interact.
+2. `Set(enable_hashagg off)` was dropped on a plan that was hash aggregating.
+   EXPLAIN's **JSON** writes `"Node Type": "Aggregate"` with a separate
+   `"Strategy": "Hashed"`; `HashAggregate` is the *text* format's name and
+   matches nothing. Measured 492.05 against a real 1970.82.
+
+A third edge case came from the unit tests: an **empty** plan was being read as
+"contains no Merge Join", so a stub baseline stripped candidates on no
+information at all. Absence of evidence is not evidence of absence, and
+`candidate_hints` is reachable from paths that pass a stored or synthetic plan.
+
+After the fixes: **PASS, 0 wrongly dropped** on all three shapes.
+
+**Effect on the serving path**, same query, before and after:
+
+| | before | after |
+|---|---|---|
+| round trips | 32 | **28** |
+| total | 25.52 ms | **21.01 ms** |
+| distinct plans found | 12 | **12** |
+
+17.7% faster with no loss of coverage. Savings are 8–9% on joins and **31%** on
+a single-table aggregate, where most operator toggles cannot apply.
+
+**What it does not reach.** 56 of the 83 kept candidates on the four-table join
+were still duplicates. Those are join-order collapses, and whether a different
+`Leading()` produces the same plan is exactly what the planner is for — there is
+no cheap way to know without asking. The prefilter takes the provable slice and
+leaves the rest honestly on the table.
+
+Two existing tests broke, both asserting `served == generated`. They were
+rewritten to assert something stronger: every candidate missing from the served
+space must come with a proof from `is_provable_noop`. A family that vanished for
+any other reason still fails the test.
+
+## Index type: the advisor was recommending indexes the planner ignores
+
+`advisor.py` found a wasteful sequential scan and recommended `CREATE INDEX ON t
+(col)` for every predicate shape. For three shapes that index gets built, costs
+disk and write amplification, and is **never used** — so the next advisor run
+reports it as unused and suggests dropping it. Two recommendations chasing each
+other.
+
+Measured against the live planner, building both the old and new recommendation:
+
+| predicate | naive `CREATE INDEX ON t (col)` | recommended |
+|---|---|---|
+| `name LIKE 'Volt%'` | Seq Scan — **ignored** | Index Scan on `text_pattern_ops` |
+| `name LIKE '%olti%'` | Seq Scan — **ignored** | Bitmap Heap Scan, trigram GIN |
+| `lower(city) = 'x'` | Seq Scan — **ignored** | Bitmap Heap Scan, expression index |
+
+Why each (§11.2.1, §11.7):
+
+- **Anchored pattern.** A B-tree can serve it *"However, if your database does
+  not use the C locale you will need to create the index with a special operator
+  class."* This database is `en_US.utf8`. `SHOW lc_collate` errors on PG16, so
+  the locale is read from `pg_database.datcollate`.
+- **Unanchored pattern, and all ILIKE.** No prefix to descend on — not indexable
+  by B-tree at all. This was a category the advisor had no answer for; the answer
+  is `pg_trgm`.
+- **Expression predicate.** An index on `city` cannot serve `lower(city)`. The
+  recommendation also offers the cheaper half from §24.1.3: `CREATE STATISTICS ON
+  lower(city)` fixes the planner's selectivity with no write-time cost.
+
+Every specialised recommendation now carries its cost — GIN is larger and slower
+to write, `text_pattern_ops` does not serve `ORDER BY`, expression indexes are
+recomputed per write.
+
+**And one thing no longer recommended at all.** §11.6: *"There's no need to
+manually create indexes on unique columns; doing so would just duplicate the
+automatically-created index."* Single columns already carrying a unique index —
+every primary key — are now excluded.
+
+## Unused-index findings argue from write cost, not disk
+
+`last_idx_scan` (PG16+) is a timestamp, and survives reasoning a reset counter
+destroys: "never scanned while the table was read 37,383,054 times" is a
+different claim from "the counter reads zero".
+
+And the cost is stated properly. §11.1: *"Indexes can also prevent the creation
+of heap-only tuples."* Where `n_tup_upd` against `n_tup_hot_upd` shows most
+updates are not heap-only, the finding now says how many writes had to touch
+every index — a recurring cost, against disk which is a fixed one.
+
+## Two more corrections to this document
+
+- **E2 was wrong.** Nothing in the project recommends `VACUUM FULL`;
+  `tables.py` already emits the non-blocking `VACUUM (ANALYZE)`.
+- **D1 was wrong** (already noted above): `CREATE INDEX CONCURRENTLY` was
+  already in use.
+
+Both were written from reading the manual rather than the code. The pattern is
+worth naming: a backlog entry derived from documentation is a hypothesis, and
+three of them so far have not survived contact with the repository.
+
+---
+
+# Round three — pg_stat_statements, and a limitation worth more than the feature
+
+## Enabled
+
+`docker-compose.yml` now preloads `pg_stat_statements` alongside `pg_hint_plan`,
+with `compute_query_id=on` and `track_io_timing=on`. `CREATE EXTENSION` alone
+gives a view with nothing in it -- the module hooks the executor, so it has to be
+preloaded, which is a server restart.
+
+`backend/app/dbadvisor/query_stats.py` reads five things out of it:
+planning time separated from execution, per-query cache hit ratio, spilling,
+JIT cost, and runtime variance -- all across the whole workload rather than the
+one query someone pasted in, at no measurement cost.
+
+## The limitation that turned out to matter more
+
+**`pg_stat_statements` cannot see this project's action space.** Measured
+directly on the running server:
+
+```
+/*+ Set(enable_hashjoin off) */  SELECT count(*) FROM orders o JOIN users u ...
+/*+ Set(enable_mergejoin off) */ SELECT count(*) FROM orders o JOIN users u ...
+                                 SELECT count(*) FROM orders o JOIN users u ...
+```
+
+Three statements → **one row**, `calls = 3`, one `queryid`, and a stored `query`
+text showing whichever hint arrived first.
+
+It normalises to the post-parse-analysis tree, and a `pg_hint_plan` hint is a
+*comment*. So every candidate the optimizer plans for a query folds into a single
+entry, and three readings mean something other than they appear to:
+
+- `stddev_exec_time` is variance **across plans**, not instability of one plan.
+- `temp_blks_written` is the **sum over every candidate**. Checked: the
+  four-table query reports thousands of temp blocks in this view and writes
+  **zero** when planned natively under `EXPLAIN (ANALYZE, BUFFERS)`. Reporting
+  "this query spills" would have been wrong.
+- The stored query text is actively misleading about what was measured.
+
+Every finding now states its attribution, and the dashboard panel repeats the
+caveat. The findings are still worth having -- "some plan for this query wrote
+118,088 temp blocks" is a real thing to know about the action space -- but only
+with the qualifier attached.
+
+Also flagged rather than filtered: `from_optimizer_sweep`. On a dashboard-driven
+database the candidate sweep *is* most of the workload, and hiding that would
+misrepresent the panel.
+
+## Version mismatches, three and four
+
+The PG18 manual documents `parallel_workers_to_launch` /
+`parallel_workers_launched`, which would have answered §15.2's worker-shortfall
+question straight from the view. **Not in `pg_stat_statements` 1.10.** And
+`shared_blk_read_time` is `blk_read_time` here.
+
+The column list is read from `information_schema` so a rename degrades instead of
+erroring, and `plan_extractor.parallel_shortfall` answers the worker question
+from the plan instead.
+
+That makes four documentation-versus-installed mismatches: `DisableIndex`,
+`pg_overexplain`, and these two. Same lesson each time — the manual describes a
+version, the server is the authority.
+
+## Dashboard
+
+`DatabaseAdvisor.jsx` now renders two sections that had no UI at all:
+**Maintenance** (never-analyzed parents, wraparound risk, HOT-update pressure,
+visibility-map readiness) and **Across the whole workload**. Nine new component
+tests, including one asserting the panel explains *why* it is empty when
+`pg_stat_statements` is absent -- an empty panel and "not installed" are
+different answers.
+
+## Totals
+
+814 backend tests, 82 frontend tests, all passing. Live `/dbadvisor` returns
+five sections.
+
+## Still open
+
+- **D5** covering indexes with `INCLUDE` -- needs the query's select list, which
+  `analyze_plan` does not currently receive.
+- **B8** `pgstattuple` for measured rather than estimated bloat.
+- **B9** BRIN for physically-correlated columns (trigram and expression indexes
+  are done).
+- **F3** picking `dependencies` vs `mcv` vs `ndistinct` per trigger rather than
+  requesting all three.
+- **F4** the statistics-permissions diagnostic from §69.3.
+- **A7** pinning `geqo_seed` in the benchmark harness.
+- The remaining ~67% of duplicate candidates, which are join-order collapses and
+  need a cheaper way to predict than planning them.
+
+---
+
+# Round four — the rest of the list
+
+Everything from the "still open" list, except the one item that is genuinely
+hard. Each verified against the live server rather than reasoned about.
+
+## B9 — BRIN, and the check that stops it being wrong
+
+`dbadvisor/physical.py::brin_candidates`. §11.2.6: BRIN is *"most effective for
+columns whose values are well-correlated with the physical order of the table
+rows"*, and `pg_stats.correlation` is exactly the statistic that decides it.
+
+**On this project's own schema it correctly proposes nothing.**
+`orders.created_at` has a correlation of **0.002** — the seed script inserts
+random dates, not ordered ones — so BRIN would prune nothing here.
+
+Proved it fires when it should, on a 1.2M-row append-only table with an ordered
+timestamp, and measured the size claim rather than repeating it:
+
+| index on `ts` | size |
+|---|---|
+| BRIN | **24 kB** |
+| B-tree | **26 MB** |
+
+A factor of 1,100. The note also states what BRIN cannot do: no sorted output,
+range/equality predicates only, and the advantage disappears once rows arrive
+out of order.
+
+## B8 — measured bloat instead of estimated
+
+`physical.measured_bloat` uses `pgstattuple`, falling back to
+`pgstattuple_approx` above 1GB because the exact form reads every page.
+
+`tables.py` estimates dead space from `pg_stat_user_tables` counters. The action
+on the other side of that number is `VACUUM FULL` or `CLUSTER` — an
+`ACCESS EXCLUSIVE` lock plus a spare copy's worth of disk. An outage recommended
+from an estimate is worth one exact read first. Live: `orders` 0.0% dead, 0.32%
+free.
+
+## F3 — the statistics kind now matches the measurement
+
+`_probe_query` builds `WHERE left = %s AND right = %s`. Pure equality. So the
+before/after q-error `extended_stats` reports is evidence about **`dependencies`
+and nothing else** — while the recommendation asked for all three kinds.
+
+Now it recommends `dependencies`, and offers the other two separately with the
+condition that would justify each:
+
+- **`ndistinct`** — only if the columns are also grouped together. The manual:
+  on columns nobody groups by, *"the ANALYZE cycles are just wasted."*
+- **`mcv`** — if the queries use range clauses, or if impossible combinations
+  occur. `dependencies` assumes the values are compatible, so
+  `city = 'San Francisco' AND zip = '90210'` is estimated as though it matched.
+  Costs more in ANALYZE, storage *and* planning time.
+
+## F4 — statistics the planner is not allowed to read
+
+`server_config.statistics_visibility`. §69.3: if the role lacks `SELECT` and the
+operator is not `LEAKPROOF`, *"the selectivity estimator will behave as if no
+statistics are available... There is no direct feedback about that, except that
+the plan might be suboptimal."*
+
+Worse here than in most systems: every estimate the model learns to correct
+assumes the planner *read* the statistics. Under a restricted role it silently
+did not, and the whole system would be compensating for a permissions boundary
+rather than a correlated column. Returns nothing for an owner or superuser,
+which is why it is cheap to leave on.
+
+## A7 — pinned session settings
+
+`measurement.make_deterministic`, called from `benchmark.py` and
+`collect_data.py`. `geqo_seed` defaults to 0, which sounds fixed and is not —
+GEQO reseeds per planning cycle, and §19.7.3 says *"Varying the value changes the
+set of join paths explored, and may result in a better or worse best path being
+found."* On a 12-relation join that turns a paired A/B into a comparison of two
+draws from a random search.
+
+Does nothing below `geqo_threshold`, which is every query in the current
+workload — insurance for the JOB-scale benchmark rather than a fix for today.
+Failures are reported, not raised: an unsettable GUC means the measurement is
+less controlled, which is worth recording.
+
+## D5 — covering indexes
+
+`index_advice.covering_opportunities`, on the analyze path only: it needs
+`EXPLAIN VERBOSE` for the `Output` list, which is one extra round trip that
+`/query/analyze` can afford (it already issues ~30) and `/query/optimize`
+cannot.
+
+Verified end to end:
+
+```
+SELECT o.status, o.created_at FROM orders o WHERE o.user_id = 42
+  before                                              Seq Scan
+  CREATE INDEX ... (user_id) INCLUDE (status, created_at)
+  after                     Index Only Scan on idx_orders_user_id_covering
+```
+
+This is what makes the `IndexOnlyScan` hint family usable rather than
+theoretical — the optimizer can force an index-only scan, but only a covering
+index makes one possible.
+
+**The first gate was wrong and the live check caught it.** Gating on "the node
+returns many rows" suppressed every real finding: `WHERE user_id = 42` returns
+about four rows while sequentially scanning 200,000, which is exactly the case a
+covering index fixes. `Plan Rows` on a Seq Scan is the post-filter count. Scan
+**cost** is the right signal, and it is what `planner.budget_for` already uses.
+
+The payload limit is three columns, not four, for the same kind of reason: on
+`orders` — five columns, one of them the filter — a limit of four accepted
+`SELECT *` and proposed an index duplicating 80% of the table.
+
+## Totals
+
+831 backend tests, 82 frontend, 15 integration. `/dbadvisor` returns six
+sections; `/query/analyze` returns plan choice, fairness, index type, and
+covering opportunities.
+
+## The one thing left
+
+**Predicting which join orders collapse to the same plan.** The prefilter removes
+the provable no-ops; 56 of the 83 remaining candidates on a four-table join are
+still duplicates, and they are `Leading()` variants. Whether a different join
+order produces a different plan is precisely what the planner decides, so there
+is no cheap way to know without asking it. Anything less than a proof here
+shrinks the action space silently, which is the failure this project keeps
+rediscovering.
+
+That is also where the compiled-language question actually lands: the way to stop
+paying for round trips is to be inside the planner, via `planner_hook` — which is
+a C extension, not a C++ one.
+
+---
+
+# A user-reported bug: optimising the optimiser's own output
+
+Reported workflow: optimise a query, copy the optimised SQL, paste it back to
+improve it further. It was silently broken, and the failure is this project's
+recurring one -- a hint that quietly stops existing.
+
+## What was actually happening
+
+`apply_hint` prepended unconditionally, so a second pass produced two comments:
+
+```
+/*+ Set(enable_nestloop off) */
+/*+ Leading(u o) */
+SELECT ...
+```
+
+**pg_hint_plan reads only the first such comment and discards the rest.** Not as
+an error, not in the "not used" or "error hint" sections of its own debug
+output -- the second comment does not exist to it. Measured, one query, one
+join, cost against `used hint:`:
+
+| input | cost | used |
+|---|---|---|
+| native | 5332.3 | — |
+| `Leading(u o)` | 5332.3 | `Leading(u o)` |
+| `Set(enable_hashjoin off)` | 14365.1 | `Set(enable_hashjoin off)` |
+| A then B, stacked | 5332.3 | **`Leading(u o)` only** |
+| B then A, stacked | 14365.1 | **`Set(...)` only** |
+| merged into one comment | 14365.1 | **both** |
+
+Whichever comment comes first wins outright. So on the second pass the
+optimiser's new hint was applied and **the hint the user pasted in was thrown
+away** -- the second pass replaced the first rather than building on it.
+
+### A correction to make
+
+An earlier reading of this said pg_hint_plan rejected the whole thing and
+planned natively. That was wrong. `error hint:` is an empty section header
+printed on every statement by `debug_print`, not a message about the statement
+in hand. The mechanism is first-comment-wins, and the table above is what
+settled it.
+
+## The fix
+
+**`apply_hint` merges.** `/*+ Leading(u o) Set(enable_hashjoin off) */` is one
+comment carrying two directives, which is the documented form. Conflicts resolve
+last-one-wins, matching pg_hint_plan's own rule for a repeated hint type, so
+chained passes converge instead of accumulating contradictions:
+
+```
+pass 1   /*+ Leading(o u) */
+pass 2   /*+ Leading(o u) Set(enable_nestloop off) */
+pass 3   /*+ Leading(u o) Set(enable_nestloop off) */          <- order replaced
+pass 4   /*+ Leading(u o) Set(enable_nestloop off) Set(work_mem 65536) */
+```
+
+Verified against the live planner -- all three directives appear in
+`used hint:` at pass 3, where previously only the last would have.
+
+**The baseline is the unhinted query.** `/query/analyze` now strips incoming
+hints before planning the baseline. Otherwise the previous pass's plan becomes
+the thing every candidate is compared against while the panel labels it
+"native": the speedup would be measured from an already-optimised plan, and a
+converged query would keep reporting "no improvement available". Both numbers
+wrong in a way nothing on the page could reveal.
+
+Three chained passes through the live API:
+
+```
+PASS 1  incoming []                                    chose Set(enable_hashjoin off)
+PASS 2  incoming [Set(enable_hashjoin off)]            chose Leading(oi p o u)
+        output: /*+ Set(enable_hashjoin off) Leading(oi p o u) */
+PASS 3  incoming [Set(enable_hashjoin off), Leading(oi p o u)]
+        output: /*+ ... Set(enable_indexscan off) */
+```
+
+**The panel says so.** `OptimizedQuery` now names the hints carried forward and
+states that the baseline is still unhinted, so the speedup is not misread as
+"faster than my last pass".
+
+## Two bugs the tests caught while fixing it
+
+**A bushy hint was silently dropped from the merge.** The directive pattern
+allowed one level of nesting; `Leading(((a b) (c d)))` has two, so it matched
+nothing and vanished. Chaining a pass onto a bushy result would have discarded
+the bushy plan -- the same failure class, inside the fix for it. Replaced with a
+balanced-paren scan.
+
+**A JSX block comment describing hint syntax ended itself.** The comment
+contained the character sequence that closes a block comment, so everything
+after it parsed as code. Rewritten with line comments, and the reason recorded
+in place.
+
+## Totals
+
+851 backend tests, 85 frontend, 15 integration.
