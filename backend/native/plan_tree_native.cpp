@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -244,10 +245,18 @@ PyObject* encode_plan_tree(PyObject* /*self*/, PyObject* args) {
                     balance_sum += std::min(a, b) / std::max(a, b);
                     balance_count++;
                 }
-                double child_rows = 1.0;
+                // Python is `sum(child rows) + 1.0`: the children are summed
+                // first and 1.0 added at the end. Seeding the accumulator with
+                // 1.0 instead would compute ((1.0 + c1) + c2) + ..., and
+                // floating-point addition is not associative, so the two can
+                // differ in the last bits. That is precisely the silent
+                // divergence this port exists not to introduce, so the order is
+                // reproduced rather than merely the arithmetic.
+                double child_rows = 0.0;
                 for (Py_ssize_t c = 0; c < n_children; c++) {
                     child_rows += get_number(PyList_GET_ITEM(plans, c), "Plan Rows");
                 }
+                child_rows += 1.0;
                 const double amplification = (rows + 1.0) / child_rows;
                 if (!have_amplification || amplification > max_amplification) {
                     max_amplification = amplification;

@@ -62,10 +62,28 @@ def test_every_query_has_the_required_fields():
         assert {"id", "sql", "description", "join_width", "trap"} <= set(item), item.get("id")
 
 
-def test_every_query_joins_at_least_two_tables():
-    """A single-table query has no join order to optimize."""
+def test_every_query_makes_the_planner_combine_two_relations():
+    """
+    A single-relation query has no join order to optimize, so it does not belong
+    in a workload built for a plan-picker.
+
+    The check used to be `"JOIN" in sql`, which is a proxy for that and a
+    slightly wrong one: a correlated `EXISTS` or `NOT EXISTS` makes the planner
+    perform a semi- or anti-join without the keyword appearing anywhere. The
+    workload's anti-join query is `FROM products p ... NOT EXISTS (SELECT 1 FROM
+    order_items oi ...)`, and measured on the live server it plans as **two
+    scanned relations with 3.5% headroom** — a real join for the optimizer to
+    order, invisible to a keyword search.
+
+    Widened rather than dropped. The property that actually matters is "the plan
+    touches at least two relations", which cannot be checked without a database;
+    `test_integration_hints.py` asserts that directly against a live server, and
+    this keeps the cheap version honest in the meantime.
+    """
     for item in WORKLOAD:
-        assert "JOIN" in item["sql"].upper(), item["id"]
+        sql = item["sql"].upper()
+        combines = "JOIN" in sql or "EXISTS" in sql or "IN (SELECT" in sql
+        assert combines, f"{item['id']}: nothing here makes the planner join anything"
 
 
 def test_workload_contains_both_traps_and_controls():

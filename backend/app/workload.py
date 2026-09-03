@@ -25,6 +25,32 @@ Each entry records `trap`, naming which estimation error it exercises, so a
 result can be read against the mechanism rather than just a number. The
 schema is now 6 tables, so the workload reaches 5- and 6-way joins where
 ordering matters far more than at 2 or 3.
+
+## v3: shapes, not only estimates
+
+The 24 queries above are all the same *shape* -- a select over joins with
+filters. None aggregates, sorts, de-duplicates, or uses a subquery, so no
+training plan ever contained a `HashAggregate`, a `WindowAgg`, a `Sort` above a
+join, or a semi-join.
+
+That is a hole in the training data, and it is visible in the feature vector:
+`optimizer/plan_tree.py` counts `n_aggregate`, `n_sort` and `n_materialize`, and
+those columns were near-zero in every row the model had ever seen. A feature
+that never varies teaches nothing, and a plan shape that never appears in
+training is one the model is guessing about at serving time.
+
+`app.generalisation` measured the consequence: prediction error of **2.93x on
+trained queries and 3.25x on held-out ones** -- the model generalises (ratio
+1.11) and is uniformly inaccurate. Coverage of the *plan space*, not just more
+rows of the same shape, is the thing that has not been tried.
+
+So the `shape_` group below adds aggregation, DISTINCT, top-N sorting, a window
+function, and semi- and anti-joins. Every one was measured before being added:
+native latency against the best plan the served action space can actually reach,
+three executions each, median. Two candidates were rejected -- a top-N showing
+39% headroom on a 1.7 ms query (a percentage of nothing) and a five-way join
+that linked `suppliers` to `users` on `country`, which ran 1.77 s at 0% headroom
+because it is a near-cartesian join with no key path rather than a hard query.
 """
 
 from __future__ import annotations
@@ -358,5 +384,128 @@ WORKLOAD = [
         "description": "control: supplier filter, weak correlation",
         "join_width": 2,
         "trap": "none (control)",
+    },
+
+    # -- v3: plan shapes the queries above never produce ------------------
+    {
+        "id": "shape_6w_supplier_reach",
+        "sql": """
+            SELECT s.name, count(DISTINCT o.id) AS orders
+            FROM orders o
+            JOIN users u ON u.id = o.user_id
+            JOIN order_items oi ON oi.order_id = o.id
+            JOIN products p ON p.id = oi.product_id
+            JOIN product_suppliers ps ON ps.product_id = p.id
+            JOIN suppliers s ON s.id = ps.supplier_id
+            WHERE p.category = 'electronics' AND p.brand = 'Voltix'
+            GROUP BY s.name
+            ORDER BY orders DESC
+            LIMIT 10
+        """,
+        "description": "6-way join under a grouped aggregate; 1754 ms native, 48% headroom",
+        "join_width": 6,
+        "trap": "brand->category, under aggregation",
+    },
+    {
+        "id": "shape_distinct_brands",
+        "sql": """
+            SELECT DISTINCT p.brand, p.category
+            FROM orders o
+            JOIN users u ON u.id = o.user_id
+            JOIN order_items oi ON oi.order_id = o.id
+            JOIN products p ON p.id = oi.product_id
+            WHERE u.city = 'Mumbai' AND u.country = 'IN'
+        """,
+        "description": "DISTINCT forces a dedup above a 4-way join; 28% headroom",
+        "join_width": 4,
+        "trap": "city->country, under DISTINCT",
+    },
+    {
+        "id": "shape_group_by_category",
+        "sql": """
+            SELECT p.category, count(*) AS orders, sum(oi.quantity) AS units
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            JOIN orders o ON o.id = oi.order_id
+            WHERE p.brand = 'Voltix' AND p.category = 'electronics'
+            GROUP BY p.category
+        """,
+        "description": "grouped aggregate over a correlated filter; 21% headroom",
+        "join_width": 3,
+        "trap": "brand->category, under GROUP BY",
+    },
+    {
+        "id": "shape_top_n_orders",
+        "sql": """
+            SELECT o.id, u.name, sum(oi.quantity) AS units
+            FROM orders o
+            JOIN users u ON u.id = o.user_id
+            JOIN order_items oi ON oi.order_id = o.id
+            WHERE u.country = 'IN' AND u.city = 'Mumbai'
+            GROUP BY o.id, u.name
+            ORDER BY units DESC
+            LIMIT 20
+        """,
+        "description": "top-N: a Sort above a join, where startup cost dominates; 20% headroom",
+        "join_width": 3,
+        "trap": "city->country, under ORDER BY / LIMIT",
+    },
+    {
+        "id": "shape_semi_join_exists",
+        "sql": """
+            SELECT u.id, u.name
+            FROM users u
+            WHERE u.city = 'Mumbai' AND u.country = 'IN'
+              AND EXISTS (
+                  SELECT 1 FROM orders o
+                  JOIN order_items oi ON oi.order_id = o.id
+                  JOIN products p ON p.id = oi.product_id
+                  WHERE o.user_id = u.id AND p.price_band = 'premium'
+              )
+        """,
+        "description": "semi-join: EXISTS stops at the first match, so row estimates behave differently",
+        "join_width": 4,
+        "trap": "city->country, under a semi-join",
+    },
+    {
+        "id": "shape_window_rank",
+        "sql": """
+            SELECT p.category, p.name, sum(oi.quantity) AS units,
+                   rank() OVER (PARTITION BY p.category ORDER BY sum(oi.quantity) DESC) AS rk
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            WHERE p.price_band = 'premium' AND p.category = 'home'
+            GROUP BY p.category, p.name
+        """,
+        "description": "window function over a grouped aggregate: a WindowAgg no other query produces",
+        "join_width": 2,
+        "trap": "price_band~category, under a window function",
+    },
+    {
+        "id": "shape_anti_join_unsold",
+        "sql": """
+            SELECT p.id, p.name
+            FROM products p
+            WHERE p.category = 'electronics' AND p.brand = 'Voltix'
+              AND NOT EXISTS (
+                  SELECT 1 FROM order_items oi WHERE oi.product_id = p.id
+              )
+        """,
+        "description": "anti-join: NOT EXISTS, the one shape whose output shrinks as its input grows",
+        "join_width": 2,
+        "trap": "brand->category, under an anti-join",
+    },
+    {
+        "id": "shape_range_recent",
+        "sql": """
+            SELECT o.id, u.name, u.language
+            FROM orders o
+            JOIN users u ON u.id = o.user_id
+            WHERE u.city = 'London' AND u.country = 'UK' AND u.language = 'en'
+              AND o.created_at >= now() - interval '90 days'
+        """,
+        "description": "three correlated columns plus a range predicate on a naturally-ordered column",
+        "join_width": 2,
+        "trap": "city->country->language, plus a time range",
     },
 ]

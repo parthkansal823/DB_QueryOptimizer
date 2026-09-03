@@ -77,3 +77,12 @@ data/pgdata_pg16/
 # not source, and this one is 14 MB.
 backups/
 *.dump
+
+# Compiled extension. Platform- and Python-version-specific, rebuilt with
+# `native/setup.py build_ext --inplace` (or the g++ line in native/README), and
+# entirely optional: app/optimizer/plan_tree.py falls back to the pure-Python
+# encoder when it is absent. Committing one would ship a Windows/CPython-3.11
+# binary to machines that are neither.
+*.pyd
+*.so
+backend/build/

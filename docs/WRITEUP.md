@@ -3196,3 +3196,56 @@ specific: more data, better features, or a different target -- not more
 threshold tuning. The thresholds are now honest, and what they honestly report
 is a model that does not know enough.
 
+
+## 2.34 A safety gate that blocked the fix for the thing it was guarding
+
+Three hooks were added to this repo: ruff on every backend edit, the unit suite
+in the background, and a gate refusing `git commit` while either is failing. The
+third one deadlocked the session within the hour.
+
+It is a `PreToolUse` hook on `Bash`, filtered by `"if": "Bash(git commit *)"` so
+it would not spawn on unrelated commands. The filter did not hold. Extending the
+workload broke one test, and the very next Bash call -- a `python - <<EOF` that
+would have *fixed* that test -- was refused:
+
+```
+PreToolUse:Bash hook error: Refusing to commit: the backend unit suite is failing.
+```
+
+Exit 2 on a `PreToolUse` hook blocks the tool call outright, so the edit never
+ran. The state was: the suite is red, therefore every shell command is blocked,
+therefore the suite stays red. A gate guarding against a broken commit had made
+the break unfixable.
+
+### What the mistake actually was
+
+Not the gate, and not the exit code. It was trusting the matcher.
+
+A hook that can *refuse work* has to be certain it is refusing the right work,
+and certainty there means reading the command rather than assuming something
+upstream filtered it. The script now parses the `PreToolUse` payload and exits 0
+unless the command genuinely contains `git commit` -- belt and braces where the
+braces turned out not to be attached.
+
+That is the same lesson as 2.20, arriving from the opposite direction. There,
+the check inferred a fact (`the plan changed, so the hint bound`) that the
+system could have been asked for directly. Here the check inferred a fact (`this
+hook ran, so the command must be a commit`) that the payload states outright.
+**A guard that reasons about its own trigger from context rather than from
+evidence will eventually fire on the wrong thing** -- and a guard that fires on
+the wrong thing while holding a veto is worse than no guard.
+
+### The general shape
+
+Two properties made this bad rather than annoying:
+
+* **It failed closed on everything, not on its subject.** A gate scoped to
+  commits that instead scopes to all shell access has a blast radius of the
+  whole session.
+* **Its failure mode removed the means of repair.** Any mechanism that blocks
+  work when something is broken should be checked against the case where the
+  broken thing is the mechanism's own precondition.
+
+Both are worth a second look before adding any future hook that can return
+exit 2.
+
