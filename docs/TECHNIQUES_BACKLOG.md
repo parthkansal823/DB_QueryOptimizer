@@ -548,177 +548,122 @@ produce these combinations and pay a planning round trip to learn they are bad.
 
 ---
 
-# Ranked, by value per unit of work
+# What is left
 
-| # | item | why first |
+This list was originally a ranking of what to build first, written when none of
+it existed. Most of it now does, so it is a status table instead -- a ranking
+whose top eleven entries are all done is not information.
+
+## Built since
+
+| item | where |
+|---|---|
+| **B4** — buffer counts as a stability-corrected objective | `measurement.py::blocks_verdict` |
+| **B5** — `pg_prewarm` before measurement | `measurement.py::prewarm` |
+| **B2** — `pg_stat_statements` | `dbadvisor/query_stats.py`, `dbadvisor/observability.py` |
+| **C6** — measurement-artifact guards | `dbadvisor/extended_stats.py::_plan_qerror` |
+| **A1** — partitionwise and the other toggles | `hints.ENABLE_SETTINGS`, `hints.EXTENDED_HINT_SETS` |
+| **A2** — parallel and other cost constants | `hints.COST_MODEL_SETTINGS` |
+| **A7** — pinned `geqo_seed` | `measurement.DETERMINISTIC_SESSION` |
+| **A8** — index pinning | `optimizer/catalog.py` + `hints.generate_index_candidates`, off by default |
+| **C7 / C8** — parallel-worker guards | `plan_extractor.py::parallel_shortfall` |
+| **B9** — trigram index advice | `index_advice.py`, `index_type: "trigram"` |
+| **B9** — BRIN index advice | `index_advice.py::brin_opportunities` |
+| **C9** — hint-binding readback | `optimizer/hint_binding.py`, `app.audit_binding` |
+
+## Measured and closed
+
+**Forced join methods and bushy trees stay off.** Both are built and both bind
+correctly. Executing every candidate from the served space against every
+candidate the two families add, across all 24 workload queries at 3 repetitions
+each: **0 queries won**, total best-candidate latency 1620.9 ms against 1618.5 ms
+-- a 0.15% difference against 18.6% measured run-to-run noise, for 254 extra
+candidates and their planning round trips. See WRITEUP 2.23.
+
+## Still open, and doable on PostgreSQL 16
+
+| item | what it needs | why it has not been done |
 |---|---|---|
-| 1 | **B4 — buffer counts as objective** | Attacks the noisy-measurement problem at the root, which is what the confidence machinery has been fighting all along. |
-| 2 | **B5 — `pg_prewarm` before measurement** | Removes the exact bias that produced the 80.5%-vs-26.0% error. Small, bundled, no restart. |
-| 3 | **B2 — `pg_stat_statements`** | Twelve signals for one extension. Also settles whether `query_template.py` should exist. |
-| 4 | **C6 — measurement-artifact guards** | Cheap, and each one is a silent wrong number today. The `BitmapAnd` zero-rows case is a live bug in the q-error walker. |
-| 5 | **A1 — partitionwise + the other toggles** | The two off-by-default GUCs are a plan shape the action space provably cannot reach. |
-| 6 | **A2 — parallel cost constants** | The manual names these as the fix when a parallel plan is not chosen; the project varies only the ceiling. |
-| 7 | **B3 — `auto_explain`** | A training-data pipeline for free, with the right settings (`log_timing off`). |
-| 8 | **B1 — statistics target** | A whole class of estimation failure `dbadvisor` is currently blind to. |
-| 9 | **B9 — non-B-tree index recommendations** | Widens the advisor from one index type to seven. |
-| 10 | **A8 — wire up index pinning** | The generators exist; they need a catalog map. |
-| 11 | **C7/C8 — parallel guards** | Prevents attributing a worker shortfall to the plan. |
-| 12 | **A7 — pin `geqo_seed`** | One line, and without it large-join measurements are partly random. |
+| **B3** — `auto_explain` | Server config plus a log parser | A training-data pipeline for free, but it duplicates what `collect_data` already produces under conditions we control. Worth it for capturing *production* queries, which this project does not have. |
+| ~~**B1**~~ | — | **Done.** The honest signal turned out not to be q-error at all: a column whose MCV list is exactly as long as its statistics target has been **truncated**, which is a fact in `pg_stats` rather than an inference about estimate quality. See the status table above. |
+| **B9** — `btree_gin` / `btree_gist` / `bloom` | Three extensions | Each needs an extension this database does not install, and each addresses a query shape absent from this workload. Recommending an index type for a predicate nobody writes is noise. |
+| **B13** — non-durable settings for benchmarking | `fsync=off` and friends | Deliberately skipped. The database is bind-mounted; a crash with `fsync=off` corrupts the volume, and the measurement gain does not justify that on a machine also holding the training log. |
 
-Everything tagged PG17+/PG18 (A9, A10, C1, C2, C3, C5) is blocked on a server
-upgrade. The `Disabled: true` flag (C2) is the one worth upgrading *for* — it
-turns "the candidate did nothing" from an inference into a fact.
+## The server upgrade happened: PostgreSQL 16.15 -> 18.6
 
----
+All six blocked items are unblocked, and one more came with them. Verified on
+the running server, not assumed:
 
-# Part D — From Chapter 11 (Indexes)
-
-Everything here is about what `app/dbadvisor/indexes.py` recommends, and how.
-
-## D1. `CREATE INDEX CONCURRENTLY` — PG16 ✓
-
-**The advisor currently emits DDL that takes an outage.**
-
-§11.1: *"By default, PostgreSQL allows reads to occur on the table in parallel
-with index creation, but writes (INSERT, UPDATE, DELETE) are blocked until the
-index build is finished. In production environments this is often
-unacceptable."*
-
-Every `CREATE INDEX` the dashboard hands the user blocks writes on the table for
-the duration of the build. On `order_items` (500,000 rows) that is not
-instantaneous. The advisor's own text says *"Check them before you run them:
-`CREATE INDEX` takes locks and disk space"* — which is honest but leaves the
-user to discover `CONCURRENTLY` themselves.
-
-The fix is a keyword. The caveats worth stating alongside it: it takes two table
-scans so it is slower overall, it cannot run inside a transaction block, and a
-failed build leaves an **invalid** index behind that must be dropped. That is
-still the right default for a recommendation aimed at a live database.
-
-## D2. Anchored `LIKE` needs `text_pattern_ops` off the C locale — PG16 ✓
-
-§11.2.1: a B-tree index can serve `col LIKE 'foo%'` or `col ~ '^foo'` — *"However,
-if your database does not use the C locale you will need to create the index with
-a special operator class."*
-
-So `CREATE INDEX ON t (name)` does **not** accelerate `WHERE name LIKE 'Volt%'`
-on this database; `CREATE INDEX ON t (name text_pattern_ops)` does. A prefix
-match is a common predicate and the advisor would currently recommend an index
-that cannot be used for it.
-
-Detection: an anchored LIKE/regex in the query text, plus `SHOW lc_collate` not
-being `C`. Both are one line.
-
-Unanchored (`LIKE '%bar%'`) is not indexable by B-tree at all — that is the
-`pg_trgm` case in B9.
-
-## D3. Partial indexes do not work with parameterized queries — PG16 ✓
-
-§11.8, and it lands directly on this project: *"Matching takes place at query
-planning time, not at run time. As a result, parameterized query clauses do not
-work with a partial index. For example a prepared query with a parameter might
-specify `x < ?` which will never imply `x < 2`."*
-
-`app/query_template.py` normalizes literals into parameters so that
-`city='Mumbai'` and `city='London'` share a `query_id`. A partial index
-recommendation derived from the *template* can therefore be unusable by the
-actual query, and would show as an index with zero scans — which
-`dbadvisor/indexes.py` would then report as unused and recommend dropping.
-
-Two recommendations chasing each other. Any partial-index suggestion has to be
-derived from a literal predicate and labelled as only applying when the value is
-a constant.
-
-## D4. Do not recommend a fan of partial indexes — PG16 ✓
-
-§11.8, Example 11.4, stated bluntly: a set of non-overlapping partial indexes
-(`WHERE category = 1`, `= 2`, …) is *"a bad idea"* — *"the system does not
-understand the relationship among the partial indexes, and will laboriously test
-each one to see if it's applicable."* One multicolumn `(category, data)` index is
-almost always better, and past a certain size the answer is partitioning.
-
-A guard for the advisor: if it is about to recommend more than one partial index
-on the same table differing only in the predicate constant, recommend the
-multicolumn index instead.
-
-## D5. Covering indexes with `INCLUDE` — PG16 ✓
-
-§11.9. `CREATE INDEX tab_x_y ON tab(x) INCLUDE (y)` puts `y` in the index as
-payload so `SELECT y FROM tab WHERE x = 'key'` never touches the heap.
-
-This is what makes the new `IndexOnlyScan` family (family 5 in `famalies.txt`)
-usable rather than theoretical. Detection is mechanical: the query's selected
-columns are a small superset of an existing index's key columns.
-
-Constraints to encode: B-tree, GiST and SP-GiST only; expressions are not
-allowed as included columns; the uniqueness of a `UNIQUE ... INCLUDE` index
-applies to the key columns only; and wide payload columns bloat the index and
-can exceed the index tuple size limit outright.
-
-And the condition that decides whether it pays at all — *"there is little point
-in including payload columns unless the table changes slowly enough that an
-index-only scan is likely to not need to access the heap"* — is exactly the
-visibility-map question in B7. The two findings should be produced together: a
-covering index on a table whose visibility map is stale buys nothing.
-
-## D6. Index sort order — PG16 ✓
-
-§11.4. `ORDER BY x ASC, y DESC` cannot be satisfied by any plain two-column
-index; it needs `CREATE INDEX ON t (x ASC, y DESC)`. Also `NULLS FIRST` /
-`NULLS LAST`.
-
-Narrow, but entirely invisible to an advisor that only proposes column lists —
-and the failure is a full sort the index was supposed to remove.
-
-Related, from §11.4: `ORDER BY ... LIMIT n` is the case where a matching index
-wins biggest, because an explicit sort has to process everything to find the
-first n rows.
-
-## D7. What an unused index actually costs — PG16 ✓
-
-§11.1: *"Indexes can also prevent the creation of heap-only tuples."*
-
-The advisor reports unused indexes as wasted disk. The larger cost is that every
-index on a table blocks the HOT-update optimization for updates touching its
-columns, forcing a new index entry and more bloat. That strengthens the
-recommendation and is a better reason to give than size.
-
-Also §11.6: *"There's no need to manually create indexes on unique columns;
-doing so would just duplicate the automatically-created index."* A primary key
-already has a unique B-tree — a recommendation to index a PK column is always
-wrong, and worth an explicit guard.
-
-## D8. Index types beyond B-tree, from §11.2 — PG16 ✓
-
-Expands B9 with what the manual says each is actually for:
-
-| type | for | notes |
+| item | status on 18.6 | evidence |
 |---|---|---|
-| B-tree | `< <= = >= >`, `BETWEEN`, `IN`, `IS NULL`, anchored `LIKE`, sorted output | the only type that can be `UNIQUE`, and the only one that produces sorted output |
-| Hash | `=` only | no range, no sort, no uniqueness |
-| GiST | geometric, ranges, nearest-neighbour `ORDER BY location <-> point` | supports index-only scans for some operator classes only |
-| SP-GiST | quadtrees, k-d trees, radix trees | also does nearest-neighbour |
-| GIN | arrays, jsonb, full-text — values with multiple components | **cannot** do index-only scans: entries hold only part of the value |
-| BRIN | columns correlated with physical row order | tiny; `pages_per_range` is the tuning knob |
+| **A10** three `enable_*` toggles | **available** | `enable_self_join_elimination`, `enable_distinct_reordering`, `enable_group_by_reordering` all present in `pg_settings` |
+| **C1** `EXPLAIN (SERIALIZE)` | **available** | reports `Serialization: output=1kB format=text` |
+| **C2** `Disabled: true` | **available** | `SET enable_seqscan=off` now plans `Seq Scan on orders / Disabled: true` |
+| **C5** `Index Searches` | **available** | `Index Searches: 1` on a primary-key lookup |
+| **A9** skip scan | available in the planner | needs a composite-index workload to exercise |
+| **C3** `pg_overexplain` | **available** | `LOAD 'pg_overexplain'` then `EXPLAIN (DEBUG)` adds `Disabled Nodes`, `Parallel Safe`, `Plan Node ID` and relation OIDs |
+| **A8** `DisableIndex` | **available and wired** | pg_hint_plan **1.8.1** (was 1.6.3) |
 
-The nearest-neighbour case is worth noting because no amount of B-tree advice
-helps an `ORDER BY distance LIMIT 10` query, and that is a shape an advisor
-should be able to name.
+**C2 was the one worth upgrading for**, and it delivers exactly what was
+predicted: it turns *"this candidate did nothing"* from an inference into a fact
+the planner states. That is the silent-failure class this project has spent the
+most time on.
 
-## D9. Multicolumn index guidance — PG16 ✓
+### `DisableIndex` works, and the argument form matters
 
-§11.3: *"equality constraints on leading columns, plus any inequality constraint
-on the first column that does not have an equality constraint, will always be
-used to limit the portion of the index that is scanned."* Column order is the
-whole ballgame, and the advisor proposes column *sets*.
+The generator was correct all along. What was wrong was the belief about why it
+failed -- the probe used `DisableIndex(o)`, and that single-argument form fails
+on *both* versions, differently: an unrecognized keyword on 1.6.3, and on 1.8.1
+a recognized keyword whose arguments are refused into the `error hint:` bucket.
+Only `DisableIndex(alias index)` binds.
 
-Also: *"Indexes with more than three columns are unlikely to be helpful unless
-the usage of the table is extremely stylized"* — a cap worth enforcing.
+Measured on 18.6: `SELECT * FROM orders o WHERE o.id = 42` plans as an Index
+Scan costing **8.4**; with `DisableIndex(o orders_pkey)` it plans as a Seq Scan
+costing **4059.0**. The planner genuinely searches as though the index were not
+there -- which is the missing half of the unused-index advisor.
 
-And §11.5 on the alternative: separate indexes on `x` and `y` can be combined
-with `BitmapAnd`, which loses index ordering (so a sort is still needed) and
-costs an extra scan. Multicolumn versus index-combination is a genuine trade-off
-the advisor currently does not present.
+Wired behind `INCLUDE_DISABLE_INDEX`, off by default like every other opt-in
+family, because whether it earns its planning cost is a measurement and WRITEUP
+2.27 records what happened the last time one was run.
+
+### What the upgrade cost
+
+**The entire training log.** 26,941 rows across 178 queries, every one a latency
+measured against PG16's planner. WRITEUP 2.18 established that a plan-latency
+log is only training data while the database it measured is the one being
+served, and a major-version planner change is that hazard at full scale. The log
+starts empty on 18.6 and the model has to be retrained from scratch; every
+measured figure in this repository predating the upgrade is now historical.
+
+The PG16 cluster is preserved at `data/pgdata_pg16` rather than deleted -- it
+holds the `job` database (the real IMDB/JOB dataset), which is not regenerable
+from `data/schema.sql`, and can be reached by pointing a `postgres:16` container
+at it. A `pg_dump` of `lqo` is in `backups/`. Both are gitignored.
+
+Two build details that are not obvious:
+
+* **`flex` and `bison` are required.** pg_hint_plan's PG16 branch shipped a
+  pre-generated `query_scan.c`; the PG18 branch generates it from
+  `query_scan.l`. Without flex the build fails *after* every C file has already
+  compiled, so the log reads like a success until its last line.
+* **PostgreSQL 18 changed the recommended mount point** to `/var/lib/postgresql`
+  rather than `.../data`, so the server places its cluster in a version
+  subdirectory. The old mount still works but puts a mount-point boundary
+  exactly where `pg_upgrade --link` needs to move files.
+
+### A note on how `pg_overexplain` is found
+
+It does not appear in `pg_available_extensions` and there is no
+`CREATE EXTENSION pg_overexplain`. It is a **loadable module**, not an
+extension: `LOAD 'pg_overexplain'` and the `DEBUG` and `RANGE_TABLE` options
+appear on `EXPLAIN`. Searching the catalogue for it returns nothing on a server
+where it is perfectly available -- which is worth writing down, because "not in
+`pg_available_extensions`" was read here as "not installed" and it was neither.
+
+It needs `postgresql-contrib-18` in the image, which is now in
+`postgres/Dockerfile`.
+
+**Nothing in Parts A-F is blocked on the server any more.**
 
 ---
 
@@ -1021,6 +966,17 @@ Two others from the same page, noted and not pursued:
 | **§69.2.3** — measured correlation | `dbadvisor/extended_stats.py::measured_correlation` | `('SG','Singapore')` occurs **22×** more often than per-column statistics predict — read from `pg_mcv_list_items`, no probe query |
 | **C9** — hint-binding readback | `optimizer/hint_binding.py` | `EXPLAIN (SETTINGS)` cannot see pg_hint_plan's `Set()` (measured: same `1.0000039e10` cost, empty `Settings`); pg_hint_plan's own debug buckets catch all four silent-failure modes |
 | **C9** — disconnected method prefixes | `hints.py::_choose_orders` | `generate_join_method_candidates` sampled orders without the join graph, so `HashJoin(p o)` on an unjoined pair was filed `not used` and the candidate mislabelled. **9 of 92 → 0 of 93** |
+| **C9** — flat bushy groups | `hints.py::_binary_group` | pg_hint_plan's nested `Leading()` takes two elements per group; `len(tables)//2` emitted `(oi p ps)` for odd table counts and it was rejected unseen. Workload audit: **8 of 2102 → 0 of 2102**; served space was **0 of 440** throughout |
+| **B9** — BRIN index advice | `index_advice.py::brin_opportunities` | Reads `pg_stats.correlation` rather than probing. Withholds advice on an unanalyzed column instead of guessing, and refuses types where a min/max page summary cannot discriminate (bool, text) however well correlated |
+| **budget** — distinct plans, not hints | `optimizer/planner.py` | The budget was sliced before deduplication, so repeats consumed slots while real alternatives went unplanned. Measured **56 of 83** candidates duplicate on a four-table join; the budget now counts distinct plans, capped at `MAX_PLANNING_ATTEMPTS_PER_SLOT` |
+| **promotion** — scores the served policy | `retrain.py::served_policy` | `_score_bundle` hardcoded `risk_averse` while `docker-compose.yml` serves `pairwise_rank` and the code default is `greedy`. The 2 Sep promotion "beat champion by 8.3%" on a policy nobody runs; on the served one it was flat (0.163 → 0.162). Fourth instance of a constant restating a decision owned elsewhere — see WRITEUP 2.28 |
+| **B1** — per-column statistics target | `dbadvisor/extended_stats.py::statistics_target_opportunities` | Fires on MCV **saturation** (list length == target), an observed fact, not on "estimates look bad". Found 9 saturated columns; `orders.user_id` tracks 100 of ~23,558 distinct values |
+| **promotion** — training cannot deploy | `train.py`, `test_train_does_not_deploy.py` | `MODEL_PATH` defaulted to `model_store.CURRENT_PATH`, so `python -m app.train` overwrote the served model and the registry's refusal had no effect. Caught by hashing the served file against the promoted version: **MISMATCH** |
+| **collection** — follows the served flag | `collect_data.py` | `include_join_methods` hardcoded `True` while serving has it off, so runs spent their wall clock on the slowest family and training discarded every row. **41 → ~100 rows/minute** |
+| **UI** — saved/lost bar | `App.css`, `ServedVsNative.test.jsx` | The dashboard rewrite kept the class names and dropped the positioning, so the diverging bar rendered as an empty cell. The component had no test at all; it has eight now |
+| **guard** — evidence window | `optimizer/regression_guard.py::evidence_since` | Blocked on the whole of `plan_execution_log` forever, so a superseded model's regressions blocked the current one. Horizon is now the current model's promotion. **guard-blocked 5/24 → 2/24** |
+| **C++** — measured, not warranted | `docs/WRITEUP.md` 2.24 | 80% of the optimizer's 26 ms overhead is PostgreSQL planning; feature extraction is 2.4 ms and round trips 3.6 ms, against a 110 ms query. Batching all 18 `EXPLAIN`s into one call measured **3x slower**, so the in-server extension idea was dropped before it was written |
+| **UI** — unstyled classes | `frontend/src/styles.test.js` | The rewrite dropped rules for `.settings-grid`, `.latency`, `.dq-group` and `.howto` while keeping the class names. A test now asserts every class used in a component has a rule |
 
 ## Corrections to earlier entries in this document
 

@@ -122,7 +122,13 @@ class BindingReport:
         for directive in self.duplication:
             out.append(f"{directive}: given more than once; pg_hint_plan kept one")
         for directive in self.error:
-            out.append(f"{directive}: rejected (an unknown GUC or an invalid value)")
+            # Deliberately not "an unknown GUC": the first draft said that, and
+            # the workload audit promptly produced a rejected `Leading()` with a
+            # three-element group. Any directive can land in this bucket.
+            out.append(
+                f"{directive}: rejected -- pg_hint_plan parsed it and refused it "
+                f"(an unknown GUC, an invalid value, or a malformed group)"
+            )
         for keyword in self.unrecognized_keywords:
             out.append(
                 f"{keyword}: not a hint keyword in this pg_hint_plan build -- the "

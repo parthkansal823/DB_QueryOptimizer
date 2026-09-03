@@ -66,3 +66,14 @@ backend/models/queries/
 *.log
 .DS_Store
 Thumbs.db
+
+# Preserved PostgreSQL 16 cluster, kept when the project moved to 18. Not
+# regenerable from data/schema.sql: it holds the `job` database (the real
+# IMDB/JOB dataset, 21 tables) which took a separate load to build. Reachable
+# by pointing a postgres:16 container at it. ~9.2 GB.
+data/pgdata_pg16/
+
+# pg_dump output. The PG16 -> PG18 upgrade backup lives here; dumps are data,
+# not source, and this one is 14 MB.
+backups/
+*.dump

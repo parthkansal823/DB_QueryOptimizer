@@ -5,6 +5,31 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Learned Query Optimizer</title>
+    <!--
+      Stamp the saved theme before the first paint.
+
+      `ThemeToggle` sets `data-theme` when React mounts, which is too late: a
+      viewer who chose light on a dark OS sees a frame of dark first, because
+      until the attribute exists `index.css` falls through to
+      `prefers-color-scheme`. The component's `readTheme`/`applyTheme` were
+      exported for this and never wired up, so the flash was live.
+
+      Inline and not a module, because it has to run before the body renders and
+      an ES import would not. It duplicates the storage key deliberately -- a
+      four-line script that cannot import is the price of running early enough,
+      and `ThemeToggle` names the key next to its own copy.
+    -->
+    <script>
+      try {
+        var t = localStorage.getItem("lqo-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {
+        /* Private windows and blocked site data throw. Following the system is
+           the right fallback, not a blank page over a colour preference. */
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

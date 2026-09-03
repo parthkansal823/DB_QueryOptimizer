@@ -69,6 +69,7 @@ import json
 import math
 import os
 
+from app.optimizer.regression_guard import UNSEEN_QUERY_CAUTION
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
 from app.train import _aggregate_repetitions, _load_rows, _row_to_candidate
@@ -220,6 +221,7 @@ def evaluate_setting(
     min_relative_gain: float,
     policy: str = "greedy",
     max_regression_ratio: float = 1.25,
+    caution: float = UNSEEN_QUERY_CAUTION,
 ) -> dict:
     model = bundle["model"]
     feature_columns = bundle["feature_columns"]
@@ -271,12 +273,24 @@ def evaluate_setting(
             # expected win from the point estimate, and a bounded downside from
             # the uncertainty. Sweeping the old single condition would tune a
             # threshold the served gate no longer applies.
+            # `caution` is applied exactly as `learned._select_against_native`
+            # applies it, because a threshold swept without it is a threshold
+            # for a system that does not run. The regression guard hands the
+            # served gate 2.0 for a query with no history and eases to 1.0 as
+            # evidence arrives, so the sweep's default is the unseen case --
+            # every query on a fresh workload starts there, and a recommendation
+            # that only holds once a query is well-observed is a recommendation
+            # for the easy half of the problem.
+            #
+            # Measured on this workload the served values were 2.0 x13,
+            # 1.67 x9, 1.33 x2. Sweeping at 1.0 made `min_relative_gain=0.02`
+            # look right when serving would apply 0.04, and a ceiling of 1.25
+            # when serving would apply 1.125.
+            required = 1.0 - min_relative_gain * caution
+            ceiling = 1.0 + (max_regression_ratio - 1.0) / max(caution, 1e-9)
             expected = math.exp(means[best_i])
-            pessimistic = math.exp(means[best_i] + confidence_z * stds[best_i])
-            deviate = (
-                expected < (1.0 - min_relative_gain)
-                and pessimistic < max_regression_ratio
-            )
+            pessimistic = math.exp(means[best_i] + confidence_z * caution * stds[best_i])
+            deviate = expected < required and pessimistic < ceiling
         else:
             # Legacy absolute-latency bundles: compare against native's own
             # predicted latency instead of a ratio.
@@ -364,6 +378,7 @@ def sweep(
     policy: str = "greedy",
     max_regression_rate: float = 0.25,
     max_worst_regression: float = 1.25,
+    caution: float = UNSEEN_QUERY_CAUTION,
     exclude_prefix: str | None = None,
 ) -> dict:
     """
@@ -397,7 +412,7 @@ def sweep(
     scored = {qid: rows for qid, rows in grouped.items() if qid in held_out} if held_out else grouped
 
     results = [
-        evaluate_setting(scored, bundle, z, g, policy=policy)
+        evaluate_setting(scored, bundle, z, g, policy=policy, caution=caution)
         for z in CONFIDENCE_Z_GRID
         for g in MIN_RELATIVE_GAIN_GRID
     ]
@@ -415,6 +430,7 @@ def sweep(
         "policy": policy,
         "max_regression_rate": max_regression_rate,
         "max_worst_regression": max_worst_regression,
+        "caution": caution,
         "excluded_prefix": exclude_prefix,
         "n_settings_tested": len(results),
         # Which queries the gate was chosen on, and whether the model had

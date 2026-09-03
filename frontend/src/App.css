@@ -406,7 +406,11 @@ input:focus, select:focus, textarea:focus {
   font-family: var(--mono);
   font-size: var(--text-xs);
   color: var(--ink-muted);
-  max-width: 30rem;
+  /* 30rem here was wider than the other six columns combined, so the table
+     could not fit its container on any screen and every layout became a
+     horizontal scroll. The full text is still on the cell's `title`. */
+  max-width: 18rem;
+  min-width: 8rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -657,10 +661,26 @@ input:focus, select:focus, textarea:focus {
 
 .howto-notes strong { color: var(--ink-strong); }
 
+/* The measured milliseconds in a plan panel -- the number the whole comparison
+   exists to show. It had no rule and rendered at body size, which put the one
+   figure a reader is looking for at the same weight as the labels around it. */
+.latency {
+  font-family: var(--mono);
+  font-size: var(--text-lg);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-strong);
+  margin-bottom: var(--s3);
+}
+
+/* The how-to card. `.card` carries the surface; this holds its prose to a
+   readable measure, which is the whole reason the class is on the element. */
+.howto {
+  max-width: 74ch;
+}
+
 /* -- bars and meters ------------------------------------------------------- */
 
 .bar-track,
-.delta-track,
 .train-bar {
   background: var(--surface-inset);
   border-radius: 2px;
@@ -674,12 +694,47 @@ input:focus, select:focus, textarea:focus {
   height: 100%;
 }
 
-.delta-fill { height: 100%; }
-.delta-zero { background: var(--ink-faint); }
+/* The saved/lost bar is a diverging one: a centre line at zero, and a fill
+   growing right for a saving or left for a regression. That needs a positioned
+   container -- the fill's `left` is set inline per row, and without
+   `position: relative` here and `absolute` on the children the offsets do
+   nothing and the cell renders empty. */
+.delta-track {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-width: 5.5rem;
+  height: 6px;
+  background: var(--surface-inset);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.delta-zero {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 1px;
+  height: 100%;
+  background: var(--ink-faint);
+}
+
+.delta-fill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+}
 
 /* -- decision quality ------------------------------------------------------ */
 
 .dq-groups { display: flex; flex-direction: column; gap: var(--s4); }
+/* One decision group inside the column above. Only the plural had a rule after
+   the stylesheet rewrite, so the groups ran together with no internal spacing. */
+.dq-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
 .dq-group-head {
   display: flex;
   align-items: baseline;
@@ -782,6 +837,32 @@ input:focus, select:focus, textarea:focus {
 
 /* -- settings -------------------------------------------------------------- */
 
+/* The experiment panel's controls. This class was in the JSX and had no rule
+   at all after the stylesheet rewrite, so a row of labelled selects rendered as
+   an unaligned stack -- the same way the saved/lost bar lost its positioning.
+   Auto-fit rather than a fixed column count because the panel shows two or
+   three controls depending on which comparison is selected. */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--s4);
+  align-items: end;
+  margin-bottom: var(--s4);
+}
+
+.settings-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  font-size: var(--text-sm);
+  color: var(--ink-muted);
+}
+
+.settings-grid select,
+.settings-grid input {
+  width: 100%;
+}
+
 .setting-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -867,6 +948,11 @@ li.empty-state {
    the grid exists to provide. */
 .table-scroll {
   max-height: 22rem;
+  /* Both axes on one container: `overflow-x` is declared above for the narrow
+     case, and setting only `overflow-y` here would reset it to `visible` on
+     this rule's cascade in some engines. Declaring the pair keeps the vertical
+     scroll without losing the horizontal fallback. */
+  overflow-x: auto;
   overflow-y: auto;
 }
 

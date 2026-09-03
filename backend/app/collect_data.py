@@ -64,7 +64,7 @@ def _recover(cur, statement_timeout_ms: int) -> None:
 
 def collect(
     reps: int = DEFAULT_REPS,
-    include_join_methods: bool = True,
+    include_join_methods: bool | None = None,
     include_tuning: bool = True,
     workload: list[dict] | None = None,
     statement_timeout_ms: int = 30_000,
@@ -86,6 +86,24 @@ def collect(
     Ctrl-C to interrupt with. Both are optional and default to the previous
     behaviour exactly.
     """
+    # Default to whatever the serving path offers, rather than hardcoding True.
+    #
+    # `train.rows_for_served_action_space` already drops rows for families the
+    # optimizer does not serve, and reads which those are from `planner.py` so
+    # the two cannot drift. Collection was the one place still asserting an
+    # answer of its own: `include_join_methods` defaulted to True while
+    # `INCLUDE_JOIN_METHODS` is off, so a run spent most of its time measuring
+    # the forced join-method family -- the slowest in the action space, mean
+    # ratio 5.49 against 1.97 for everything else -- and training then discarded
+    # every row of it.
+    #
+    # Passing the flag explicitly still works, which is what a run meant to
+    # answer "would join methods earn their place?" should do.
+    if include_join_methods is None:
+        from app.optimizer import planner
+
+        include_join_methods = planner.INCLUDE_JOIN_METHODS
+
     workload = workload if workload is not None else WORKLOAD
     start = time.time()
     total_rows = 0

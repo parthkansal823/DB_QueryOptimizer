@@ -233,3 +233,85 @@ class TestJoinMethodPrefixesAreConnected:
         from app.optimizer.hints import generate_join_method_candidates
 
         assert generate_join_method_candidates(["a"], join_graph={"a": []}) == []
+
+
+class TestBushyGroupsAreBinary:
+    """
+    The second defect the binding readback found, on the full workload.
+
+    pg_hint_plan's nested `Leading()` takes exactly two elements per group.
+    Measured on 1.6.3:
+
+        Leading(((o u) (oi p ps)))     -> error hint:   (rejected)
+        Leading(((o u) ((oi p) ps)))   -> used hint:    (applied)
+
+    `generate_bushy_candidates` split the tables with `len(tables) // 2`, which
+    gives 2 and 3 for a five-table query and emits the flat three-element group.
+    The rejection is reported at a severity the client does not see by default,
+    so the candidate ran and did nothing. 8 of 2102 across the workload, all of
+    this shape; 0 of 2102 after.
+
+    Nesting has to follow the join graph, not the alphabet. `((a b) c)` joins
+    `a` to `b` first, so on the chain `a-c-b` that step is a cross product --
+    accepted syntactically, priced at `disable_cost`, and useless. That would be
+    the same silent failure one level down.
+    """
+
+    CHAIN = {
+        "o": ["u", "oi"],
+        "u": ["o"],
+        "oi": ["o", "p"],
+        "p": ["oi", "ps"],
+        "ps": ["p"],
+    }
+
+    def _groups(self, hint):
+        """Every parenthesised group in the hint, innermost first."""
+        import re
+
+        return re.findall(r"\(([^()]*)\)", hint)
+
+    def test_no_group_has_more_than_two_elements(self):
+        from app.optimizer.hints import generate_bushy_candidates
+
+        candidates = generate_bushy_candidates(
+            ["o", "u", "oi", "p", "ps"], join_graph=self.CHAIN
+        )
+        assert candidates, "a five-table chain should admit bushy splits"
+        for hint in candidates:
+            for group in self._groups(hint):
+                assert len(group.split()) <= 2, f"{hint}: flat group ({group}) is rejected"
+
+    def test_the_even_case_still_works(self):
+        from app.optimizer.hints import generate_bushy_candidates
+
+        graph = {"a": ["b"], "b": ["a", "c"], "c": ["b", "d"], "d": ["c"]}
+        candidates = generate_bushy_candidates(["a", "b", "c", "d"], join_graph=graph)
+        assert candidates
+        for hint in candidates:
+            for group in self._groups(hint):
+                assert len(group.split()) <= 2
+
+    def test_each_fold_step_shares_a_join_predicate(self):
+        """
+        The order within a group matters as much as its arity. Folding a set
+        alphabetically can pair two tables with no predicate between them.
+        """
+        from app.optimizer.hints import _connected_fold_order
+
+        # `a` and `b` are two hops apart; a naive sorted fold would pair them.
+        graph = {"a": ["c"], "b": ["c"], "c": ["a", "b"]}
+        order = _connected_fold_order(("a", "b", "c"), graph)
+        placed = [order[0]]
+        for member in order[1:]:
+            assert any(n in placed for n in graph[member]), f"{order} breaks at {member}"
+            placed.append(member)
+
+    def test_an_unreadable_graph_degrades_rather_than_vanishing(self):
+        """
+        A join graph the parser could not build should not silently produce zero
+        candidates -- the previous behaviour is better than nothing.
+        """
+        from app.optimizer.hints import _connected_fold_order
+
+        assert _connected_fold_order(("a", "b", "c"), {}) == ["a", "b", "c"]

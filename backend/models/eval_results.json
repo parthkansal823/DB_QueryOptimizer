@@ -4,42 +4,67 @@
   "join_cardinality_corrector": "trained",
   "conformal_gate": {
     "alpha": 0.1,
-    "q": 23.762247103955957,
-    "n_calibration": 2480,
+    "q": 0.16319646427219153,
+    "n_calibration": 2357,
     "target_coverage": 0.9,
-    "held_out_coverage": 0.9848648648648649
+    "held_out_coverage": 0.8365155131264916
   },
-  "uncertainty_scale": 4.0270059754342,
-  "n_rows_raw": 12648,
+  "action_space": {
+    "filtered": true,
+    "dropped_rows": 1592,
+    "kept_rows": 19420,
+    "reason": "INCLUDE_JOIN_METHODS is off, so forced join-method candidates are never served. Training on them shifts every prediction upward toward their much slower mean, which is what stopped the safety gate from ever firing."
+  },
+  "point_calibration": {
+    "intercept": -0.01860821710441865,
+    "slope": 1.0623607027098259,
+    "n_calibration": 2357,
+    "fitted": true,
+    "before": {
+      "mean_log_error": 0.002916286246430513,
+      "systematic_factor": 1.0029205427458838,
+      "mean_absolute_log_error": 0.1124722216166272,
+      "min_predicted_ratio": 0.16633177478326377
+    },
+    "after": {
+      "mean_log_error": -9.330324661659422e-16,
+      "systematic_factor": 0.9999999999999991,
+      "mean_absolute_log_error": 0.11345835684241902,
+      "min_predicted_ratio": 0.14598668365236445
+    }
+  },
+  "uncertainty_scale": 3.959869548235231,
+  "n_rows_raw": 21012,
   "reps_aggregated_to_median": true,
-  "n_rows_total": 3470,
-  "n_rows_train": 2545,
-  "n_rows_test": 925,
+  "latest_run_only": true,
+  "n_rows_total": 3257,
+  "n_rows_train": 2419,
+  "n_rows_test": 838,
   "n_features": 62,
-  "test_mae_log_ratio": 0.21277393428264973,
-  "test_typical_multiplicative_error": 1.2371049526111062,
-  "test_mean_uncertainty_log_ratio": 0.07677439760711059,
+  "test_mae_log_ratio": 0.18341268789127727,
+  "test_typical_multiplicative_error": 1.2013100719169139,
+  "test_mean_uncertainty_log_ratio": 0.08662638784181055,
   "n_tables_in_schema": 6,
   "n_held_out_queries": 36,
   "avg_latency_ms": {
-    "native": 186.9413611111111,
-    "heuristic": 187.38327777777775,
-    "oracle_best_possible": 157.6531527777778,
-    "learned_greedy": 188.676625,
-    "learned_thompson": 191.41715277777777,
-    "learned_risk_averse": 189.92487500000001,
-    "learned_pairwise_rank": 183.53459722222223
+    "native": 205.4741944444444,
+    "heuristic": 202.3506111111111,
+    "oracle_best_possible": 169.20816666666664,
+    "learned_greedy": 203.88494444444453,
+    "learned_thompson": 207.20725000000004,
+    "learned_risk_averse": 203.83747222222226,
+    "learned_pairwise_rank": 201.17086111111112
   },
   "headroom_captured_vs_oracle": {
-    "learned_greedy": -0.059247867576589924,
-    "learned_thompson": -0.1528188961143356,
-    "learned_risk_averse": -0.10186740871729408,
-    "learned_pairwise_rank": 0.11631861703918493
+    "learned_greedy": 0.04382200360453322,
+    "learned_thompson": -0.047787300174561106,
+    "learned_risk_averse": 0.04513100338011264,
+    "learned_pairwise_rank": 0.1186601786030225
   },
   "beats_or_ties_heuristic_rate": {
-    "learned_greedy": 0.6944444444444444,
-    "learned_thompson": 0.6388888888888888,
+    "learned_greedy": 0.6666666666666666,
+    "learned_thompson": 0.7222222222222222,
     "learned_risk_averse": 0.6666666666666666,
-    "learned_pairwise_rank": 0.6111111111111112
+    "learned_pairwise_rank": 0.7222222222222222
   }
 }

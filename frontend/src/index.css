@@ -202,7 +202,12 @@ body {
 }
 
 #root {
-  max-width: 1120px;
+  /* 1120px left ~480px of empty gutter on a 1600px landscape screen while the
+     data tables inside were horizontally scrolling. Widening the shell is safe
+     because prose is capped separately -- `.group-blurb`, `.page-intro` and the
+     panel copy all hold themselves to 74-78ch -- so this buys width for the
+     tables and plan comparisons without stretching a line of text. */
+  max-width: 1440px;
   margin: 0 auto;
   padding: 0 var(--s5) var(--s8);
 }

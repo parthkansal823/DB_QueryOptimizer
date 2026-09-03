@@ -85,6 +85,12 @@ def report(cur, schema: str = "public", include_statistics: bool = True) -> dict
         "physical": physical.report(cur, schema),
         "observability": observability.report(cur),
         "server_config": server_config.report(cur),
+        # Not part of `extended_statistics` below, despite living in the same
+        # module: that one measures whether a *multi-column* statistics object
+        # would help, at the cost of an ANALYZE per candidate. This is a
+        # catalogue read about single columns whose most-common-value list is
+        # full, so it belongs with the cheap checks.
+        "statistics_target": extended_stats.statistics_target_opportunities(cur, schema),
     }
     if include_statistics:
         findings["extended_statistics"] = extended_stats.recommend(cur, schema)

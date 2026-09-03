@@ -28,6 +28,8 @@ model improves. Blocking is a brake, not a permanent ban.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 # `is_chosen AND hint IS NOT NULL` -- served executions that actually
 # *deviated* from PostgreSQL. Runs where the optimizer served the native plan
 # are recorded as chosen too (they were the served decision, and every paired
@@ -74,6 +76,50 @@ HINT_FAMILY_SQL = """
 """
 
 
+# How far back the guard's evidence reaches.
+#
+# It used to reach forever: every query below aggregated the whole of
+# `plan_execution_log` with no date filter. That is wrong in a specific and
+# expensive way. A query that regressed under a superseded model, an earlier
+# gate setting, or a different database says nothing about the model deployed
+# now -- and the log holds all of it, with equal weight, forever.
+#
+# Measured: after replacing the model and the gate, the guard blocked 5 of 24
+# queries on the strength of runs made under the configuration that had just
+# been replaced -- more than the safety gate itself vetoed. WRITEUP 2.18
+# records the same hazard for training data ("a plan-latency log is only
+# training data while the database it measured is still the database you are
+# serving"); this is that sentence applied to the evidence a guard blocks on.
+#
+# The window is the *current model's promotion time*, because that is the event
+# that makes older evidence describe something else. A freshly promoted model
+# therefore starts with no history and no blocks, which is correct: it has not
+# earned distrust yet, and `caution_multiplier` already handles the fact that it
+# has not earned trust either.
+DEFAULT_LOOKBACK = timedelta(days=30)
+
+
+def evidence_since(fallback: timedelta = DEFAULT_LOOKBACK) -> datetime:
+    """
+    The earliest execution the guard should count.
+
+    The current model's promotion time when the registry knows it, otherwise a
+    fixed lookback -- an unreadable registry should narrow the evidence, never
+    silently widen it back to "all of history".
+    """
+    try:
+        from app import model_store
+
+        promoted_at = model_store.promoted_at()
+    except Exception:  # noqa: BLE001 - the guard must work without a registry
+        promoted_at = None
+
+    floor = datetime.now(timezone.utc) - fallback
+    if promoted_at is None:
+        return floor
+    return max(promoted_at, floor) if promoted_at < floor else promoted_at
+
+
 def hint_family(hint: str | None) -> str | None:
     """
     Which kind of action a hint represents. Mirrors `HINT_FAMILY_SQL`.
@@ -118,6 +164,7 @@ FAMILY_REGRESSION_SQL = f"""
           AND hint IS NOT NULL
           AND query_id IS NOT NULL
           AND actual_total_time_ms IS NOT NULL
+          AND created_at >= %s
         GROUP BY 1, 2
     )
     SELECT s.query_id, s.family, n.native_avg, s.family_avg, s.n_served
@@ -137,6 +184,7 @@ NATIVE_LATENCY_SQL = """
     WHERE is_baseline
       AND query_id IS NOT NULL
       AND actual_total_time_ms IS NOT NULL
+      AND created_at >= %s
     GROUP BY query_id
 """
 
@@ -144,6 +192,7 @@ OBSERVATION_COUNT_SQL = """
     SELECT query_id, COUNT(*) FILTER (WHERE is_chosen)
     FROM plan_execution_log
     WHERE query_id IS NOT NULL AND actual_total_time_ms IS NOT NULL
+      AND created_at >= %s
     GROUP BY query_id
 """
 
@@ -156,12 +205,14 @@ REGRESSION_SQL = """
         COUNT(*) FILTER (WHERE is_chosen AND hint IS NOT NULL) AS n_chosen
     FROM plan_execution_log
     WHERE query_id IS NOT NULL AND actual_total_time_ms IS NOT NULL
+      AND created_at >= %s
     GROUP BY query_id
 """
 
 
 def find_regressed_queries(
-    cur, tolerance: float = 0.10, min_observations: int = 3
+    cur, tolerance: float = 0.10, min_observations: int = 3,
+    since: datetime | None = None,
 ) -> dict[str, dict]:
     """
     Query ids whose learned-path average is worse than native by more than
@@ -171,7 +222,7 @@ def find_regressed_queries(
     query that is really a wash; `min_observations` exists so one unlucky
     execution doesn't either.
     """
-    cur.execute(REGRESSION_SQL)
+    cur.execute(REGRESSION_SQL, (since or evidence_since(),))
     regressed: dict[str, dict] = {}
 
     for query_id, native_avg, chosen_avg, n_chosen in cur.fetchall():
@@ -188,7 +239,8 @@ def find_regressed_queries(
 
 
 def find_regressed_families(
-    cur, tolerance: float = 0.10, min_observations: int = 2
+    cur, tolerance: float = 0.10, min_observations: int = 2,
+    since: datetime | None = None,
 ) -> dict[str, dict[str, dict]]:
     """
     Per query, which hint families have been slower than native.
@@ -199,7 +251,7 @@ def find_regressed_families(
     to be judged. Dropping one family is also a far smaller intervention than
     refusing to optimise the query at all, so it can be made on less evidence.
     """
-    cur.execute(FAMILY_REGRESSION_SQL)
+    cur.execute(FAMILY_REGRESSION_SQL, (since or evidence_since(),))
     regressed: dict[str, dict[str, dict]] = {}
 
     for query_id, family, native_avg, family_avg, n_served in cur.fetchall():
@@ -236,13 +288,21 @@ class RegressionGuard:
         self.native_ms: dict[str, float] = {}
 
     def refresh(self, cur) -> dict[str, dict]:
+        # One boundary for every query below, resolved once: a refresh that used
+        # a slightly different cutoff per statement could block a query on
+        # evidence it had already decided was too old to count.
+        since = evidence_since()
+        self.evidence_since = since
         self.blocked = find_regressed_queries(
-            cur, tolerance=self.tolerance, min_observations=self.min_observations
+            cur, tolerance=self.tolerance, min_observations=self.min_observations,
+            since=since,
         )
-        self.blocked_families = find_regressed_families(cur, tolerance=self.tolerance)
-        cur.execute(OBSERVATION_COUNT_SQL)
+        self.blocked_families = find_regressed_families(
+            cur, tolerance=self.tolerance, since=since
+        )
+        cur.execute(OBSERVATION_COUNT_SQL, (since,))
         self.observations = {qid: int(n) for qid, n in cur.fetchall()}
-        cur.execute(NATIVE_LATENCY_SQL)
+        cur.execute(NATIVE_LATENCY_SQL, (since,))
         self.native_ms = {qid: float(ms) for qid, ms in cur.fetchall() if ms is not None}
         return self.blocked
 

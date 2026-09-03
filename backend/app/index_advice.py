@@ -438,3 +438,117 @@ def _columns_from(filter_text: str, alias: str) -> list[str]:
             continue
         found.append(column)
     return found
+
+
+# -- BRIN: the index for a column the table is already ordered by -------------
+#
+# `dbadvisor` proposed B-tree for everything except the trigram case above.
+# BRIN is core (no extension), and one column in this schema is exactly its
+# shape: `orders.created_at` on an append-only table.
+#
+# A BRIN index stores a summary -- min and max -- per range of table pages
+# rather than an entry per row. On a column whose physical order matches its
+# logical order, a range predicate can then skip whole swathes of the table
+# after reading an index that is orders of magnitude smaller than the B-tree.
+# On a column with no such ordering it summarises to "this page range contains
+# roughly everything", every range matches, and it degenerates to a sequential
+# scan plus wasted reads.
+#
+# So the whole recommendation turns on physical/logical correlation -- which
+# PostgreSQL already computes during ANALYZE and stores in `pg_stats.correlation`
+# as a value in [-1, 1]. No probe query, no estimate of our own: the number is
+# read, and if it is missing the advice is withheld rather than guessed.
+
+# Below this the summaries overlap enough that BRIN stops being able to skip.
+# Deliberately strict: a B-tree that is merely large is a working index, while a
+# BRIN on an uncorrelated column is a slower sequential scan, so a false
+# positive here costs more than a false negative.
+MIN_BRIN_CORRELATION = 0.9
+
+# BRIN indexes a *range of pages*. Below a few thousand pages there are too few
+# ranges for skipping to save anything, and a B-tree of that size is cheap.
+MIN_BRIN_PAGES = 2000
+
+BRIN_CANDIDATE_SQL = """
+    SELECT s.tablename,
+           s.attname,
+           s.correlation,
+           c.relpages,
+           t.typname
+    FROM pg_stats s
+    JOIN pg_class c ON c.relname = s.tablename
+    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = s.attname
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE s.schemaname = %s
+      AND c.relkind = 'r'
+      AND s.correlation IS NOT NULL
+      AND abs(s.correlation) >= %s
+      AND c.relpages >= %s
+    ORDER BY c.relpages DESC, abs(s.correlation) DESC
+"""
+
+# Types where a min/max summary per page range actually discriminates. A BRIN on
+# a boolean or a low-cardinality enum summarises to "contains both values" in
+# every range and skips nothing, however well correlated it is.
+_BRIN_USEFUL_TYPES = {
+    "timestamp", "timestamptz", "date", "time", "timetz",
+    "int2", "int4", "int8", "numeric", "float4", "float8", "oid",
+}
+
+
+def brin_opportunities(cur, schema: str = "public") -> list[dict]:
+    """
+    Columns where a BRIN index would be much smaller than the B-tree.
+
+    Reads `pg_stats.correlation`, so a column that has never been analyzed is
+    absent rather than guessed at -- the same rule the rest of this module
+    follows. Returns one finding per column, ordered by table size.
+    """
+    # A surrogate primary key is the most perfectly correlated column in any
+    # append-only table -- `order_items.id` measures 1.000 here -- and it is
+    # also the column BRIN can least afford to replace. BRIN cannot enforce
+    # uniqueness and cannot serve the single-row lookup a key exists for, so
+    # recommending one for a key column is advice that would break the table if
+    # taken. Excluded outright rather than left to the caveats: a recommendation
+    # nobody should follow does not belong in the list.
+    unique_columns = already_uniquely_indexed(cur, schema)
+
+    cur.execute(BRIN_CANDIDATE_SQL, (schema, MIN_BRIN_CORRELATION, MIN_BRIN_PAGES))
+    findings = []
+    for tablename, attname, correlation, relpages, typname in cur.fetchall():
+        if typname not in _BRIN_USEFUL_TYPES:
+            continue
+        if (tablename, attname) in unique_columns:
+            continue
+        findings.append({
+            "table": tablename,
+            "column": attname,
+            "correlation": round(float(correlation), 4),
+            "table_pages": int(relpages),
+            "index_type": "brin",
+            "ddl": (
+                f"CREATE INDEX CONCURRENTLY {_quote('idx_' + tablename + '_' + attname + '_brin')} "
+                f"ON {_quote(tablename)} USING brin ({_quote(attname)});"
+            ),
+            "note": (
+                f"{tablename}.{attname} is stored in almost exactly the order it "
+                f"sorts in (correlation {float(correlation):.3f}), across "
+                f"{int(relpages):,} pages. A BRIN index summarises min/max per "
+                f"page range instead of storing a row per tuple, so it is "
+                f"typically a few hundred kilobytes where the B-tree is tens of "
+                f"megabytes, and a range scan can skip whole page ranges."
+            ),
+            "caveats": [
+                "BRIN cannot serve an equality lookup of a single row well, and "
+                "cannot enforce uniqueness or answer ORDER BY -- it narrows the "
+                "search to page ranges, and the rows are then rechecked.",
+                "The benefit depends entirely on physical ordering. Bulk updates, "
+                "or inserts that arrive out of order, degrade it silently: the "
+                "correlation drops and the index quietly stops skipping.",
+                "It is not a replacement for an existing B-tree used for point "
+                "lookups on this column -- it is an alternative when the queries "
+                "are ranges.",
+            ],
+        })
+    return findings

@@ -11,7 +11,8 @@ It runs on any PostgreSQL database, ships with a dashboard that explains every
 decision it makes, and refuses to act when it isn't confident. Built end to end:
 data collection, feature engineering, model training, a self-retraining loop
 with rollback, two independent safety mechanisms, a conformally calibrated
-safety gate, and 492 tests behind CI.
+safety gate, and **1,136 tests** behind CI (1,016 backend of which 17 run against a live PostgreSQL with
+`pg_hint_plan` actually loaded, plus 120 frontend).
 
 ## Documentation
 

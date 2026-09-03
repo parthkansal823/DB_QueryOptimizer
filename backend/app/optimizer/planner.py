@@ -127,6 +127,12 @@ INCLUDE_MEMOIZE = os.getenv("INCLUDE_MEMOIZE", "0") != "0"
 INCLUDE_PARALLEL = os.getenv("INCLUDE_PARALLEL", "0") != "0"
 INCLUDE_ENABLE_SETTINGS = os.getenv("INCLUDE_ENABLE_SETTINGS", "0") != "0"
 INCLUDE_INDEX_PINNING = os.getenv("INCLUDE_INDEX_PINNING", "0") != "0"
+# `DisableIndex(alias index)`: plan as if the index had already been dropped.
+# Unavailable until the PostgreSQL 18 upgrade brought pg_hint_plan 1.8.1 -- on
+# 1.6.3 the keyword did not exist, and the rejection arrived at INFO severity,
+# which the default client_min_messages discards. Needs the catalog map for the
+# same reason index pinning does.
+INCLUDE_DISABLE_INDEX = os.getenv("INCLUDE_DISABLE_INDEX", "0") != "0"
 # Six more `enable_*` toggles, and the cost-model constants the manual names as
 # what actually gates a parallel plan (`parallel_setup_cost`,
 # `min_parallel_table_scan_size`) rather than the ceiling TUNING_SETTINGS varies.
@@ -167,6 +173,13 @@ CANDIDATE_BUDGET_TIERS: tuple[tuple[float, int], ...] = (
     (20_000.0, 20),
 )
 UNBUDGETED_CANDIDATES = 64
+
+
+# How many hints may be planned per budget slot while hunting for a distinct
+# plan. Three is enough to absorb the usual duplicate rate without letting a
+# fully-degenerate query (every hint collapsing to the baseline) plan the whole
+# list looking for something that is not there.
+MAX_PLANNING_ATTEMPTS_PER_SLOT = 3
 
 
 def budget_for(total_cost: float | None) -> int:
@@ -242,6 +255,7 @@ def candidate_hints(
         # candidates skip the cartesian products Postgres would never pick.
         join_graph=baseline_plan.get("join_graph"),
         include_bushy=INCLUDE_BUSHY,
+        include_disable_index=INCLUDE_DISABLE_INDEX,
         include_scan_methods=INCLUDE_SCAN_METHODS,
         include_negative_scans=INCLUDE_NEGATIVE_SCANS,
         include_negative_joins=INCLUDE_NEGATIVE_JOINS,
@@ -344,17 +358,37 @@ def plan_query(
     # with a chance could have used.
     if guard is not None:
         hints = guard.allowed_hints(query_id, hints)
-    hints = hints[:budget]
+
+    # The budget counts *distinct plans*, not hints tried.
+    #
+    # It used to slice the hint list (`hints[:budget]`) and then deduplicate
+    # what came back, which spends the budget before knowing what it bought.
+    # Many hints legitimately collapse to the same plan -- on a four-table join
+    # PostgreSQL answers most `Leading()` orders with the plan it already
+    # preferred -- so measured on this workload **56 of 83** candidates were
+    # duplicates of one another. The budget was funding repeats while genuinely
+    # different alternatives further down the list were never planned at all.
+    #
+    # Planning one hint is an `EXPLAIN` without `ANALYZE`, a few milliseconds,
+    # so trying a few extra to fill the budget with real alternatives is cheap.
+    # `MAX_PLANNING_ATTEMPTS_PER_SLOT` bounds that: without it a query whose
+    # every hint collapses to the baseline would plan the entire list to find
+    # nothing, turning the cheapest case into the slowest.
+    attempt_cap = min(len(hints), budget * MAX_PLANNING_ATTEMPTS_PER_SLOT)
 
     candidates = []
     seen_plans = {plan_fingerprint(baseline)}
-    for hint in hints:
+    n_duplicates = 0
+    for hint in hints[:attempt_cap]:
+        if len(candidates) >= budget:
+            break
         try:
             plan = get_plan(cur, apply_hint(sql, hint), analyze=False)
         except Exception:  # noqa: BLE001 - a rejected hint is not a request failure
             continue
         fingerprint = plan_fingerprint(plan)
         if fingerprint in seen_plans:
+            n_duplicates += 1
             continue  # same plan as one already considered; not a real alternative
         seen_plans.add(fingerprint)
         plan["hint"] = hint
@@ -389,6 +423,11 @@ def plan_query(
         "candidate_budget": budget,
         "decision": decision,
         "n_candidates_planned": len(candidates),
+        # Hints that planned to a plan already on the list. Reported because it
+        # is the difference between "this query has few alternatives" and "this
+        # query's alternatives all collapse to the same plan", and only the
+        # second is a reason to generate a different *kind* of candidate.
+        "n_duplicate_plans": n_duplicates,
         "optimizer_overhead_ms": planning_ms,
     }
 

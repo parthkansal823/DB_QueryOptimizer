@@ -290,9 +290,64 @@ def generate_bushy_candidates(
         splits = rng.sample(splits, max_candidates)
 
     return [
-        f"/*+ Leading((({' '.join(left)}) ({' '.join(right)}))) */"
+        f"/*+ Leading(({_binary_group(left, join_graph)} "
+        f"{_binary_group(right, join_graph)})) */"
         for left, right in sorted(splits)
     ]
+
+
+def _binary_group(members: tuple[str, ...], join_graph: dict[str, list[str]]) -> str:
+    """
+    One side of a bushy split, written as a strictly binary tree.
+
+    pg_hint_plan's nested `Leading()` accepts only two elements per group.
+    Measured on pg_hint_plan 1.6.3:
+
+        Leading(((o u) (oi p ps)))     -> error hint:   (rejected)
+        Leading(((o u) ((oi p) ps)))   -> used hint:    (applied)
+
+    A flat group of three was emitted for every query with an odd number of
+    tables -- `len(tables) // 2` splits five into two and three -- and the
+    rejection is reported at a severity the client does not see by default, so
+    the candidate simply did nothing. 8 of 2102 across the workload, all of them
+    this.
+
+    The members are folded left, but in an order that keeps each step joinable
+    rather than alphabetical. `((a b) c)` asks Postgres to join `a` and `b`
+    first, so if the set is the chain `a-c-b` that step is a cross product,
+    priced at `disable_cost` -- syntactically accepted and semantically useless,
+    which is the same silent failure one level down.
+    """
+    ordered = _connected_fold_order(members, join_graph)
+    tree = ordered[0]
+    for member in ordered[1:]:
+        tree = f"({tree} {member})"
+    return tree
+
+
+def _connected_fold_order(
+    members: tuple[str, ...], join_graph: dict[str, list[str]]
+) -> list[str]:
+    """
+    Order `members` so each one shares a join predicate with those before it.
+
+    Greedy, which is sufficient here: the caller has already checked the set is
+    connected via `_is_connected_set`, and any connected set admits such an
+    order. Falls back to the given order if the graph does not supply one, so a
+    graph the parser could not read degrades to the previous behaviour instead
+    of producing nothing.
+    """
+    remaining = list(members)
+    placed = [remaining.pop(0)]
+    while remaining:
+        for i, candidate in enumerate(remaining):
+            if any(n in placed for n in join_graph.get(candidate, ())):
+                placed.append(remaining.pop(i))
+                break
+        else:
+            placed.extend(remaining)
+            break
+    return placed
 
 
 # -- Per-table scan methods -------------------------------------------------
@@ -452,8 +507,28 @@ def generate_disable_index_candidates(
     """
     `DisableIndex(t idx)`: plan as if this index had already been dropped.
 
-    Requires a pg_hint_plan newer than 1.6.3 -- see the note above. Deliberately
-    left out of `generate_candidates`.
+    Available since the PG18 upgrade -- pg_hint_plan **1.8.1**. On 1.6.3 the
+    keyword did not exist at all and was rejected as a syntax error at `INFO`
+    severity, which the default `client_min_messages` discards; see
+    `docs/WRITEUP.md` 2.20 for how long that took to notice.
+
+    The two-argument form is required, and this is worth stating because the
+    single-argument one fails differently on each version. `DisableIndex(o)` is
+    an *unrecognized keyword* on 1.6.3 and a *rejected directive* on 1.8.1 --
+    the keyword parses, the arguments do not, and it lands in pg_hint_plan's
+    `error hint:` bucket rather than raising. Only `DisableIndex(alias index)`
+    binds, and the alias rule from `optimizer/catalog.py` applies to the first
+    argument as it does everywhere else.
+
+    Measured on PG18.6: `SELECT * FROM orders o WHERE o.id = 42` plans as an
+    Index Scan costing 8.4; with `DisableIndex(o orders_pkey)` it plans as a Seq
+    Scan costing 4059.0. The planner genuinely searches as though the index were
+    not there.
+
+    That is the missing half of the unused-index advisor in
+    `app/dbadvisor/indexes.py`. Zero scans in `pg_stat_user_indexes` is evidence
+    about the past; this is evidence about the future, and dropping an index is
+    irreversible without a rebuild.
     """
     if not table_indexes:
         return []
@@ -806,6 +881,10 @@ def generate_candidates(
     include_enable_settings: bool = False,
     include_extended_toggles: bool = False,
     include_cost_model: bool = False,
+    # Needs pg_hint_plan >= 1.8 (the PG18 upgrade). Off by default like every
+    # other opt-in family: whether it earns its planning cost is a measurement,
+    # and `docs/WRITEUP.md` 2.27 is what happens when that measurement is run.
+    include_disable_index: bool = False,
     join_graph: dict[str, list[str]] | None = None,
     table_indexes: dict[str, list[str]] | None = None,
 ) -> list[str]:
@@ -853,6 +932,8 @@ def generate_candidates(
         candidates += generate_hint_sets()
     if include_bushy:
         candidates += generate_bushy_candidates(tables, join_graph=join_graph)
+    if include_disable_index and table_indexes:
+        candidates += generate_disable_index_candidates(table_indexes)
     if include_scan_methods:
         candidates += generate_scan_method_candidates(tables)
     if include_negative_scans:

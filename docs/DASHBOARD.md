@@ -209,6 +209,20 @@ Four groups, each with the exact statement that would apply it:
   slow-query report.
 - **Table health.** Statistics describing a table that has since changed, and
   dead row versions that every sequential scan has to read past.
+- **An index of the wrong *kind*.** B-tree is not always the answer. A column
+  the table is already physically ordered by -- an append-only `created_at` --
+  can be served by a BRIN index that summarises min/max per page range, a few
+  hundred kilobytes where the B-tree is tens of megabytes. It fires only on
+  `pg_stats.correlation` above 0.9, never on a key column (BRIN cannot enforce
+  uniqueness or answer a point lookup), and never on a column that has not been
+  analyzed -- an unmeasured column gets silence rather than a guess.
+- **A statistics target that has run out of room.** PostgreSQL stores at most
+  `statistics_target` most-common values per column. When a column comes back
+  with *exactly* that many, the list is truncated: the planner wanted to track
+  more and could not, and every value it dropped is now estimated from one
+  uniform average. On this database `orders.user_id` tracks 100 of roughly
+  23,558 distinct values. Reported on saturation, which is an observable fact,
+  rather than on "estimates look bad", which is a guess about a cause.
 
 **Nothing here is applied.** Running DDL against your database is your decision;
 the panel shows the statement and stops.

@@ -284,39 +284,88 @@ def test_every_generated_candidate_is_a_keyword_this_server_knows(cur):
     assert not rejected, f"pg_hint_plan does not recognise: {rejected}"
 
 
-def test_disable_index_is_not_in_the_action_space(cur):
+def test_disable_index_binds_and_removes_the_index_from_consideration(cur):
     """
-    The keyword this server rejects, pinned from both directions: the generator
-    still produces it (the technique is real and it exists in newer
-    pg_hint_plan), and `generate_candidates` still refuses to emit it.
+    The keyword this server used to reject, now that it does not.
 
-    If a pg_hint_plan upgrade makes this test's first assertion fail, that is
-    the signal to add an `include_disable_index` flag -- not to delete the test.
+    On pg_hint_plan 1.6.3 -- what PostgreSQL 16 shipped here -- `DisableIndex`
+    did not exist. It was rejected as a syntax error at `INFO` severity, which
+    the default `client_min_messages` of WARNING discards, so an unsupported
+    hint was indistinguishable from a hint that did nothing. This test used to
+    assert that rejection, with a failure message saying to wire the family in
+    if an upgrade ever changed it. The PostgreSQL 18 upgrade brought 1.8.1 and
+    the test duly failed, which is what it was for.
+
+    Two things are pinned here now. The hint binds, and it has the effect its
+    name claims -- because "accepted" and "did what you wanted" are different
+    facts, and this project has confused them before.
+
+    Note the argument form. `DisableIndex(o)` fails on *both* versions but
+    differently: an unrecognized keyword on 1.6.3, and on 1.8.1 a recognized
+    keyword whose arguments are refused, landing in pg_hint_plan's `error hint:`
+    bucket. Only `DisableIndex(alias index)` binds.
     """
+    from app.optimizer.hint_binding import check_binding, enable_hint_debug
+
+    enable_hint_debug(cur)
+    notices = cur.connection.notices
+    sql = "SELECT * FROM orders o WHERE o.id = 42"
+
+    report = check_binding(
+        cur, f"/*+ DisableIndex(o orders_pkey) */ EXPLAIN (FORMAT JSON) {sql}", notices
+    )
+    assert report.bound, f"DisableIndex did not bind: {report.problems}"
+
+    cur.execute("SET pg_hint_plan.debug_print = off")
+    cur.execute("RESET client_min_messages")
+
+    def node_and_cost(hint=""):
+        cur.execute(f"{hint} EXPLAIN (FORMAT JSON) {sql}")
+        plan = cur.fetchone()[0][0]["Plan"]
+        return plan["Node Type"], plan["Total Cost"]
+
+    native_node, native_cost = node_and_cost()
+    hinted_node, hinted_cost = node_and_cost("/*+ DisableIndex(o orders_pkey) */")
+
+    assert "Index" in native_node, f"expected an index scan natively, got {native_node}"
+    assert "Seq" in hinted_node, (
+        f"with its only usable index disabled the planner should fall back to a "
+        f"sequential scan, got {hinted_node}"
+    )
+    assert hinted_cost > native_cost * 10, (
+        "disabling the index should make the plan dramatically more expensive; "
+        f"{native_cost} -> {hinted_cost} suggests the hint changed nothing"
+    )
+
+
+def test_disable_index_is_opt_in(cur):
+    """
+    Wired, and off by default -- like every other family whose value has not
+    been measured on this workload. `docs/WRITEUP.md` 2.27 records what happened
+    when two other opt-in families were finally measured: zero wins across 24
+    queries, and they stayed off.
+    """
+    from app.optimizer import planner
     from app.optimizer.hints import generate_disable_index_candidates
 
-    hint = generate_disable_index_candidates({"u": ["users_pkey"]})[0]
-    assert _rejected_keywords(cur, hint, FOUR_TABLE_SQL), (
-        "pg_hint_plan now accepts DisableIndex -- wire the family in"
-    )
+    assert planner.INCLUDE_DISABLE_INDEX is False
 
-    everything = generate_candidates(
+    table_indexes = {"o": ["orders_pkey"], "u": ["users_pkey"]}
+    assert generate_disable_index_candidates(table_indexes), "the generator still works"
+
+    without = generate_candidates(
         ["o", "u", "oi", "p"],
         join_graph={"o": ["u", "oi"], "u": ["o"], "oi": ["o", "p"], "p": ["oi"]},
-        include_bushy=True,
-        include_scan_methods=True,
-        include_negative_scans=True,
-        include_negative_joins=True,
-        include_memoize=True,
-        include_parallel=True,
-        include_enable_settings=True,
-        table_indexes={"u": ["users_pkey"]},
+        table_indexes=table_indexes,
     )
-    assert not any("DisableIndex" in c for c in everything)
-
-
-# -- the alias rule ---------------------------------------------------------
-
+    with_family = generate_candidates(
+        ["o", "u", "oi", "p"],
+        join_graph={"o": ["u", "oi"], "u": ["o"], "oi": ["o", "p"], "p": ["oi"]},
+        table_indexes=table_indexes,
+        include_disable_index=True,
+    )
+    assert not any("DisableIndex" in c for c in without)
+    assert any("DisableIndex" in c for c in with_family)
 
 def test_a_hint_naming_the_relation_instead_of_the_alias_does_nothing(cur):
     """

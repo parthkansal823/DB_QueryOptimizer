@@ -469,3 +469,136 @@ def measured_correlation(cur, stats_name: str, limit: int = 5) -> dict | None:
 def verify_recommendation(cur, table: str, columns: list[str]) -> dict | None:
     """Read back the correlation captured by the object this module recommends."""
     return measured_correlation(cur, _stats_name(table, columns))
+
+
+# -- Per-column statistics target --------------------------------------------
+#
+# `server_config.py` already reports `default_statistics_target`. What was
+# missing is per-column advice, and the reason it stayed missing is that the
+# obvious version of it is dishonest: "your estimates are bad, try raising the
+# statistics target" is a guess dressed as a recommendation, and raising it
+# everywhere makes ANALYZE and planning slower for no stated benefit.
+#
+# There is a fact in the catalogue that says it directly. PostgreSQL stores at
+# most `statistics_target` most-common values per column. When a column's MCV
+# list comes back with *exactly* that many entries, the list is **saturated** --
+# the planner wanted to track more common values than it was allowed to, and the
+# ones it dropped are now estimated from the uniform remainder instead. That is
+# not an inference about estimate quality; it is the planner having run out of
+# room, readable without executing anything.
+#
+# Measured on this schema: `orders.user_id` has n_distinct -0.118 (about 12% of
+# rows distinct) and exactly 100 MCVs against a target of 100. `orders.status`
+# and `orders.channel` have 1 MCV each and are nowhere near the ceiling.
+
+STATS_TARGET_SQL = """
+    SELECT s.tablename,
+           s.attname,
+           s.n_distinct,
+           coalesce(array_length(s.most_common_vals::text::text[], 1), 0) AS n_mcv,
+           -- `attstattarget IS NULL` is the PostgreSQL 17+ spelling of "this
+           -- column uses the default". PG16 stored -1 for that; 17 made the
+           -- column NULLable and moved the sentinel. Testing only `< 0` on 17+
+           -- yields NULL for every column that has never been given an explicit
+           -- target -- which is nearly all of them -- and the comparison below
+           -- then raises `'<' not supported between 'int' and 'NoneType'`,
+           -- taking the whole /dbadvisor endpoint to a 500. Found by the
+           -- PG16 -> PG18 upgrade, which is the only reason it surfaced at all.
+           CASE WHEN a.attstattarget IS NULL OR a.attstattarget < 0
+                THEN current_setting('default_statistics_target')::int
+                ELSE a.attstattarget
+           END AS effective_target,
+           c.reltuples
+    FROM pg_stats s
+    JOIN pg_class c ON c.relname = s.tablename
+    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = s.attname
+    WHERE s.schemaname = %s
+      AND c.relkind = 'r'
+"""
+
+# What to raise a saturated column to. Doubling is the smallest step that can
+# demonstrate whether more room helps; the manual's ceiling is 10000, and going
+# straight there makes every ANALYZE and every plan of that column slower to buy
+# an unknown amount.
+STATS_TARGET_MULTIPLIER = 2
+MAX_STATISTICS_TARGET = 10_000
+
+# Below this the column has few enough distinct values that a saturated MCV list
+# is nearly a complete census of them, and the remainder it failed to track is
+# not where estimates go wrong.
+MIN_DISTINCT_FOR_STATS_ADVICE = 200
+
+
+def _distinct_count(n_distinct: float, reltuples: float) -> float:
+    """
+    `pg_stats.n_distinct` in absolute terms.
+
+    Negative values are a *fraction of the table* rather than a count, which is
+    how PostgreSQL expresses "this scales with the table" -- reading one as a
+    count would make the most-distinct columns look like the least.
+    """
+    n_distinct = float(n_distinct or 0)
+    if n_distinct < 0:
+        return abs(n_distinct) * max(float(reltuples or 0), 0.0)
+    return n_distinct
+
+
+def statistics_target_opportunities(cur, schema: str = "public") -> list[dict]:
+    """
+    Columns whose most-common-value list is full, and so is losing information.
+
+    Fires only on saturation -- an observed fact -- never on "estimates look
+    bad", which cannot be attributed to one column without a probe per column.
+    """
+    cur.execute(STATS_TARGET_SQL, (schema,))
+    findings = []
+    for tablename, attname, n_distinct, n_mcv, target, reltuples in cur.fetchall():
+        if target is None or n_mcv is None:
+            # Belt and braces: the SQL above resolves the PG17 NULL sentinel,
+            # but a column the planner has no statistics row for at all should
+            # produce no advice rather than an exception.
+            continue
+        if n_mcv < target:
+            continue  # room to spare: the planner tracked everything it wanted
+        distinct = _distinct_count(n_distinct, reltuples)
+        if distinct < MIN_DISTINCT_FOR_STATS_ADVICE:
+            continue
+        proposed = min(int(target) * STATS_TARGET_MULTIPLIER, MAX_STATISTICS_TARGET)
+        if proposed <= target:
+            continue  # already at the ceiling; nothing to suggest
+        findings.append({
+            "table": tablename,
+            "column": attname,
+            "n_mcv": int(n_mcv),
+            "statistics_target": int(target),
+            "proposed_target": proposed,
+            "estimated_distinct_values": int(distinct),
+            "ddl": (
+                f"ALTER TABLE {_quote_ident(tablename)} "
+                f"ALTER COLUMN {_quote_ident(attname)} SET STATISTICS {proposed};\n"
+                f"ANALYZE {_quote_ident(tablename)};"
+            ),
+            "note": (
+                f"{tablename}.{attname} has exactly {int(n_mcv)} most-common "
+                f"values stored against a statistics target of {int(target)} -- "
+                f"the list is full, so it is truncated. The column has roughly "
+                f"{int(distinct):,} distinct values, and every one outside the "
+                f"tracked {int(n_mcv)} is estimated from a single uniform "
+                f"average instead of its own frequency."
+            ),
+            "caveats": [
+                "ANALYZE must be re-run for the new target to take effect; the "
+                "DDL alone changes nothing.",
+                "A larger target makes ANALYZE read more rows and makes planning "
+                "this column slightly slower, on every query that touches it.",
+                "Saturation says the list is truncated, not that any particular "
+                "query is being mis-estimated. Verify with the q-error on a "
+                "query that filters this column before and after.",
+            ],
+        })
+    return sorted(findings, key=lambda f: -f["estimated_distinct_values"])
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'

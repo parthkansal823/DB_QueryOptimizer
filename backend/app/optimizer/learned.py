@@ -397,6 +397,7 @@ class LearnedOptimizer:
         upper_log, gate_used = self._upper_bound(means[best_i], stds[best_i], caution)
         upper_ratio = math.exp(upper_log)
         required_ratio = 1.0 - self.min_relative_gain * caution
+        effective_ceiling = 1.0 + (self.max_regression_ratio - 1.0) / max(caution, 1e-9)
 
         chosen = candidate_plans[best_i]
         # The policy's own record is merged in rather than replaced. Overwriting
@@ -414,8 +415,13 @@ class LearnedOptimizer:
             "predicted_uncertainty_log": stds[best_i],
             "gate": gate_used,
             # The ceiling the pessimistic case has to stay under. Reported so a
-            # reader can see which of the two conditions a held plan failed.
+            # reader can see which of the two conditions a held plan failed --
+            # which means reporting the one actually compared against, not the
+            # raw setting. A payload showing pessimistic 1.152 against 1.25 with
+            # the verdict `downside_not_bounded` reads as a broken gate.
             "max_regression_ratio": self.max_regression_ratio,
+            "effective_max_regression_ratio": effective_ceiling,
+            "caution": caution,
             "chosen_index": best_i,
             "fell_back_to_baseline": False,
         }
@@ -431,10 +437,25 @@ class LearnedOptimizer:
         # Is the downside bounded? A question about risk, asked of the
         # uncertainty -- a ceiling on how bad this can get, not a demand that
         # the worst case also be a win.
-        # Divided, not multiplied: `caution` above 1 means *less* trust, so it
-        # has to lower the ceiling. Multiplying raised it, which would have
-        # made an unseen query the easiest one to gamble on.
-        if upper_ratio >= self.max_regression_ratio / caution:
+        #
+        # `caution` tightens the *margin above 1.0*, not the ratio. It used to
+        # divide the ratio directly, and that quietly changed the question being
+        # asked. `caution` is 2.0 for a query with no history
+        # (`regression_guard.UNSEEN_QUERY_CAUTION`), so the ceiling became
+        # 1.25 / 2.0 = **0.625** -- the pessimistic case had to be a 1.6x
+        # *speedup*, which is precisely the demand the comment above disclaims.
+        # Every query on a fresh workload starts with no history, so every query
+        # started there, and that is where the 96% veto rate came from.
+        #
+        # Scaling the margin keeps the ceiling above 1.0 for any caution, stays
+        # monotone (more caution is always stricter), and matches what
+        # `caution_multiplier` documents: "the confidence bar is raised and then
+        # relaxed as evidence arrives... deviating on a new query stays
+        # possible, it just has to look clearly worth it."
+        #
+        #     caution 1.0 -> 1.250   (unchanged)
+        #     caution 2.0 -> 1.125   (tighter, still a bounded regression)
+        if upper_ratio >= effective_ceiling:
             self.last_decision["fell_back_to_baseline"] = True
             self.last_decision["reason"] = "downside_not_bounded"
             self.last_decision["chosen_index"] = None

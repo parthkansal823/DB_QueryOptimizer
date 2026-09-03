@@ -1,15 +1,32 @@
-FROM postgres:16
+FROM postgres:18
 
+# `flex` and `bison` are not optional on PG18. pg_hint_plan's PG16 branch
+# shipped a pre-generated `query_scan.c`; the PG18 branch generates it from
+# `query_scan.l` at build time, and without flex the build fails with
+# "make: /usr/bin/flex: No such file or directory" -- after every C file has
+# already compiled, so the log reads like a successful build until its last line.
 RUN apt-get update && apt-get install -y \
     build-essential \
-    postgresql-server-dev-16 \
+    postgresql-server-dev-18 \
+    flex \
+    bison \
     git \
+    # pg_overexplain (PG18, contrib): reports range-table entries, per-node
+    # plan internals and relation OIDs that no EXPLAIN option exposes. Not in
+    # the base image.
+    postgresql-contrib-18 \
     && rm -rf /var/lib/apt/lists/*
 
-# pg_hint_plan's branch must match your Postgres major version (REL16 here).
+# pg_hint_plan's branch must match your Postgres major version (PG18 here).
 # If this has moved on by the time you build it, check
-# https://github.com/ossc-db/pg_hint_plan for the branch matching PG 16.
-RUN git clone --branch PG16 --depth 1 https://github.com/ossc-db/pg_hint_plan.git /tmp/pg_hint_plan \
+# https://github.com/ossc-db/pg_hint_plan for the branch matching your PG.
+#
+# The move from PG16 to PG18 was not cosmetic. On PG16 this project ran
+# pg_hint_plan **1.6.3** while the manual it was being read against
+# documented a newer one, and the gap was silent: `DisableIndex` simply did
+# not exist, and the rejection arrived at INFO severity, which the default
+# `client_min_messages` discards. See docs/WRITEUP.md 2.20.
+RUN git clone --branch PG18 --depth 1 https://github.com/ossc-db/pg_hint_plan.git /tmp/pg_hint_plan \
     && cd /tmp/pg_hint_plan \
     && make && make install \
     && rm -rf /tmp/pg_hint_plan

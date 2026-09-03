@@ -184,6 +184,26 @@ def current_version() -> str | None:
     return _read_registry().get("current")
 
 
+def promoted_at() -> datetime | None:
+    """
+    When the currently-served model was promoted, or None if unknown.
+
+    `regression_guard` uses this as the horizon on the evidence it blocks
+    queries with: a regression measured under a superseded model describes that
+    model, not this one, and the execution log keeps both forever.
+    """
+    raw = _read_registry().get("promoted_at")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    # A naive timestamp from an older registry would raise on comparison with
+    # an aware one, which would take the guard down rather than widen a window.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def list_versions() -> list[dict]:
     """Newest first."""
     return sorted(_read_registry()["versions"], key=lambda v: v["version_id"], reverse=True)

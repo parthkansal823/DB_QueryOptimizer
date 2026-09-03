@@ -19,6 +19,10 @@ import { useEffect, useState } from "react";
 // are opposites, so half of everyone reads it backwards. A fixed icon says
 // "theme" and the tooltip says which way it goes.
 
+// Also spelled out inline in `index.html`, which stamps the saved theme
+// before the first paint. That script cannot import this one -- it has to
+// run before any module loads -- so the two copies are kept next to a note
+// rather than pretending they can be shared.
 const KEY = "lqo-theme";
 
 function systemPrefersDark() {
@@ -30,7 +34,7 @@ function systemPrefersDark() {
 }
 
 /** The stored choice, or null when there is none and the system decides. */
-export function readTheme() {
+function readTheme() {
   try {
     const stored = localStorage.getItem(KEY);
     return stored === "light" || stored === "dark" ? stored : null;
@@ -41,7 +45,7 @@ export function readTheme() {
   }
 }
 
-export function applyTheme(theme) {
+function applyTheme(theme) {
   const root = document.documentElement;
   if (theme === "light" || theme === "dark") {
     root.setAttribute("data-theme", theme);

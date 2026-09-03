@@ -202,9 +202,20 @@ def redundant(cur, schema: str = "public") -> list[dict]:
 
 
 def report(cur, schema: str = "public") -> dict:
-    """Everything this module knows about the indexes that already exist."""
+    """
+    Everything this module knows about the indexes on this database.
+
+    The first three findings are about indexes that already exist and should
+    not. `brin` is the one that points the other way -- an index that does not
+    exist and would be much smaller than the B-tree it replaces -- and it lives
+    in `index_advice` because it is driven by column statistics rather than by
+    the index catalogue.
+    """
+    from app.index_advice import brin_opportunities
+
     return {
         "unused": unused(cur, schema),
         "duplicates": duplicates(cur, schema),
         "redundant": redundant(cur, schema),
+        "brin": brin_opportunities(cur, schema),
     }

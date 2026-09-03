@@ -39,7 +39,22 @@ from app.optimizer.ranker import PairwisePlanRanker
 from app.plan_extractor import _extract_join_types, _extract_scan_relations, _extract_tables
 from app.schema_introspection import discover_table_cardinalities
 
-MODEL_PATH = os.getenv("MODEL_OUT_PATH", "models/plan_selector.pkl")
+# Deliberately NOT `models/plan_selector.pkl`.
+#
+# That file is `model_store.CURRENT_PATH` -- the one `learned.py` loads to serve
+# with. `retrain.py` states the invariant plainly ("train() writes to a scratch
+# path -- promotion is this module's decision, not train()'s") and honours it by
+# passing an explicit path, but the CLI default did not, so
+# `python -m app.train` overwrote the served model with an untested one and the
+# registry's promotion decision was bypassed without a word.
+#
+# Measured: a retrain whose offline eval was worse than the incumbent on every
+# policy (risk-averse headroom 0.045 against 0.365) was refused promotion by the
+# registry and served anyway, because the pickle had already landed on the
+# served path. `model_store.py`'s own docstring says the registry exists to stop
+# exactly this: "Until now the pipeline overwrote models/plan_selector.pkl on
+# every train".
+MODEL_PATH = os.getenv("MODEL_OUT_PATH", "models/_trained.pkl")
 EVAL_PATH = os.getenv("EVAL_OUT_PATH", "models/eval_results.json")
 
 FETCH_SQL = """
@@ -424,6 +439,22 @@ def train(
     latest_run_only: bool = False,
     conformal_alpha: float = DEFAULT_CONFORMAL_ALPHA,
 ) -> dict:
+    # Checked before any work: this used to sit beside the write, so an
+    # invalid destination was only reported after a full training run.
+    # A caller that names the served path is asking this function to make a
+    # promotion decision it is not allowed to make. Refused loudly rather than
+    # silently redirected, because a run that thinks it deployed a model and did
+    # not is the same silent failure in the other direction.
+    from app import model_store
+
+    if os.path.abspath(model_path) == os.path.abspath(model_store.CURRENT_PATH):
+        raise ValueError(
+            f"{model_path} is the model being served. Training writes a candidate; "
+            f"promoting it is `model_store.promote()`'s decision, made against the "
+            f"incumbent (see app/retrain.py). Pass --model-out with another path, "
+            f"or use POST /model/retrain which runs the champion/challenger comparison."
+        )
+
     rows = _load_rows()
     if not rows:
         raise RuntimeError("plan_execution_log is empty -- run `python -m app.collect_data` first.")
@@ -690,6 +721,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n-models", type=int, default=8, help="bootstrapped ensemble size (drives uncertainty estimates)"
     )
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help="record the trained model in the version registry as a candidate. "
+             "It is not promoted -- POST /model/retrain compares a challenger "
+             "against the incumbent on a common held-out set and decides.",
+    )
     args = parser.parse_args()
 
     results = train(
@@ -699,4 +737,24 @@ if __name__ == "__main__":
         latest_run_only=args.latest_run_only,
     )
     print(json.dumps(results, indent=2))
+
+    print()
+    print(f"Candidate written to {args.model_out}")
+    if args.register:
+        import pickle as _pickle
+
+        from app import model_store
+
+        with open(args.model_out, "rb") as fh:
+            bundle = _pickle.load(fh)
+        version_id = model_store.save_version(bundle, results)
+        current = model_store.current_version()
+        print(f"Registered as {version_id} (not promoted; serving {current}).")
+    else:
+        print("Not registered. Pass --register to record it as a candidate.")
+    print(
+        "Promotion is a comparison, not a side effect of training: "
+        "POST /model/retrain scores challenger and champion on a common "
+        "held-out set and promotes only on a real improvement."
+    )
     print(f"\nModel written to {args.model_out}")

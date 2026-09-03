@@ -358,26 +358,53 @@ backend/app/
 ├── schema_introspection.py table sizes from pg_class, any schema
 ├── schema_graph.py         discovers tables and join edges
 ├── advisor.py              suggests CREATE INDEX / CREATE STATISTICS
-├── workload.py             the 25-query benchmark
+├── index_advice.py         index shape per predicate: trigram, covering, BRIN
+├── hypothetical.py         HypoPG: what an index *would* do, without building it
+├── workload.py             the 24-query benchmark
 ├── workload_generator.py   writes a workload for an unknown database
-├── onboard.py              one command: discover → generate → collect → train
+├── schema_introspection.py reads an unfamiliar schema
+├── schema_graph.py         join graph from foreign keys
+├── onboard.py              one command: discover -> generate -> collect -> train
 ├── collect_data.py         offline training-data sweep
-├── train.py                trains the model, writes the bundle
-├── retrain.py              champion/challenger gate
+├── train.py                trains the model, writes a *candidate* bundle
+├── retrain.py              champion/challenger gate -- the only thing that promotes
 ├── model_store.py          versioned models, promote, rollback
-├── calibrate.py            measures the best confidence thresholds
+├── model_zoo.py            alternative model backends
+├── calibrate.py            sweeps the gate thresholds, by replay or by execution
 ├── benchmark.py            native vs learned over the workload
 ├── experiment.py           paired A/B with confidence intervals
+├── measurement.py          fairness, prewarming, and a deterministic session
+├── audit_binding.py        asks pg_hint_plan whether every candidate bound
+├── diagnostics.py          why the model is or is not confident
+├── query_template.py       query identity, with hints stripped out
 ├── stats.py                matched-pair reporting for the dashboard
+├── settings.py             runtime configuration the dashboard can change
+├── saved_queries.py        the queries a user asked to learn
+├── db.py, db_profiles.py   connection pool, and pointing it elsewhere
+├── dbadvisor/              what to fix in the database itself
+│   ├── indexes.py          unused, duplicate, redundant, and missing BRIN
+│   ├── tables.py           bloat, fill factor, column order
+│   ├── maintenance.py      vacuum, analyze, visibility map, XID age
+│   ├── physical.py         partitioning, TOAST, table access methods
+│   ├── extended_stats.py   correlated columns, and statistics targets
+│   ├── query_stats.py      pg_stat_statements: the workload's real shape
+│   ├── observability.py    which extensions and counters are available
+│   └── server_config.py    memory, cost constants, autovacuum settings
 └── optimizer/
     ├── hints.py            builds the action space
-    ├── features.py         plan → feature vector
+    ├── catalog.py          index names by *alias*, which is how hints address them
+    ├── hint_binding.py     did the hint actually apply? -- pg_hint_plan's own answer
+    ├── prefilter.py        drops candidates that provably cannot differ
+    ├── features.py         plan -> feature vector
     ├── plan_tree.py        structural features
     ├── bandit.py           bootstrapped ensemble + policies
     ├── ranker.py           pairwise learning-to-rank
     ├── cardinality.py      learned row-estimate correction
-    ├── learned.py          plan selection + cost veto
-    ├── regression_guard.py per-query blocking
+    ├── conformal.py        distribution-free prediction intervals
+    ├── calibration.py      affine correction of the predicted level
+    ├── learned.py          plan selection + the safety gate
+    ├── regression_guard.py per-query blocking, windowed to the current model
+    ├── decision_cache.py   memoised decisions for repeated queries
     ├── planner.py          production path: plan N, run 1
     └── regret.py           cumulative regret
 ```

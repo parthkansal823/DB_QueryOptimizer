@@ -1,11 +1,11 @@
 {
-  "confidence_z": 2.0,
-  "min_relative_gain": 0.02,
-  "calibrated_on_n_queries": 9,
-  "expected_deviation_rate": 0.5555555555555556,
-  "expected_regression_rate": 0.2,
-  "expected_worst_regression_ratio": 1.0924024640657084,
-  "chosen_by": "replay",
+  "confidence_z": 1.0,
+  "min_relative_gain": 0.1,
+  "chosen_by": "measured",
   "evaluated_on": "held_out_queries",
-  "excluded_query_prefix": "auto_"
+  "calibrated_on_n_queries": 11,
+  "measured_headroom_captured": 0.403,
+  "measured_headroom_captured_held_out": 0.176,
+  "measured_vetoed_queries": 3,
+  "measured_note": "chosen by app.calibrate --measure on 2026-09-02 against model 20260902T173559Z. The replay-recommended setting (z=2.0, min_gain=0.2) measured -3.9% on held-out queries -- worse than not deviating at all."
 }

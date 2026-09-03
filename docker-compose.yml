@@ -52,7 +52,16 @@ services:
       # survives `docker compose down -v` being forgotten; this does not.
       #
       # `data/pgdata/` is gitignored -- it is 9.5GB of database, not source.
-      - ./data/pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18 changed the recommended mount point: a single mount at
+      # /var/lib/postgresql, with the server placing its cluster in a version
+      # subdirectory beneath it. Mounting .../data directly still works but puts
+      # a mount-point boundary exactly where `pg_upgrade --link` needs to move
+      # files, so the next major upgrade would have to copy 9 GB instead of
+      # hard-linking it. The PG16 cluster this replaced is preserved at
+      # data/pgdata_pg16 -- its `job` (IMDB/JOB) database is not regenerable
+      # from schema.sql and can be reached by pointing a postgres:16 container
+      # at that directory.
+      - ./data/pgdata:/var/lib/postgresql
       - ./postgres/init:/docker-entrypoint-initdb.d
       - ./data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql
       # Read-only: lets `data/job/load_job.sh` COPY the JOB/IMDB CSVs
@@ -62,15 +71,22 @@ services:
   backend:
     build: ./backend
     environment:
-      # `lqo_v2` rather than `lqo`. The original was seeded before the bug in
-      # data/schema.sql was found: a `CROSS JOIN LATERAL (... ORDER BY random()
-      # LIMIT 1)` that PostgreSQL is free to evaluate once, so every user got the
-      # same city and every product the same brand. `SELECT count(DISTINCT city)`
-      # returned 1 across 50,000 rows, which means the correlated columns this
-      # whole project is built around had no correlation because they had no
-      # variety. The old database is kept rather than dropped so the two can be
-      # compared.
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo_v2
+      # `lqo`, and the reason it is not `lqo_v2` any more is worth keeping.
+      #
+      # The original `lqo` was seeded before a bug in data/schema.sql was found:
+      # a `CROSS JOIN LATERAL (... ORDER BY random() LIMIT 1)` that PostgreSQL is
+      # free to evaluate once, so every user got the same city and every product
+      # the same brand. `SELECT count(DISTINCT city)` returned 1 across 50,000
+      # rows -- the correlated columns this whole project is built around had no
+      # correlation, because they had no variety. `lqo_v2` was a reseed beside
+      # it, so the two could be compared.
+      #
+      # `data/schema.sql` has been fixed since, and the PostgreSQL 18 upgrade
+      # rebuilt the cluster from it: the fresh `lqo` has 11 cities, 5 countries,
+      # 10 brands and 5 categories. It *is* the corrected database, so the v2
+      # name now points at nothing and only survives as a trap. The PG16 cluster
+      # holding the real `lqo_v2` is preserved at data/pgdata_pg16.
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo
       FRONTEND_ORIGIN: http://localhost:5173
       # Measured best on this dataset: 87.8% of oracle headroom captured
       # versus 77.2% for the ensemble policies (docs/WRITEUP.md 2.1).

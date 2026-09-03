@@ -123,3 +123,42 @@ class TestFiltering:
         _, report = rows_for_served_action_space([row("/*+ HashJoin(a b) */")])
         assert "never served" in report["reason"]
         assert "gate" in report["reason"]
+
+
+class TestCollectionFollowsTheServedActionSpace:
+    """
+    Collection defaults to what serving offers, rather than asserting its own answer.
+
+    `rows_for_served_action_space` above drops rows for families the optimizer
+    does not serve, and reads which those are from `planner.py` so the two
+    cannot drift. Collection was the last place still hardcoding one:
+    `include_join_methods` defaulted to `True` while `INCLUDE_JOIN_METHODS` is
+    off, so a run spent most of its wall clock measuring the forced join-method
+    family -- the slowest in the action space, mean ratio 5.49 against 1.97 --
+    and training then discarded every row of it.
+
+    Measured: a 5-repetition run was still grinding through forced merge joins
+    after an hour, having produced 2,465 rows of a family that would not survive
+    the filter.
+    """
+
+    def test_the_default_is_read_from_the_serving_flag(self, monkeypatch):
+        import inspect
+
+        from app.collect_data import collect
+
+        assert inspect.signature(collect).parameters["include_join_methods"].default is None, (
+            "a hardcoded default is what let collection and serving disagree"
+        )
+
+    def test_an_explicit_value_still_wins(self):
+        """
+        A run meant to answer "would join methods earn their place?" has to be
+        able to collect them even though serving does not offer them.
+        """
+        import inspect
+
+        from app.collect_data import collect
+
+        params = inspect.signature(collect).parameters
+        assert params["include_join_methods"].annotation in ("bool | None", bool | None)

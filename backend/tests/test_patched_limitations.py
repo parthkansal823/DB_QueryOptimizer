@@ -5,6 +5,7 @@ Each of these describes something the system used to get wrong, so the test
 name is the behaviour and the docstring is why it mattered.
 """
 
+import pytest
 from app.optimizer.features import build_feature_columns, featurize
 from app.optimizer.hints import generate_join_order_candidates
 from app.plan_extractor import extract_join_graph
@@ -227,17 +228,70 @@ def test_a_marginal_win_is_taken_on_a_known_query_and_refused_on_an_unseen_one()
     """
     Same prediction, same uncertainty -- only the evidence differs. A query the
     guard has history for clears the bar; a brand-new one does not.
+
+    The numbers changed when `caution` stopped dividing `max_regression_ratio`
+    and started tightening the margin above 1.0. This test previously used a
+    prediction of 0.82x with a spread of 0.05, whose pessimistic case at
+    caution 2.0 is **0.906** -- the worst plausible outcome was still a 9%
+    speedup, and the gate refused it. That was not caution, and asserting it
+    kept the real bug in place: with the old arithmetic the ceiling fell to
+    1.25 / 2.0 = 0.625, so an unseen query had to have a pessimistic case that
+    was a 1.6x *win*. Every query on a fresh workload is unseen.
+
+    So the case here is one that is genuinely risky rather than merely
+    uncertain: a 15% predicted gain with a wide spread, whose pessimistic case
+    at caution 2.0 is a **27% regression** and therefore past the tightened
+    ceiling of 1.125.
     """
     import math
 
-    # ~18% predicted gain with modest spread: clears the normal bar, not a 2x one.
-    opt = _optimizer(mean=math.log(0.82), std=0.05)
+    opt = _optimizer(mean=math.log(0.85), std=0.20)
 
     opt.select_plan([_candidate()], baseline_plan=_baseline(), caution=1.0)
     assert opt.last_decision["fell_back_to_baseline"] is False
+    assert opt.last_decision["pessimistic_speedup_vs_native"] < 1.25
 
     opt.select_plan([_candidate()], baseline_plan=_baseline(), caution=2.0)
     assert opt.last_decision["fell_back_to_baseline"] is True
+    assert opt.last_decision["reason"] == "downside_not_bounded"
+    assert opt.last_decision["pessimistic_speedup_vs_native"] > 1.25
+
+
+def test_caution_never_pushes_the_ceiling_below_no_regression():
+    """
+    The bug the rewrite above fixed, stated directly.
+
+    `caution` may tighten how much regression is tolerated; it may never demand
+    that the pessimistic case be a *speedup*. A ceiling below 1.0 means "the
+    worst plausible outcome must be faster than native", which is a different
+    and far stricter question than "the downside is bounded" -- and it is not
+    reachable for most queries at any confidence.
+    """
+    import math
+
+    opt = _optimizer(mean=math.log(0.85), std=0.01)
+    for caution in (1.0, 2.0, 5.0, 100.0):
+        opt.select_plan([_candidate()], baseline_plan=_baseline(), caution=caution)
+        ceiling = opt.last_decision["effective_max_regression_ratio"]
+        assert ceiling > 1.0, f"caution={caution} gave a ceiling of {ceiling}"
+        assert ceiling <= opt.last_decision["max_regression_ratio"]
+
+
+def test_the_reported_ceiling_is_the_one_the_gate_compared_against():
+    """
+    A payload showing a pessimistic 1.152 against a ceiling of 1.25, with the
+    verdict `downside_not_bounded`, reads as a gate that vetoed a plan it should
+    have allowed. That was the real payload, and the raw `max_regression_ratio`
+    it reported was not the number being compared.
+    """
+    import math
+
+    opt = _optimizer(mean=math.log(0.85), std=0.20)
+    opt.select_plan([_candidate()], baseline_plan=_baseline(), caution=2.0)
+    d = opt.last_decision
+    assert d["caution"] == 2.0
+    assert d["effective_max_regression_ratio"] == pytest.approx(1.125)
+    assert d["pessimistic_speedup_vs_native"] >= d["effective_max_regression_ratio"]
 
 
 def test_a_clear_win_still_goes_through_on_an_unseen_query():

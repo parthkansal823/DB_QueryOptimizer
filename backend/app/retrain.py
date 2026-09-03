@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import json
 
 from app import model_store
@@ -92,14 +93,45 @@ def rows_since_last_training() -> int:
         return cur.fetchone()[0]
 
 
-def _score_bundle(bundle: dict, rows_by_query: dict[str, list[dict]]) -> float | None:
+def served_policy() -> str:
+    """
+    The selection policy this deployment actually serves with.
+
+    Read from the environment rather than restated, because promotion has to
+    score the policy that will run. It used to hardcode `risk_averse` while
+    `docker-compose.yml` sets `SELECTION_POLICY: pairwise_rank` and the code
+    default is `greedy` -- three policies named in three places.
+
+    That is not academic. The model promoted on 2 September beat the champion by
+    8.3% on the risk-averse score, and on the train-time eval its **pairwise_rank**
+    headroom was flat (0.163 -> 0.162) while risk-averse *collapsed* from +0.365
+    to -0.142. Promotion was deciding on a policy nobody runs, using a number
+    that moved in the opposite direction to the one that matters.
+
+    `docs/WRITEUP.md` 2.22 names the pattern: a constant that duplicates a
+    decision made elsewhere will eventually disagree with it. This is the fourth
+    instance.
+    """
+    return os.getenv("SELECTION_POLICY", "greedy")
+
+
+def _score_bundle(
+    bundle: dict,
+    rows_by_query: dict[str, list[dict]],
+    policy: str | None = None,
+) -> float | None:
     """
     Average latency of the plans this bundle would have picked, over the
     given held-out queries. Lower is better; None if unscoreable.
+
+    Scores with the policy that serves (see `served_policy`), so a promotion
+    decision is a statement about the system that will run rather than about a
+    configuration it does not use.
     """
     if bundle is None:
         return None
 
+    policy = policy or served_policy()
     model = bundle["model"]
     feature_columns = bundle["feature_columns"]
     cardinalities = bundle["table_cardinalities"]
@@ -110,7 +142,16 @@ def _score_bundle(bundle: dict, rows_by_query: dict[str, list[dict]]) -> float |
         latencies = [c["actual_total_time_ms"] for c in candidates]
         vectors = [to_vector(featurize(c, cardinalities), feature_columns) for c in candidates]
         try:
-            index, _ = select_index(model, vectors, policy="risk_averse")
+            # `pairwise_rank` lives on the ranker, not the ensemble, so it is not
+            # one of `bandit.POLICIES` -- the same split `calibrate.py` handles.
+            if policy == "pairwise_rank":
+                ranker = bundle.get("ranker")
+                if ranker is None:
+                    return None
+                costs = [c["total_cost"] or float("inf") for c in candidates]
+                index = ranker.select(vectors, tie_break_costs=costs)
+            else:
+                index, _ = select_index(model, vectors, policy=policy)
         except Exception:  # noqa: BLE001 - a stale bundle shouldn't block a retrain
             return None
         picked.append(latencies[index])
@@ -192,11 +233,17 @@ def retrain_if_needed(
         "challenger_avg_latency_ms": challenger_score,
         "improvement": improvement,
         "min_improvement": min_improvement,
+        # Which policy the two models were compared under. Without it the
+        # registry records a verdict with no way to tell what it measured.
+        "scored_with_policy": served_policy(),
         "metrics": metrics,
     }
 
     if improvement > min_improvement:
-        model_store.promote(version_id, reason=f"beat champion by {improvement:.1%}")
+        model_store.promote(
+            version_id,
+            reason=f"beat champion by {improvement:.1%} on {served_policy()}",
+        )
         decision["action"] = "promoted"
     else:
         decision["action"] = "rejected"

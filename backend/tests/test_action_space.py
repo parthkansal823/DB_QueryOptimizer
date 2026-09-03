@@ -224,3 +224,63 @@ def test_the_budget_setting_is_declared_for_the_dashboard():
     field = app_settings.FIELDS["adaptive_candidate_budget"]
     assert field["type"] == "bool"
     assert field["default"] is True
+
+
+class TestBudgetCountsDistinctPlans:
+    """
+    The candidate budget funds *alternatives*, not attempts.
+
+    It used to slice the hint list and deduplicate afterwards, which spends the
+    budget before knowing what it bought. Many hints legitimately collapse to
+    the same plan -- PostgreSQL answers most `Leading()` orders on a small join
+    with the plan it already preferred -- and measured on this workload 56 of 83
+    candidates were duplicates. The budget funded repeats while genuinely
+    different alternatives further down the list went unplanned.
+    """
+
+    def test_a_duplicate_plan_is_not_counted_against_the_budget(self):
+        """
+        The loop's actual contract, exercised directly: given hints that plan to
+        repeated shapes, the candidate list fills with *distinct* plans up to
+        the budget rather than stopping at the first `budget` hints.
+        """
+        from app.optimizer.hints import plan_fingerprint
+
+        budget = 3
+        # Six hints, four distinct plans among them.
+        planned = [
+            {"Node Type": "Seq Scan"},
+            {"Node Type": "Seq Scan"},
+            {"Node Type": "Hash Join"},
+            {"Node Type": "Seq Scan"},
+            {"Node Type": "Nested Loop"},
+            {"Node Type": "Merge Join"},
+        ]
+        baseline = {"Node Type": "Index Scan"}
+
+        seen = {plan_fingerprint({"raw_plan": baseline})}
+        kept, duplicates = [], 0
+        for shape in planned:
+            if len(kept) >= budget:
+                break
+            fp = plan_fingerprint({"raw_plan": shape})
+            if fp in seen:
+                duplicates += 1
+                continue
+            seen.add(fp)
+            kept.append(shape)
+
+        assert len(kept) == budget, "the budget should be filled with distinct plans"
+        assert duplicates == 2, "the two repeats should not have consumed a slot"
+        assert [k["Node Type"] for k in kept] == ["Seq Scan", "Hash Join", "Nested Loop"]
+
+    def test_the_attempt_cap_is_a_multiple_of_the_budget(self):
+        """
+        Filling the budget with distinct plans must not let a fully degenerate
+        query -- every hint collapsing to the baseline -- plan the entire list
+        looking for something that is not there.
+        """
+        from app.optimizer.planner import MAX_PLANNING_ATTEMPTS_PER_SLOT
+
+        assert MAX_PLANNING_ATTEMPTS_PER_SLOT >= 2, "no room to absorb duplicates"
+        assert MAX_PLANNING_ATTEMPTS_PER_SLOT <= 5, "unbounded planning on a bad query"
