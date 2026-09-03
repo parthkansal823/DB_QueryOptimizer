@@ -124,8 +124,40 @@ def get_plan(cursor, query: str, analyze: bool = True) -> dict:
         "tables_scanned": _extract_tables(plan),
         "scan_relations": _extract_scan_relations(plan),
         "join_graph": extract_join_graph(plan),
+        "disabled_nodes": count_disabled_nodes(plan),
         **_extract_buffers(plan),
     }
+
+
+def count_disabled_nodes(plan: dict) -> int:
+    """
+    How many nodes the planner used despite having been told not to.
+
+    PostgreSQL 17 added `Disabled: true` to `EXPLAIN`, and PostgreSQL 18 changed
+    what it means to have it. Before 18, a node reached under `enable_x = off`
+    was priced at `disable_cost` (~1e10), so a disabled plan announced itself in
+    the total cost and this project detected it that way
+    (`learned.DISABLE_COST_SCALE`). PG18 removed that inflation and tracks
+    disabled nodes as a separate count instead.
+
+    Measured on 18.6, the same query with and without three scan types banned:
+
+        no hint                              cost 8.0   disabled []
+        enable_seq/index/bitmapscan off      cost 8.0   disabled [Seq Scan, Index Scan]
+
+    **Identical cost.** So on PG18 no cost comparison can tell a plan the
+    planner was forbidden to use from one it chose freely, and the safety veto
+    that looked for a 1e9-scale cost silently stopped being reachable. This
+    reads the fact instead of inferring it, which is the whole reason the
+    `Disabled` flag was worth upgrading for -- see `docs/TECHNIQUES_BACKLOG.md`
+    C2.
+
+    Returns 0 on PG16, where the key is absent and the cost signal still works.
+    """
+    count = 1 if plan.get("Disabled") else 0
+    for child in plan.get("Plans", []) or []:
+        count += count_disabled_nodes(child)
+    return count
 
 
 # Conditions that name the two sides of a join. `Index Cond` is the odd one:

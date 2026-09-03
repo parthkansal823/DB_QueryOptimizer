@@ -93,9 +93,10 @@ or
 
 This is a *measured* statement, not a predicted one. The decision note beside it
 says what the model expected; this says what the clock said. `/query/analyze`
-runs every candidate, so by the time the panel renders the answer is known — and
-it used to present a pick that ran slower as "LEARNED PICK / CHOSEN" beside a
-larger number and leave you to compare the two yourself.
+executes the model's pick alongside a few others, so by the time the panel
+renders the answer is known — and it used to present a pick that ran slower as
+"LEARNED PICK / CHOSEN" beside a larger number and leave you to compare the two
+yourself.
 
 The 5% band matters. Two runs of the *same* plan on this database differ by more
 than that, so calling a 4% difference a regression would be as wrong as calling
@@ -156,9 +157,21 @@ the full version including the drift check.
 
 ## The production path
 
-Everything above uses `/query/analyze`, which runs every candidate so they can
-be compared. That is a measuring tool — it costs N executions to answer one
-question, so it would be slower than having no optimizer at all.
+Everything above uses `/query/analyze`, which plans every candidate and executes
+a few of them so they can be compared. It is a measuring tool: even executing
+four costs four times what serving one does.
+
+It used to execute *all* of them, which on a four-table query meant 19
+executions at 48 ms each — 915 ms of a 1.2 s request. Planning a candidate costs
+**0.89 ms**, and the model predicts latency from the plan tree rather than
+needing it measured, so those executions bought a slower dashboard and nothing
+else. `ANALYZE_EXECUTE_LIMIT` (default 4) now bounds them: the plan the model
+chose, plus the cheapest by the planner's own estimate. **1.19 s to 0.19 s.**
+
+The consequence is worth knowing when reading the panels above: the comparison
+is against four executed alternatives, not every one. `n_candidates_planned` and
+`n_candidates_executed` in the response say which numbers are measured and which
+are the planner's estimate.
 
 This button uses `/query/optimize`, the real path: it plans every candidate
 with `EXPLAIN` (nothing runs) and executes only the one it picks.
@@ -287,8 +300,15 @@ inside an average.
 | Time saved / lost | Green right of centre is saved, red left is lost |
 | Improvement | Percentage, negative when the query got slower |
 
-"Fastest seen" is knowable only because `/query/analyze` runs every candidate.
-In production you never learn what the plans you skipped would have cost.
+"Fastest seen" is knowable only because the candidates were executed, which is
+why it is a dashboard figure rather than a production one: in production you
+never learn what the plans you skipped would have cost.
+
+It is the fastest of the candidates this endpoint *executed*, not of all of
+them — four by default. `app.benchmark` executes every candidate, so its oracle
+is the real ceiling; this one is a floor under it. Raise
+`ANALYZE_EXECUTE_LIMIT` to close the gap, at the cost of the request time the
+limit exists to save.
 
 ---
 

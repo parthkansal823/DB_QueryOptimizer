@@ -33,9 +33,22 @@ import difflib
 import re
 from dataclasses import dataclass
 
-# `column "nmae" does not exist`, `relation "userss" does not exist`,
-# `syntax error at or near "FORM"`. The quoted token is the thing to replace.
+# `relation "userss" does not exist`, `syntax error at or near "FORM"`.
 _QUOTED = re.compile(r'"([^"]+)"')
+
+# PostgreSQL does not quote a *qualified* column reference. Measured on 18.6:
+#
+#     SELECT u.nmae FROM users u   ->  column u.nmae does not exist
+#     SELECT * FROM userss         ->  relation "userss" does not exist
+#
+# The first draft here looked only for a quoted token, so the qualified case --
+# by far the more common way to typo a column in a joined query -- produced a
+# suggestion from PostgreSQL's own hint and then no corrected SQL to apply it
+# to, because there was nothing identified to replace. Found by running the
+# three cases against the server rather than by reading the regex.
+_UNQUOTED_SUBJECT = re.compile(
+    r'^(?:column|relation|table|function)\s+([A-Za-z_][\w$.]*)\s', re.IGNORECASE
+)
 
 # How alike a catalogue name has to be before it is offered as a correction.
 # 0.6 accepts `nmae` -> `name` and `userss` -> `users`; it rejects `foo` ->
@@ -166,6 +179,34 @@ def _replace_identifier(sql: str, position: int | None, old: str, new: str) -> s
     return None
 
 
+def _rebase_position(sql: str, position: int | None, offending: str | None) -> int | None:
+    """
+    Translate PostgreSQL's offset into an offset in the SQL the user wrote.
+
+    PostgreSQL reports `statement_position` into the statement *it* received,
+    and this project rarely sends the user's text unaltered: `/query/optimize`
+    wraps it in `EXPLAIN (FORMAT JSON) `, and a candidate carries a `/*+ ... */`
+    hint in front. Every one of those shifts the offset.
+
+    Measured: `SELECT u.nmae FROM users u LIMIT 5` reported position 30, which
+    is 8 in the user's text plus the 22 characters of `EXPLAIN (FORMAT JSON) `.
+    The caret landed under `users u` -- confidently pointing at the one part of
+    the line that was correct, which is worse than not pointing at all.
+
+    Rather than track every prefix this project can add, the offending token is
+    located in the user's own text. Only an unambiguous single occurrence is
+    accepted: with the token appearing twice there is no way to know which one
+    PostgreSQL meant, and a caret under the wrong one is the bug being fixed.
+    """
+    if not offending:
+        return position
+    if position and 0 < position <= len(sql) and sql.startswith(offending, position - 1):
+        return position  # already correct: no prefix was added
+    if sql.count(offending) == 1:
+        return sql.index(offending) + 1
+    return None  # ambiguous -- report the error without pointing at the wrong text
+
+
 def explain(exc: Exception, sql: str, known_names: list[str] | None = None) -> SqlError:
     """
     Explain a failed statement, and correct it where that can be done safely.
@@ -186,9 +227,15 @@ def explain(exc: Exception, sql: str, known_names: list[str] | None = None) -> S
     except (TypeError, ValueError):
         position = None
 
-    line, col, excerpt = _locate(sql, position)
     quoted = _QUOTED.findall(message)
-    offending = quoted[0] if quoted else None
+    if quoted:
+        offending = quoted[0]
+    else:
+        bare = _UNQUOTED_SUBJECT.match(message)
+        offending = bare.group(1) if bare else None
+
+    position = _rebase_position(sql, position, offending)
+    line, col, excerpt = _locate(sql, position)
 
     error = SqlError(
         message=message,

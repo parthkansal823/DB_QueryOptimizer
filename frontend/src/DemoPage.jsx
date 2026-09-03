@@ -164,7 +164,10 @@ export default function DemoPage() {
       loadTrend();
       loadCostModel();
     } catch (err) {
-      setError(err.message);
+      // The structured explanation when the backend produced one (a 400 about
+      // the SQL itself), the bare message otherwise. `SqlErrorPanel` renders
+      // both, so nothing here has to decide which case it is.
+      setError(err.sqlError ?? err.message);
     } finally {
       setLoading(false);
     }
@@ -193,7 +196,15 @@ export default function DemoPage() {
           behind two toggles that say what is inside them. */}
       <section className="card">
         <h2>Query</h2>
-        <QueryForm onAnalyze={handleAnalyze} loading={loading} error={error} />
+        <QueryForm
+          onAnalyze={handleAnalyze}
+          loading={loading}
+          error={error}
+          onUseSuggestion={(sql) => {
+            setError(null);
+            handleAnalyze(sql);
+          }}
+        />
       </section>
 
       {result && (

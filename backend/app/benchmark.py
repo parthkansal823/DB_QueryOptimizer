@@ -260,11 +260,130 @@ def run(
     }
 
 
+# -- Protocols ---------------------------------------------------------------
+#
+# This script answers two different questions, and quoting one number for both
+# is what made every previous figure in this repository unusable (WRITEUP 2.30).
+#
+#   compare  -- "is configuration X better than Y?"
+#   deploy   -- "what is the running system delivering?"
+#
+# They need opposite treatment of the regression guard.
+#
+# The guard blocks a query after watching it regress over several *served*
+# executions, so what it blocks depends on what previous runs did. Measured:
+# two runs of the identical gate gave 15.6% and 7.2% captured headroom,
+# differing only in that the guard had learned to block ten queries in between.
+# For a comparison that is a confound, not a treatment -- the second
+# configuration is scored on a system the first one modified.
+#
+# So `compare` turns the guard off. That is not a loss of fidelity, because a
+# guard with no history blocks nothing anyway: it requires `min_observations`
+# served executions before it will act, and a single workload pass supplies one.
+# "Reset the guard" and "disable the guard" produce the same first run;
+# disabling is honest about which one is happening.
+#
+# `compare` also repeats. WRITEUP 2.26 measured 18.6% run-to-run variation on
+# this database, so a single pass cannot resolve a difference smaller than the
+# noise, and most differences worth arguing about are smaller than that.
+#
+# `deploy` leaves the guard on and does one pass. Its number is a point on a
+# trend, and it must never be compared against a `compare` number -- different
+# question, different system.
+PROTOCOLS = {
+    "compare": {
+        "use_guard": False,
+        # Five, not three, and the number came from the protocol measuring
+        # itself. Two independent 3-run measurements of the *identical* model
+        # gave medians of 8.0% and 16.0% captured headroom -- an 8-point gap
+        # between two "controlled" estimates of one configuration. The summary's
+        # own spread line had warned that anything under 8.4 points was inside
+        # the sample's noise, and it turned out to be describing itself.
+        #
+        # Five runs is still not many. The honest use of this number is the one
+        # that worked here: the champion measured -5.3% (range -13.6 to -2.0)
+        # and the challenger 7.4-16.6% across six runs, and the *ranges do not
+        # overlap*. That is a real difference. A gap between medians that sits
+        # inside either range is not.
+        "default_repeat": 5,
+        "question": "is this configuration better than that one?",
+        "note": (
+            "guard off and repeated, so the only thing changing between runs is "
+            "the configuration under test"
+        ),
+    },
+    "deploy": {
+        "use_guard": True,
+        "default_repeat": 1,
+        "question": "what is the running system delivering right now?",
+        "note": (
+            "guard on, one pass: a point on a trend, not comparable with a "
+            "`compare` number"
+        ),
+    },
+}
+
+
+def _summarise(results: list[dict], protocol: str, repeat: int) -> None:
+    """Print the spread, not just a number, so a reader can see the noise."""
+    import statistics
+
+    captured = [r["captured_pct"] for r in results]
+    held = [r["held_out_captured_pct"] for r in results if r.get("n_held_out")]
+
+    spec = PROTOCOLS[protocol]
+    print(f"\n=== protocol: {protocol} ({repeat} run{'s' if repeat != 1 else ''}) ===")
+    print(f"question: {spec['question']}")
+    print(f"method  : {spec['note']}")
+
+    def line(label: str, values: list[float]) -> None:
+        if not values:
+            return
+        median = statistics.median(values)
+        if len(values) == 1:
+            print(f"{label:22s} {median:6.1f}%   (single run -- spread unknown)")
+            return
+        print(
+            f"{label:22s} {median:6.1f}%   "
+            f"range {min(values):.1f}% to {max(values):.1f}%   "
+            f"runs {', '.join(f'{v:.1f}' for v in values)}"
+        )
+
+    line("headroom captured", captured)
+    line("held-out captured", held)
+
+    if len(captured) > 1:
+        spread = max(captured) - min(captured)
+        print(
+            f"\nA difference smaller than {spread:.1f} points is inside this "
+            f"sample's own spread and should not be argued about."
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", choices=list(POLICIES) + ["pairwise_rank"], default="greedy")
     parser.add_argument("--risk-lambda", type=float, default=1.0)
-    parser.add_argument("--no-guard", action="store_true", help="disable the per-query regression guard")
+    parser.add_argument(
+        "--protocol",
+        choices=sorted(PROTOCOLS),
+        default="deploy",
+        help=(
+            "'compare' to evaluate a configuration (guard off, repeated); "
+            "'deploy' to report what the running system delivers (guard on, one pass)"
+        ),
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=None,
+        help="workload passes; defaults to the protocol's own (compare: 3, deploy: 1)",
+    )
+    parser.add_argument(
+        "--no-guard",
+        action="store_true",
+        help="force the guard off regardless of protocol",
+    )
     parser.add_argument(
         "--timeout-ms",
         type=int,
@@ -272,9 +391,23 @@ if __name__ == "__main__":
         help="per-candidate statement_timeout; a slower candidate is skipped, not waited for",
     )
     args = parser.parse_args()
-    run(
-        policy=args.policy,
-        risk_lambda=args.risk_lambda,
-        use_guard=not args.no_guard,
-        statement_timeout_ms=args.timeout_ms,
-    )
+
+    spec = PROTOCOLS[args.protocol]
+    repeat = args.repeat if args.repeat is not None else spec["default_repeat"]
+    use_guard = spec["use_guard"] and not args.no_guard
+
+    results = []
+    for i in range(max(repeat, 1)):
+        if repeat > 1:
+            print(f"\n----- run {i + 1} of {repeat} -----")
+        results.append(
+            run(
+                policy=args.policy,
+                risk_lambda=args.risk_lambda,
+                use_guard=use_guard,
+                statement_timeout_ms=args.timeout_ms,
+                quiet=repeat > 1,
+            )
+        )
+
+    _summarise(results, args.protocol, max(repeat, 1))

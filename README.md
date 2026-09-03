@@ -11,8 +11,8 @@ It runs on any PostgreSQL database, ships with a dashboard that explains every
 decision it makes, and refuses to act when it isn't confident. Built end to end:
 data collection, feature engineering, model training, a self-retraining loop
 with rollback, two independent safety mechanisms, a conformally calibrated
-safety gate, and **1,136 tests** behind CI (1,016 backend of which 17 run against a live PostgreSQL with
-`pg_hint_plan` actually loaded, plus 120 frontend).
+safety gate, and **1,239 tests** behind CI (1,107 backend, of which 17 run against a live PostgreSQL with
+`pg_hint_plan` actually loaded, plus 132 frontend).
 
 ## Documentation
 
@@ -26,8 +26,9 @@ safety gate, and **1,136 tests** behind CI (1,016 backend of which 17 run agains
 | [`docs/JOB_RESULTS.md`](docs/JOB_RESULTS.md) | Results on the real JOB/IMDB benchmark |
 | [`docs/CONFIDENCE.md`](docs/CONFIDENCE.md) | **How the optimizer decides whether to trust itself** — and the two fixes that were measured and reverted |
 | [`docs/DATABASE_OPTIMIZATION.md`](docs/DATABASE_OPTIMIZATION.md) | Fixing the *database* rather than one query: correlated columns, server settings, index and table health |
-| [`docs/TECHNIQUES_BACKLOG.md`](docs/TECHNIQUES_BACKLOG.md) | The PostgreSQL manual read against this system — what was built from it, what is blocked on a server upgrade, and the four documented features that do not exist on this server |
+| [`docs/TECHNIQUES_BACKLOG.md`](docs/TECHNIQUES_BACKLOG.md) | The PostgreSQL manual read against this system — what was built from it, and what the move to PostgreSQL 18 unblocked. Nothing in it is blocked on the server any more |
 | [`famalies.txt`](famalies.txt) | Every hint family in the action space, with measured evidence that each one binds |
+| [`.claude/hooks/`](.claude/hooks/) | Ruff on every backend edit, the unit suite in the background, and a gate on `git commit` |
 
 > **Read `docs/WRITEUP.md` §2.4.0 before the numbers below.** The seed data in
 > `data/schema.sql` had a bug that gave every categorical column exactly one
@@ -190,9 +191,19 @@ that has since changed, server settings that are defaults rather than decisions.
 Each is fixed once and helps every query afterwards, including ones this system
 has never seen. See `docs/DATABASE_OPTIMIZATION.md`.
 
-Everything it decides is inspectable. `python -m app.diagnostics` answers "should
-I believe this model", `python -m app.dbadvisor` answers "what is wrong with this
-database", and the dashboard shows both.
+Everything it decides is inspectable:
+
+| command | answers |
+|---|---|
+| `python -m app.diagnostics` | should I believe this model? |
+| `python -m app.dbadvisor` | what is wrong with this database? |
+| `python -m app.audit_binding` | did every hint the optimizer generates actually bind? |
+| `python -m app.generalisation` | does the model predict unseen queries as well as trained ones? |
+
+The dashboard shows the first two. The third exists because a hint that is
+ignored is indistinguishable from one that did nothing, and the fourth because
+the benchmark's held-out column cannot answer its question when the gate
+declines to act on five of six held-out queries.
 
 ### Things worth knowing before trusting a number
 
@@ -200,10 +211,19 @@ database", and the dashboard shows both.
   of the built-in workload is in the model's training set, so the headline is
   substantially a memorisation score. The held-out figure below it is the one
   that says whether the model generalises.
-- **A single benchmark run cannot settle a comparison.** Native totals on this
-  database swing about 13% between identical runs. `python -m app.experiment`
-  interleaves two arms, puts a bootstrap interval around the difference, and
-  reports **unresolved** when the interval spans zero.
+- **A single benchmark run cannot settle a comparison.** Repeated executions of
+  the *same* plan on this database differ by **18.6%** on average.
+  `python -m app.experiment` interleaves two arms, puts a bootstrap interval
+  around the difference, and reports **unresolved** when the interval spans
+  zero; `app.benchmark --protocol compare` repeats the workload and prints the
+  spread beside the median.
+- **The benchmark mutates what the next benchmark reads.** The regression guard
+  accumulates history as runs happen, so two runs of an identical gate gave
+  15.6% and 7.2% captured headroom, differing only in what the guard had learned
+  in between. `--protocol compare` turns the guard off for exactly this reason;
+  `--protocol deploy` leaves it on and reports a trend point. The two numbers
+  answer different questions and must never be compared. See `docs/WRITEUP.md`
+  2.30.
 - **`docs/WRITEUP.md` keeps the failures.** A learned cardinality correction that
   raised the ceiling by 0.0%; a conformal bound that was correct and unusable; a
   gate that calibrated itself into doing nothing; a seed-data bug that removed
@@ -212,8 +232,9 @@ database", and the dashboard shows both.
 
 ## Tech stack
 
-- **Database**: PostgreSQL 16 + `pg_hint_plan`, built from source (see
-  `postgres/Dockerfile`)
+- **Database**: PostgreSQL 18 + `pg_hint_plan` 1.8.1, built from source (see
+  `postgres/Dockerfile`). Upgraded from 16.15 / 1.6.3; `docs/WRITEUP.md` 2.29
+  records what that unlocked and the safety veto it silently switched off
 - **Backend**: FastAPI + psycopg2 + LightGBM. Falls back to scikit-learn's
   `GradientBoostingRegressor` if the LightGBM native library is missing
 - **Learned part**: `backend/app/optimizer/learned.py`. A bootstrapped
@@ -241,8 +262,8 @@ which works with no model at all:
 docker compose exec backend python -m app.collect_data   # gather training data
 docker compose exec backend python -m app.train          # train models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark      # native vs. learned, full workload
-docker compose exec backend pytest                       # 481 unit tests, no database needed
-docker compose exec backend pytest -m integration        # 11 more: hints must actually bind
+docker compose exec backend pytest                       # 1,090 unit tests, no database needed
+docker compose exec backend pytest -m integration        # 17 more: hints must actually bind
 docker compose exec backend ruff check app tests         # lint, same rules CI runs
 ```
 
@@ -286,7 +307,7 @@ decision went the way it did, and the history across every run so far.
 | Endpoint | Purpose |
 |---|---|
 | `POST /query/optimize` | **The real path.** Plans N candidates on estimates, runs only the chosen one |
-| `POST /query/analyze` | Measuring path. Runs *every* candidate so they can be compared |
+| `POST /query/analyze` | Measuring path. Plans every candidate, executes `ANALYZE_EXECUTE_LIMIT` of them |
 | `GET /schema` | What it found in the current database (tables, join edges, declared vs. inferred) |
 | `GET /stats/trend` | Served vs. native history as matched pairs: overall, per day, per query, plus decision quality |
 | `GET /stats/cost-model` | How well PostgreSQL's cost estimates predict real time |
@@ -298,12 +319,23 @@ decision went the way it did, and the history across every run so far.
 | `POST /model/retrain` / `POST /model/rollback` | Drive the learning loop |
 | `GET /advisor` | Schema-wide fixes, currently unindexed foreign keys |
 
-The difference between the first two matters. `/query/analyze` runs every
-candidate, so it costs N executions to answer one question. That is useful for
-measuring and useless for serving. `/query/optimize` plans all candidates with
-`EXPLAIN` (no `ANALYZE`, so nothing runs) and executes only the winner.
-Measured on this workload: **3.8 ms of planning against 138 ms of execution**,
-about 2.7%.
+The difference between the first two matters, though it is smaller than it
+was. `/query/optimize` plans all candidates with `EXPLAIN` (no `ANALYZE`, so
+nothing runs) and executes only the winner.
+
+`/query/analyze` used to execute *every* candidate, which cost N executions to
+answer one question. Measured: 19 candidates at 48 ms each was 915 ms of a
+1.2 s request, while *planning* a candidate costs **0.89 ms**. The model never
+needed those executions -- it predicts latency from the plan tree -- so the
+endpoint now plans all of them and executes only the handful whose measured
+latency the response actually reports (`ANALYZE_EXECUTE_LIMIT`, default 4).
+**1.19 s to 0.19 s**, and every number that remains is still a real
+measurement. `n_candidates_planned` and `n_candidates_executed` in the response
+say which is which.
+
+Deliberately not parallelised: concurrent candidates compete for CPU and shared
+buffers, so every latency would be contaminated by whatever ran beside it --
+and those latencies are logged as training data.
 
 ## JOB/IMDB stretch goal
 
@@ -321,6 +353,8 @@ Everything this project produces at runtime is inside the repo directory, so
 |---|---|---|
 | `data/pgdata/` | **the PostgreSQL data directory** — bind-mounted by `docker-compose.yml` rather than a Docker named volume | 9.5 GB |
 | `data/job/csv/` | the downloaded JOB/IMDB dataset | 4.8 GB |
+| `data/pgdata_pg16/` | the **PostgreSQL 16 cluster**, kept when the project moved to 18. Not regenerable from `schema.sql`: it holds the `job` database. Reachable by pointing a `postgres:16` container at it | 9.2 GB |
+| `backups/` | `pg_dump` output, including the pre-upgrade snapshot | 14 MB |
 | `backend/models/` | trained bundles, the calibrated gate, generated workloads, saved queries | 23 MB |
 
 A Docker named volume would have been the conventional choice and is the reason
@@ -348,7 +382,10 @@ learned-query-optimizer/
 │   ├── schema.sql            synthetic benchmark schema + skewed seed data
 │   └── job/                  JOB/IMDB stretch goal: loader + docs
 ├── backend/
-│   ├── tests/                 pytest suite
+│   ├── tests/                 pytest suite (1,090 unit + 17 integration)
+│   ├── native/                optional compiled encoder; falls back to Python
+│   │   ├── plan_tree_native.cpp   C++ port of encode_plan_tree
+│   │   └── setup.py               build_ext --inplace
 │   └── app/
 │       ├── main.py               FastAPI endpoints
 │       ├── stats.py              paired served-vs-native reporting, decision quality
@@ -357,33 +394,55 @@ learned-query-optimizer/
 │       ├── plan_extractor.py     EXPLAIN JSON -> structured metrics
 │       ├── schema_introspection.py  table row counts from pg_class, any schema
 │       ├── advisor.py            index and statistics recommendations
+│       ├── index_advice.py       index shape per predicate: trigram, covering, BRIN
 │       ├── diagnostics.py        model/gate health: why it behaves as it does
+│       ├── generalisation.py     prediction error on unseen queries vs trained ones
+│       ├── sql_errors.py         a failed query, explained, with a corrected statement
+│       ├── measurement.py        fairness, prewarming, a deterministic session
+│       ├── audit_binding.py      asks pg_hint_plan whether every candidate bound
+│       ├── calibrate.py          sweeps the gate against your own logged results
 │       ├── hypothetical.py       what an index would be worth, via HypoPG
 │       ├── query_template.py     parameterised statements share one identity
 │       ├── experiment_job.py     paired A/B comparisons, run from the dashboard
-│       ├── workload.py           the 25-query benchmark workload
+│       ├── workload.py           the 24-query benchmark workload
 │       ├── collect_data.py       offline collection -> plan_execution_log
 │       ├── train.py              trains and evaluates the model
-│       ├── benchmark.py          CLI: native vs. learned over the workload
+│       ├── benchmark.py          CLI: native vs. learned; --protocol compare|deploy
 │       ├── retrain.py            learning loop: champion/challenger gate
 │       ├── model_store.py        versioned models, promotion, rollback
+│       ├── dbadvisor/            fixing the database rather than one query
+│       │   ├── indexes.py            unused, duplicate, redundant, missing BRIN
+│       │   ├── maintenance.py        vacuum, analyze, visibility, HOT updates
+│       │   ├── extended_stats.py     correlated columns, q-error, stats targets
+│       │   ├── physical.py           bloat, fill factor, partitioning
+│       │   ├── observability.py      what the server is not telling you
+│       │   └── query_stats.py        pg_stat_statements
 │       └── optimizer/
-│           ├── hints.py          join-order + join-method candidates
+│           ├── hints.py          the action space: 12 hint families
+│           ├── hint_binding.py   did the hint actually apply? pg_hint_plan's own answer
+│           ├── catalog.py        index map by *alias*, which is how hints address relations
+│           ├── prefilter.py      candidates that provably cannot differ from native
 │           ├── features.py       schema-agnostic feature vectors
 │           ├── plan_tree.py      plan-TREE encoding (Neo/Bao-inspired)
 │           ├── bandit.py         bootstrapped ensemble: Thompson sampling
 │           ├── ranker.py         Lero-style pairwise learning-to-rank
+│           ├── calibration.py    point calibration fitted on out-of-bag rows
 │           ├── regression_guard.py  per-query blocking, backward-looking
 │           ├── planner.py        the production path: plan N, run 1
 │           ├── regret.py         cumulative regret
-│           ├── cardinality.py   learned q-error + Rows() corrections
-│           ├── conformal.py    calibrated safety bound (out-of-bag conformal)
+│           ├── cardinality.py    learned q-error + Rows() corrections
+│           ├── conformal.py      calibrated safety bound (out-of-bag conformal)
 │           └── learned.py        plan selection + forward-looking safety veto
 ├── frontend/                 React (Vite) + Recharts dashboard
+├── .claude/hooks/            ruff on edit, tests async, a gate on git commit
 └── docs/
+    ├── ARCHITECTURE.md       how the whole system works — start here
     ├── DASHBOARD.md          how to read every panel
     ├── METRICS.md            how each number is worked out
     ├── ROADMAP.md            phase-by-phase plan
+    ├── CONFIDENCE.md         how the optimizer decides whether to trust itself
+    ├── DATABASE_OPTIMIZATION.md   fixing the database rather than one query
+    ├── TECHNIQUES_BACKLOG.md the PostgreSQL manual read against this system
     ├── WRITEUP.md            literature review, results, limitations
     └── JOB_RESULTS.md        results on the real JOB/IMDB benchmark
 ```
@@ -524,6 +583,11 @@ deviate on any predicted win at all.
 | `GUARD_MIN_OBSERVATIONS` | `3` | Served executions needed before the guard will judge a query |
 | `AUTO_RETRAIN_SECONDS` | `0` (off) | Retrain on a background interval; promotion is still gated |
 | `ENABLE_ROWS_CORRECTION` | `1` | Learned `Rows()` cardinality corrections as an extra candidate |
+| `INCLUDE_BUSHY` | `0` (off) | Bushy plan trees. Measured against the served space on all 24 queries: **zero wins** |
+| `INCLUDE_DISABLE_INDEX` | `0` (off) | `DisableIndex(alias index)`: plan as if an index were dropped. Needs pg_hint_plan >= 1.8 |
+| `INCLUDE_INDEX_PINNING` | `0` (off) | Pin scans to named indexes, read from the catalog |
+| `ANALYZE_EXECUTE_LIMIT` | `4` | How many candidates `/query/analyze` executes for its measured comparison |
+| `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin the API accepts |
 
 `GUARD_TOLERANCE` and `GUARD_MIN_OBSERVATIONS` were declared settings that
 nothing read; the guard kept its constructor defaults whatever they were set to.
@@ -652,4 +716,3 @@ What it does *not* claim: coverage is marginal and assumes exchangeability. A
 workload or schema that stops resembling the training queries breaks that
 assumption, and the guarantee with it — the same assumption the rest of the
 model already runs on, stated rather than buried.
-| `FRONTEND_ORIGIN` | `http://localhost:5173` | CORS origin the API accepts |

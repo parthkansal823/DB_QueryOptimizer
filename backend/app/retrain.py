@@ -121,12 +121,32 @@ def _score_bundle(
     policy: str | None = None,
 ) -> float | None:
     """
-    Average latency of the plans this bundle would have picked, over the
-    given held-out queries. Lower is better; None if unscoreable.
+    How this bundle would have performed on the held-out queries: the mean
+    latency of the plans it picks, **and the worst single pick**.
 
-    Scores with the policy that serves (see `served_policy`), so a promotion
-    decision is a statement about the system that will run rather than about a
-    configuration it does not use.
+    Returns `{"mean_ms", "worst_ratio_vs_best", "n_queries"}`, or None if
+    unscoreable. Scores with the policy that serves (see `served_policy`), so a
+    promotion decision is a statement about the system that will run rather than
+    about a configuration it does not use.
+
+    The worst case is here because the mean alone could not see the failure that
+    mattered. A PostgreSQL 16-trained model, still deployed after the upgrade to
+    18, predicted **0.291x** for a candidate its own training data measures at
+    1.134x, and served it: 137 ms of native work became 160 ms. The PG18-trained
+    challenger predicted 1.273x and would have declined. Scored on the mean, the
+    two came out **1.0% apart** -- below the promotion bar -- because on most
+    queries they pick the same plan, and the difference lives entirely in the
+    handful where they diverge.
+
+    An average answers "how good is this model on a typical query". Promotion
+    needs "is this model ever catastrophically wrong", and a metric that cannot
+    tell a uniformly mediocre model from a usually-fine-occasionally-disastrous
+    one is not measuring what the safety gate exists to protect against.
+
+    `worst_ratio_vs_best` is measured against the best candidate actually
+    available for that query rather than against native, so it reads as "how
+    much of the achievable win did the worst pick throw away" and stays
+    comparable across queries of very different absolute cost.
     """
     if bundle is None:
         return None
@@ -137,6 +157,7 @@ def _score_bundle(
     cardinalities = bundle["table_cardinalities"]
 
     picked: list[float] = []
+    worst_ratio = 1.0
     for rows in rows_by_query.values():
         candidates = [_row_to_candidate(r) for r in rows]
         latencies = [c["actual_total_time_ms"] for c in candidates]
@@ -155,8 +176,17 @@ def _score_bundle(
         except Exception:  # noqa: BLE001 - a stale bundle shouldn't block a retrain
             return None
         picked.append(latencies[index])
+        best = min(latencies)
+        if best > 0:
+            worst_ratio = max(worst_ratio, latencies[index] / best)
 
-    return sum(picked) / len(picked) if picked else None
+    if not picked:
+        return None
+    return {
+        "mean_ms": sum(picked) / len(picked),
+        "worst_ratio_vs_best": worst_ratio,
+        "n_queries": len(picked),
+    }
 
 
 def _load_challenger_bundle(path: str) -> dict:
@@ -224,13 +254,24 @@ def retrain_if_needed(
             "new_rows": new_rows,
         }
 
-    improvement = (champion_score - challenger_score) / champion_score
+    improvement = (
+        champion_score["mean_ms"] - challenger_score["mean_ms"]
+    ) / champion_score["mean_ms"]
+    champ_worst = champion_score["worst_ratio_vs_best"]
+    chall_worst = challenger_score["worst_ratio_vs_best"]
+    # A challenger that improves the mean while picking one plan far worse than
+    # the champion's worst is not an improvement to a system whose whole purpose
+    # is not being catastrophically wrong.
+    worst_regressed = chall_worst > champ_worst * 1.1
+    worst_improved = chall_worst < champ_worst * 0.9
     decision = {
         "version_id": version_id,
         "new_rows": new_rows,
         "champion_id": champion_id,
-        "champion_avg_latency_ms": champion_score,
-        "challenger_avg_latency_ms": challenger_score,
+        "champion_avg_latency_ms": champion_score["mean_ms"],
+        "challenger_avg_latency_ms": challenger_score["mean_ms"],
+        "champion_worst_ratio": champ_worst,
+        "challenger_worst_ratio": chall_worst,
         "improvement": improvement,
         "min_improvement": min_improvement,
         # Which policy the two models were compared under. Without it the
@@ -239,16 +280,43 @@ def retrain_if_needed(
         "metrics": metrics,
     }
 
-    if improvement > min_improvement:
+    # Two ways to earn promotion, because two different things can be wrong
+    # with a model.
+    #
+    # A clear mean improvement is the ordinary case. A materially better *worst*
+    # pick is the other, and it has to count on its own: a challenger that turns
+    # a catastrophic prediction into a correct one may barely move the mean --
+    # measured at 1.0%, below the bar -- while being the difference between
+    # serving a plan 17% slower than native and declining to serve it.
+    if worst_regressed:
+        decision["action"] = "rejected"
+        decision["reason"] = (
+            f"challenger's worst pick is {chall_worst:.2f}x the best available plan "
+            f"against the champion's {champ_worst:.2f}x -- a better mean does not "
+            f"buy a worse worst case"
+        )
+    elif improvement > min_improvement:
         model_store.promote(
             version_id,
             reason=f"beat champion by {improvement:.1%} on {served_policy()}",
         )
         decision["action"] = "promoted"
+    elif worst_improved:
+        model_store.promote(
+            version_id,
+            reason=(
+                f"worst pick improved from {champ_worst:.2f}x to {chall_worst:.2f}x of "
+                f"the best available plan (mean moved {improvement:+.1%}, below the "
+                f"{min_improvement:.0%} bar)"
+            ),
+        )
+        decision["action"] = "promoted"
     else:
         decision["action"] = "rejected"
         decision["reason"] = (
-            f"challenger improved by {improvement:.1%}, below the {min_improvement:.0%} bar"
+            f"challenger moved the mean {improvement:+.1%} (bar {min_improvement:.0%}) "
+            f"and the worst pick from {champ_worst:.2f}x to {chall_worst:.2f}x -- "
+            f"neither is a real improvement"
         )
     return decision
 

@@ -159,3 +159,147 @@ class TestPrewarm:
 
     def test_no_tables_is_not_an_error(self):
         assert prewarm(_Cursor(), [])["warmed"] == {}
+
+
+class TestBenchmarkProtocols:
+    """
+    Two questions, two protocols, and never the same number for both.
+
+    WRITEUP 2.30: three consecutive benchmark runs gave 15.6%, -3.8% and 7.2%
+    captured headroom. Runs 1 and 3 used the *identical* gate and differed only
+    in that the regression guard had, in between, learned to block ten queries.
+    The benchmark mutates state the next benchmark reads.
+
+    For a comparison that is a confound rather than a treatment: the second
+    configuration gets scored on a system the first one modified. So `compare`
+    turns the guard off -- which costs nothing in fidelity, because a guard with
+    no history blocks nothing anyway (it needs `min_observations` served
+    executions first, and one workload pass supplies one).
+
+    `deploy` keeps the guard on for reporting what production does, and its
+    number is a trend point that must never be compared against a `compare`
+    number.
+    """
+
+    def test_compare_disables_the_guard(self):
+        from app.benchmark import PROTOCOLS
+
+        assert PROTOCOLS["compare"]["use_guard"] is False
+
+    def test_deploy_keeps_the_guard(self):
+        from app.benchmark import PROTOCOLS
+
+        assert PROTOCOLS["deploy"]["use_guard"] is True
+
+    def test_compare_repeats_by_default(self):
+        """
+        WRITEUP 2.26 measured 18.6% run-to-run variation on this database. One
+        pass cannot resolve a difference smaller than the noise, and most
+        differences worth arguing about are smaller than that.
+        """
+        from app.benchmark import PROTOCOLS
+
+        assert PROTOCOLS["compare"]["default_repeat"] >= 3
+
+    def test_deploy_does_not_repeat(self):
+        """It is a point on a trend, not an experiment."""
+        from app.benchmark import PROTOCOLS
+
+        assert PROTOCOLS["deploy"]["default_repeat"] == 1
+
+    def test_each_protocol_states_the_question_it_answers(self):
+        """
+        The failure this exists to prevent is quoting a number without saying
+        which question it answers, so the question has to travel with it.
+        """
+        from app.benchmark import PROTOCOLS
+
+        for name, spec in PROTOCOLS.items():
+            assert spec["question"].endswith("?"), name
+            assert spec["note"], name
+
+    def test_the_summary_reports_spread_not_just_a_number(self, capsys):
+        from app.benchmark import _summarise
+
+        runs = [
+            {"captured_pct": 15.6, "held_out_captured_pct": 21.6, "n_held_out": 11},
+            {"captured_pct": 7.2, "held_out_captured_pct": 7.7, "n_held_out": 11},
+            {"captured_pct": 11.0, "held_out_captured_pct": 14.0, "n_held_out": 11},
+        ]
+        _summarise(runs, "compare", 3)
+        out = capsys.readouterr().out
+
+        assert "11.0%" in out, "the median should be reported"
+        assert "7.2" in out and "15.6" in out, "the range should be reported"
+        assert "should not be argued about" in out, (
+            "a reader has to be told how large a difference this sample can resolve"
+        )
+
+    def test_a_single_run_says_its_spread_is_unknown(self, capsys):
+        """
+        The honest thing to print when there is nothing to compare against --
+        rather than a number that looks as precise as a repeated one.
+        """
+        from app.benchmark import _summarise
+
+        _summarise([{"captured_pct": 15.6, "held_out_captured_pct": 21.6, "n_held_out": 11}],
+                   "deploy", 1)
+        assert "spread unknown" in capsys.readouterr().out
+
+
+class TestTheBaselineIsMeasuredLikeACandidate:
+    """
+    The denominator of every training label, measured under the same conditions
+    as its numerators.
+
+    `collect_data` used to measure the baseline exactly once, before any
+    candidate ran, while each candidate got `reps` executions aggregated to a
+    median. That biased every ratio the model learns, in one direction, two
+    ways:
+
+      * a single draw keeps the unlucky samples a median discards, and
+        run-to-run variation on this database is 18.6% (WRITEUP 2.18);
+      * running first means running on the coldest cache, and every candidate
+        afterwards benefits from the pages the baseline just faulted in. A
+        reported 80.5% improvement on this project was really 26.0% once
+        cache state was controlled.
+
+    Measured directly: first-sample against median-of-three across eight
+    queries came to **1.8%**. Small, real, free to remove, and in the direction
+    that flatters the system -- which is the direction to be most suspicious of.
+    """
+
+    def test_the_baseline_is_run_reps_times(self):
+        import inspect
+
+        from app import collect_data
+
+        source = inspect.getsource(collect_data.collect)
+        assert "for _ in range(reps):" in source
+        assert "baseline_runs" in source
+
+    def test_every_baseline_repetition_is_logged(self):
+        """
+        `train._aggregate_repetitions` takes the median of whatever rows a
+        (query, hint) pair has. Logging one of three would put the baseline
+        back on a different footing from the candidates.
+        """
+        import inspect
+
+        from app import collect_data
+
+        source = inspect.getsource(collect_data.collect)
+        assert "for run in baseline_runs:" in source
+
+    def test_a_failed_baseline_still_skips_the_query(self):
+        """
+        A query whose native plan cannot be measured has no denominator, so its
+        candidates are unusable. It has to be skipped, not logged with a
+        partial baseline.
+        """
+        import inspect
+
+        from app import collect_data
+
+        source = inspect.getsource(collect_data.collect)
+        assert "if failed or not baseline_runs:" in source

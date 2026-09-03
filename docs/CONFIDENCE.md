@@ -72,13 +72,41 @@ inequality. So they are now asked separately:
 
 | question | asked of | condition |
 |---|---|---|
-| Is there an expected win? | the prediction | `prediction < 1 - required_margin` |
-| Is the downside bounded? | the uncertainty | `pessimistic < ceiling` (default 1.25x) |
+| Is there an expected win? | the prediction | `prediction < 1 - required_margin x caution` |
+| Is the downside bounded? | the uncertainty | `pessimistic < 1 + (ceiling - 1) / caution` |
 
 The second is a **ceiling on how bad it can get**, not a demand that the worst
 case also be good. This is also what the Bao paper actually claims a learned
 optimizer must guarantee — never *much* worse than the optimizer it replaces.
 "Never worse at all" is a different and impossible promise.
+
+### `caution` scales the margin, not the ratio
+
+A query the system has never served gets a stricter bar, easing back as
+evidence arrives: `caution` is 2.0 with no history and 1.0 once the guard has
+seen enough (`regression_guard.caution_multiplier`).
+
+The second condition used to apply it by *dividing the ceiling*:
+`pessimistic < ceiling / caution`. Dividing a ratio only behaves while the
+result stays above 1.0, and 1.25 / 2.0 is **0.625** — so an unseen query needed
+a pessimistic case that was a 1.6x *speedup*, which is not a bounded downside
+but an impossibility. Every query on a fresh workload is unseen, so every query
+started there, and the gate acted on **0 of 24**.
+
+Scaling the margin above 1.0 instead keeps the ceiling above 1.0 for any
+caution, stays monotone, and matches what the multiplier is documented to do:
+
+| caution | old ceiling | new ceiling |
+|---|---|---|
+| 1.0 | 1.250 | 1.250 |
+| 2.0 | **0.625** | 1.125 |
+
+Two further consequences, both fixed: the decision payload reported the *raw*
+`max_regression_ratio` while comparing against the caution-adjusted one, so a
+veto could show `pessimistic 1.152` against `ceiling 1.25` and read as a bug;
+and `app.calibrate` swept thresholds without applying caution at all, so a
+recommended required gain of 2% meant 4% in production. `docs/WRITEUP.md` 2.21
+has the measurements.
 
 Both dashboard cases now come out right. The 5.9x win is served: `0.20` clears
 the gain bar and `1.13` is inside the ceiling. A candidate predicted at `0.89x`

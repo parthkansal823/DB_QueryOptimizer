@@ -147,13 +147,26 @@ def generate_join_order_candidates(
 
     Why connectivity is worth the trouble. A `Leading()` order that introduces
     a table sharing no join predicate with the tables placed so far forces
-    Postgres to build the cross product of the two. It prices that at
-    `disable_cost` (~1e10), so the plan is never chosen -- the optimizer is
-    handed a list of alternatives most of which it cannot use. The waste grows
-    with table count: a 6-table chain join has 720 orderings and only 32
-    connected ones, so a blind sample of 8 is expected to contain well under
-    one usable candidate. This is the "sampling above 5 tables" limitation,
-    and constraining the search space is a cheaper fix than learning it.
+    Postgres to build the cross product of the two. The waste grows with table
+    count: a 6-table chain join has 720 orderings and only 32 connected ones, so
+    a blind sample of 8 is expected to contain well under one usable candidate.
+    This is the "sampling above 5 tables" limitation, and constraining the
+    search space is a cheaper fix than learning it.
+
+    **This matters more on PostgreSQL 18 than it did on 16, not less.** Until 18
+    such a plan carried `disable_cost` (~1e10), so it was self-punishing -- every
+    cost comparison put it last, and a disconnected order wasted a budget slot
+    but could not be *chosen*. PG18 removed that inflation, and the ordering
+    inverts. Measured on 18.6, a four-table join:
+
+        Leading(o u oi p)   connected      cost 6990.8   disabled: none
+        Leading(p o oi u)   disconnected   cost   20.5   disabled: Nested Loop
+
+    The unusable plan now looks **340x cheaper** than the correct one. A
+    minimum-cost selector would take it every time. `planner.plan_query` drops
+    plans carrying disabled nodes for that reason, and this filter keeps them
+    from being generated in the first place -- two defences, because the cost
+    signal that used to be the third is gone. See docs/WRITEUP.md 2.29.
     """
     if len(tables) <= 1:
         return []
@@ -223,7 +236,9 @@ def _choose_orders(
 #
 # Only balanced splits are produced, and only where both halves are internally
 # connected and connected to each other. An unconnected half is a cartesian
-# product, which Postgres prices at disable_cost and never picks.
+# product. Before PostgreSQL 18 that was priced at disable_cost and never
+# picked; since 18 it is merely marked `Disabled` and can come back *cheaper*
+# than the correct plan, so the filter is now load-bearing rather than tidy.
 
 
 def _is_connected_set(tables: tuple[str, ...], join_graph: dict[str, list[str]]) -> bool:
@@ -314,9 +329,11 @@ def _binary_group(members: tuple[str, ...], join_graph: dict[str, list[str]]) ->
 
     The members are folded left, but in an order that keeps each step joinable
     rather than alphabetical. `((a b) c)` asks Postgres to join `a` and `b`
-    first, so if the set is the chain `a-c-b` that step is a cross product,
-    priced at `disable_cost` -- syntactically accepted and semantically useless,
-    which is the same silent failure one level down.
+    first, so if the set is the chain `a-c-b` that step is a cross product --
+    syntactically accepted and semantically useless, which is the same silent
+    failure one level down. On PostgreSQL 18 it is worse than useless: the
+    resulting plan carries `Disabled` nodes and, with the old `disable_cost`
+    inflation gone, can undercut the correct plan on estimated cost.
     """
     ordered = _connected_fold_order(members, join_graph)
     tree = ordered[0]
@@ -392,9 +409,11 @@ def generate_scan_method_candidates(
 # -- Negative scan hints ----------------------------------------------------
 #
 # `IndexScan(orders)` says "use an index on orders". If no index is usable it is
-# not a request the planner can honour, so it prices the alternatives at
-# disable_cost and hands back a plan chosen under a constraint that was never
-# satisfiable -- a wasted candidate that still costs a planning round trip.
+# not a request the planner can honour, so it hands back a plan chosen under a
+# constraint that was never satisfiable -- a wasted candidate that still costs a
+# planning round trip. Before PostgreSQL 18 that plan was priced at
+# disable_cost; since 18 it is flagged `Disabled` instead, which is what
+# `planner.plan_query` now filters on.
 #
 # `NoSeqScan(orders)` says only "not a sequential scan", and leaves the planner
 # free to choose between index, index-only and bitmap on its own. It is a
@@ -974,9 +993,12 @@ def generate_candidates(
 # model something to choose between.
 #
 # These are `Set()` hints on planner GUCs, which pg_hint_plan applies for the
-# duration of the statement. PostgreSQL never truly *disables* an operator --
-# it prices it at disable_cost (~1e10) -- so a plan is always producible even
-# if every listed operator is off. That is why no combination here can fail.
+# duration of the statement. PostgreSQL never truly *disables* an operator: it
+# used to price it at disable_cost (~1e10), and since 18 it marks the node
+# `Disabled` and counts it instead. Either way a plan is always producible even
+# if every listed operator is off, which is why no combination here can fail --
+# but on 18 the resulting plan no longer carries a cost that says so, and
+# `planner.plan_query` drops it on the flag.
 HINT_SETS: tuple[tuple[str, ...], ...] = (
     ("enable_nestloop",),
     ("enable_hashjoin",),

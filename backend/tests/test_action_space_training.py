@@ -162,3 +162,52 @@ class TestCollectionFollowsTheServedActionSpace:
 
         params = inspect.signature(collect).parameters
         assert params["include_join_methods"].annotation in ("bool | None", bool | None)
+
+
+class TestTheCliDoesNotOverrideTheServingFlag:
+    """
+    The fix above, defeated one layer up.
+
+    `collect()` was given a `None` default so it would read
+    `planner.INCLUDE_JOIN_METHODS` -- the flag serving uses -- instead of
+    asserting an answer of its own. The CLI then passed
+    `include_join_methods=not args.no_join_methods`, which is `True` whenever
+    the flag is absent, so every command-line run overrode the default and
+    collected the family anyway.
+
+    Caught by watching a live collection: it was executing
+    `HashJoin(o u) HashJoin(o u oi) HashJoin(o u oi p)` candidates -- the
+    slowest family in the action space, mean ratio 5.49 against 1.97 -- every
+    row of which `rows_for_served_action_space` discards at training time.
+
+    Fixing a function and leaving its caller is how the same bug survives being
+    fixed, so this asserts the caller.
+    """
+
+    def _args(self, no_join_methods: bool):
+        import argparse
+
+        return argparse.Namespace(no_join_methods=no_join_methods)
+
+    def test_the_default_defers_to_the_serving_flag(self):
+        import inspect
+
+        from app import collect_data
+
+        source = inspect.getsource(collect_data)
+        assert "include_join_methods=False if args.no_join_methods else None" in source, (
+            "absent flag must mean None (follow planner), not True"
+        )
+        assert "include_join_methods=not args.no_join_methods" not in source
+
+    def test_the_explicit_flag_still_forces_the_family_off(self):
+        """
+        `--no-join-methods` has to keep working: a run answering "would this
+        family earn its place?" needs to be able to say so.
+        """
+        import inspect
+
+        from app import collect_data
+
+        source = inspect.getsource(collect_data)
+        assert "args.no_join_methods" in source

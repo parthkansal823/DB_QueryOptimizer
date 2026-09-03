@@ -1,5 +1,7 @@
 import { useState } from "react";
 
+import SqlErrorPanel from "./SqlErrorPanel";
+
 // A handful of the backend's Phase 1 workload queries (see
 // backend/app/workload.py), so the dashboard is useful without the user
 // having to know the schema first.
@@ -60,7 +62,7 @@ WHERE oi.quantity >= 3`,
   },
 ];
 
-export default function QueryForm({ onAnalyze, loading, error }) {
+export default function QueryForm({ onAnalyze, loading, error, onUseSuggestion }) {
   const [sql, setSql] = useState(SAMPLE_QUERIES[0].sql);
 
   function handleSampleChange(e) {
@@ -94,7 +96,7 @@ export default function QueryForm({ onAnalyze, loading, error }) {
           ))}
         </select>
       </div>
-      {error && <div className="error-banner">{error}</div>}
+      {error && <SqlErrorPanel error={error} onUseSuggestion={onUseSuggestion} />}
     </form>
   );
 }

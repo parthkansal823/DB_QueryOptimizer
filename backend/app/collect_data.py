@@ -107,6 +107,7 @@ def collect(
     workload = workload if workload is not None else WORKLOAD
     start = time.time()
     total_rows = 0
+    skipped_disabled = 0
 
     with get_cursor() as cur:
         cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
@@ -128,25 +129,58 @@ def collect(
             # of this (long-running, many-INSERT) transaction -- without one,
             # a single cancelled statement aborts the whole transaction and
             # every row logged so far in this run would be lost on rollback.
-            cur.execute("SAVEPOINT candidate")
-            try:
-                baseline = get_plan(cur, sql)
-                cur.execute("RELEASE SAVEPOINT candidate")
-            except Exception as exc:  # noqa: BLE001 - one bad query shouldn't kill the run
-                print(f"  [skip] {query_id} (baseline): {exc}", file=sys.stderr)
-                _recover(cur, statement_timeout_ms)
+            # The baseline is measured `reps` times, like every candidate.
+            #
+            # It used to be measured exactly once, before any candidate ran, and
+            # that biased every label in the same direction. Two ways:
+            #
+            #   * it was a single draw carrying the full run-to-run noise, while
+            #     each candidate got the median of `reps` -- and a median
+            #     discards the unlucky draws a lone sample keeps;
+            #   * it ran first, on the coldest cache, and every candidate after
+            #     it benefited from the pages it had just pulled in. This
+            #     project has been caught by cache-state bias before: a reported
+            #     80.5% improvement was really 26.0%.
+            #
+            # The baseline is the *denominator* of every ratio the model learns,
+            # so a denominator measured under worse conditions than its
+            # numerators pushes every training label below 1.0. Measured
+            # directly on this database, first-sample against median-of-three
+            # across eight queries: **1.8%**. Small, real, free to remove, and
+            # in the one direction that flatters the system.
+            baseline_runs = []
+            failed = False
+            for _ in range(reps):
+                cur.execute("SAVEPOINT candidate")
+                try:
+                    baseline_runs.append(get_plan(cur, sql))
+                    cur.execute("RELEASE SAVEPOINT candidate")
+                except Exception as exc:  # noqa: BLE001 - one bad query shouldn't kill the run
+                    print(f"  [skip] {query_id} (baseline): {exc}", file=sys.stderr)
+                    _recover(cur, statement_timeout_ms)
+                    failed = True
+                    break
+            if failed or not baseline_runs:
                 continue
 
-            log_execution(
-                cur,
-                query_id=query_id,
-                sql_text=sql,
-                plan=baseline,
-                hint=None,
-                is_baseline=True,
-                selector_used="native",
-            )
-            total_rows += 1
+            # Every repetition is logged, exactly as candidate repetitions are:
+            # `train._aggregate_repetitions` takes the median of whatever rows a
+            # (query, hint) pair has, so writing them all is what puts the
+            # baseline on the same footing as everything else. `baseline` itself
+            # is only used below for the table set and join graph, which do not
+            # vary between repetitions.
+            baseline = baseline_runs[0]
+            for run in baseline_runs:
+                log_execution(
+                    cur,
+                    query_id=query_id,
+                    sql_text=sql,
+                    plan=run,
+                    hint=None,
+                    is_baseline=True,
+                    selector_used="native",
+                )
+                total_rows += 1
 
             tables = baseline["tables_scanned"]
             # The join graph must match what serving uses, or training data is
@@ -190,6 +224,23 @@ def collect(
                         print(f"  [skip] {query_id} {hint!r}: {exc}", file=sys.stderr)
                         _recover(cur, statement_timeout_ms)
                         continue
+                    # A plan carrying disabled nodes is one the planner was
+                    # forbidden to build and built anyway, under a constraint it
+                    # could not satisfy. `planner.plan_query` drops those from
+                    # the action space, so collecting them is the train/serve
+                    # skew of WRITEUP 2.18 all over again -- training the model
+                    # on candidates it will never be asked to score.
+                    #
+                    # It matters more since PostgreSQL 18. Before 18 such a plan
+                    # carried `disable_cost` (~1e10) and was obvious in the
+                    # cost; PG18 removed the inflation, and a disconnected
+                    # four-table order now costs 20.5 against the correct
+                    # plan's 6990.8. Logged as training data, that row says a
+                    # structurally broken plan is 340x cheap.
+                    if plan.get("disabled_nodes"):
+                        skipped_disabled += 1
+                        continue
+
                     log_execution(
                         cur,
                         query_id=query_id,
@@ -223,6 +274,14 @@ def collect(
                 on_progress(qi + 1, len(workload), query_id, total_rows)
 
     print(f"Done. Logged {total_rows} rows in {time.time() - start:.1f}s.")
+    if skipped_disabled:
+        # Said out loud, because silently collecting a subset is the same class
+        # of mistake as silently serving one -- WRITEUP 2.18.
+        print(
+            f"Skipped {skipped_disabled} candidate(s) whose plan carried disabled "
+            f"nodes: the planner could not honour the hint, so the plan is not "
+            f"what the candidate claims and serving would never offer it."
+        )
 
 
 if __name__ == "__main__":
@@ -234,7 +293,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-join-methods",
         action="store_true",
-        help="collect join-order candidates only (skip the join-method stretch goal)",
+        help=(
+            "skip the forced join-method family. Without this flag the run "
+            "follows INCLUDE_JOIN_METHODS, which is what serving offers"
+        ),
     )
     parser.add_argument(
         "--no-tuning",
@@ -245,7 +307,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
     collect(
         reps=args.reps,
-        include_join_methods=not args.no_join_methods,
+        # `False` when the flag is given, otherwise `None` -- which lets
+        # `collect()` read `planner.INCLUDE_JOIN_METHODS`, the flag serving
+        # actually uses.
+        #
+        # This used to pass `not args.no_join_methods`, so the CLI hardcoded
+        # `True` and defeated the very default that was added to stop collection
+        # and serving disagreeing. The function was fixed and the caller was
+        # not, which is the same mistake one layer up: a constant restating a
+        # decision owned somewhere else (WRITEUP 2.28 lists the other four).
+        #
+        # Caught by watching a live run: it was executing
+        # `HashJoin(o u) HashJoin(o u oi) ...` candidates, the slowest family in
+        # the action space, every row of which `rows_for_served_action_space`
+        # discards at training time.
+        include_join_methods=False if args.no_join_methods else None,
         include_tuning=not args.no_tuning,
         statement_timeout_ms=args.timeout_ms,
     )

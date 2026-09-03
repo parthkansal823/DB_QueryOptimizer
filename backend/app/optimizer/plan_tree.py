@@ -69,8 +69,34 @@ def _node_family(node_type: str) -> str | None:
     return None
 
 
+# A compiled encoder, when one has been built.
+#
+# `native/plan_tree_native.cpp` is a port of `_encode_plan_tree_py` below, and
+# `native/setup.py` builds it. It is optional in both directions: a checkout with
+# no compiler runs the Python, and a checkout with one runs the C++ only after
+# `tests/test_plan_tree_native.py` has asserted the two produce bit-identical
+# output on every plan in the execution log.
+#
+# The import is guarded rather than required because a feature vector that
+# differs between the compiled and interpreted paths would be a silent
+# divergence between what the model trained on and what it is served -- the
+# failure class docs/WRITEUP.md is largely about. Falling back is always safe;
+# guessing is not.
+try:  # pragma: no cover - depends on whether the extension was built
+    from plan_tree_native import encode_plan_tree as _encode_plan_tree_native
+except ImportError:  # pragma: no cover
+    _encode_plan_tree_native = None
+
+
 def encode_plan_tree(raw_plan: dict) -> dict[str, float]:
     """Structural features for one plan tree (estimate-side only)."""
+    if _encode_plan_tree_native is not None:
+        return _encode_plan_tree_native(raw_plan)
+    return _encode_plan_tree_py(raw_plan)
+
+
+def _encode_plan_tree_py(raw_plan: dict) -> dict[str, float]:
+    """The reference implementation. The C++ port must match this exactly."""
     features = {name: 0.0 for name in TREE_FEATURES}
     if not raw_plan:
         return features

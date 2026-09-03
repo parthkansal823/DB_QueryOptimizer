@@ -200,16 +200,41 @@ COUNTS_SQL = f"""
 """
 
 
-# PostgreSQL does not remove a disabled node type; it adds `disable_cost`
-# (1e10) to the plan so the costing arithmetic buries it. Operator-toggle
-# hints like `Set(enable_hashjoin off)` therefore produce plans whose
-# `total_cost` is a sentinel rather than an estimate -- 670 of 1618 rows on
-# the sample database. Plotting those would compress every real estimate into
-# the first pixel of the axis, and they would flatter the rank correlation
-# too, since a disabled plan is reliably both top-of-scale and slow. They are
-# not predictions, so they are not evidence about prediction quality.
+# A plan the planner was told not to build is not a prediction, so it is not
+# evidence about prediction quality. Operator-toggle hints like
+# `Set(enable_hashjoin off)` produce them routinely -- 670 of 1618 rows on the
+# sample database -- and including them would say something about the cost model
+# that is not true of the cost model.
+#
+# **How to detect one changed under this code's feet.** Until PostgreSQL 18 such
+# a plan carried `disable_cost` (1e10), so its `total_cost` was a sentinel and
+# the floor below caught it. PG18 removed the inflation and tracks disabled
+# nodes separately: measured on 18.6, a query with three scan types banned costs
+# **8.0**, exactly what it costs unconstrained. Every one of those rows sailed
+# through a `total_cost < 1e9` filter.
+#
+# Worse than merely leaking them in. The comment this replaces argued they would
+# "flatter the rank correlation, since a disabled plan is reliably both
+# top-of-scale and slow". On PG18 a disabled plan is *bottom*-of-scale and slow
+# -- a disconnected four-table order costs 20.5 against the correct plan's
+# 6990.8 -- so the same rows now push the correlation the other way and make the
+# cost model look worse than it is.
+#
+# So the flag is read instead of the cost, and the cost floor is kept underneath
+# it because it is still correct on PostgreSQL 16 and costs nothing to leave in.
+# This is the third place the same upgrade silently disabled a cost-based test;
+# see `docs/WRITEUP.md` 2.29 for the other two.
 DISABLE_COST_FLOOR = 1e9
 
+# The doubled percent signs in the LIKE below are escapes: this statement binds
+# a parameter, and psycopg2 substitutes textually without parsing SQL, so a
+# literal percent must be written twice.
+#
+# That also rules out explaining this *inside* the statement. The first version
+# of this note lived in a `--` comment in the SQL, and the placeholder it
+# mentioned by name was counted as a real one -- psycopg2 does not know a
+# comment from a predicate. It failed with `IndexError: tuple index out of
+# range`, which names neither the comment nor the percent.
 COST_VS_LATENCY_SQL = f"""
     SELECT total_cost, actual_total_time_ms, is_baseline, hint IS NOT NULL AS hinted
     FROM plan_execution_log
@@ -217,6 +242,7 @@ COST_VS_LATENCY_SQL = f"""
       AND actual_total_time_ms IS NOT NULL
       AND total_cost > 0
       AND total_cost < {DISABLE_COST_FLOOR}
+      AND raw_plan::text NOT LIKE '%%"Disabled": true%%'
     ORDER BY created_at DESC
     LIMIT %s
 """

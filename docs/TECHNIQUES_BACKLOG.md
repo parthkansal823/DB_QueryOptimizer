@@ -4,18 +4,35 @@ Source: `postgresql-18-A4.pdf` (3156 pages), read chapter by chapter. Each entry
 says what the technique is, **why it matters for this project specifically**,
 where the code would go, and what it costs.
 
-## Read this first: the manual is 18, the server is 16
+## Read this first: the manual and the server now agree
 
-The PDF documents **PostgreSQL 18**. `docker compose exec postgres psql -c
-"select version()"` reports **16.15**, with `pg_hint_plan 1.6.3`. Several things
-the manual describes do not exist on the running server, and a few of the most
-useful ones are among them. Every entry below is tagged:
+This document was written when the PDF documented **PostgreSQL 18** and the
+server ran **16.15** with `pg_hint_plan 1.6.3`. That gap was its organising
+idea: several techniques the manual described did not exist on the running
+server, and the most useful ones were among them.
 
-- **PG16 ✓** — available now, verified against `pg_settings` on the live server.
-- **PG17+ / PG18** — documented in this PDF, **not on this server**. Needs an
-  upgrade first, so it is a reason to upgrade rather than a task.
+**The server was upgraded.** `docker compose exec postgres psql -c
+"select version()"` now reports **18.6**, with `pg_hint_plan 1.8.1`. Every entry
+tagged PG17+/PG18 is available, and the section near the end records what that
+delivered and what it silently cost.
+
+The per-entry tags are kept as written rather than rewritten, because they are
+the record of what was true when each technique was assessed:
+
+- **PG16 ✓** — was available before the upgrade, and still is.
+- **PG17+ / PG18** — was blocked at the time of writing. All are now available;
+  see "The server upgrade happened" below for verification of each.
 
 Anything not tagged is version-independent.
+
+One thing the upgrade is worth stating up front, because it runs against the
+grain of "upgrade to get features": PostgreSQL 18 **removed** the `disable_cost`
+inflation that made a forbidden plan announce itself in its cost. A safety veto
+written against that cost stopped being reachable the moment the server changed
+— no error, no failing test. `docs/WRITEUP.md` 2.29 has the measurement. An
+upgrade is a source of silent capability *loss* as well as gain, because what
+breaks is the assumption a piece of code was written against rather than any
+line in it.
 
 ---
 
@@ -580,7 +597,7 @@ each: **0 queries won**, total best-candidate latency 1620.9 ms against 1618.5 m
 -- a 0.15% difference against 18.6% measured run-to-run noise, for 254 extra
 candidates and their planning round trips. See WRITEUP 2.23.
 
-## Still open, and doable on PostgreSQL 16
+## Still open, and doable on the current server
 
 | item | what it needs | why it has not been done |
 |---|---|---|

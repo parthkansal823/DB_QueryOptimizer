@@ -98,7 +98,10 @@ The measurement path (`POST /query/analyze`, used by the dashboard):
 │ 3. DEDUPLICATE                hints.plan_fingerprint()       │
 │    Most hints on a simple query reproduce the native plan.   │
 │    Identical plans are dropped, so the candidate count       │
-│    reflects real choices instead of copies.                  │
+│    reflects real choices instead of copies — and the budget  │
+│    counts *distinct plans*, not hints tried. Plans carrying  │
+│    Disabled nodes are dropped here too: the planner could    │
+│    not honour the hint, so the candidate is not what it says.│
 └─────────────────────────────────────────────────────────────┘
       │
       ▼
@@ -118,7 +121,8 @@ The measurement path (`POST /query/analyze`, used by the dashboard):
       ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 6. TWO SAFETY CHECKS                                         │
-│    Cost veto (forward)  — is this priced far above native?   │
+│    Forward veto  — a plan carrying Disabled nodes, or (on    │
+│                    PG16) priced at disable_cost              │
 │    Regression guard (back) — has this query burned us before?│
 │    Either one → serve PostgreSQL's plan instead.             │
 └─────────────────────────────────────────────────────────────┘
@@ -133,11 +137,6 @@ The measurement path (`POST /query/analyze`, used by the dashboard):
 
 ### The production path is different, and that matters
 
-`/query/analyze` **executes every candidate** so the dashboard can compare
-them. That costs N executions to answer one question — it is a measuring
-instrument, not an optimizer. Serving real traffic with it would be slower than
-having no optimizer at all.
-
 `POST /query/optimize` (`optimizer/planner.py`) is the real path:
 
 ```
@@ -145,9 +144,27 @@ N x EXPLAIN without ANALYZE    →  PostgreSQL plans, runs nothing
 1 x actual execution           →  only the plan that was chosen
 ```
 
-Planning is cheap (sub-millisecond); execution is not. Measured on this
-workload: **3.8 ms of planning against 138 ms of execution**, about 2.7%
-overhead.
+Planning is cheap; execution is not. Measured on this workload: **3.8 ms of
+planning against 138 ms of execution**, about 2.7% overhead.
+
+`/query/analyze` is the measuring instrument. It **used to execute every
+candidate**, which cost N executions to answer one question: 19 candidates at
+48 ms each was 915 ms of a 1.2 s request. Planning one costs **0.89 ms**, and
+the model predicts latency from the plan tree rather than needing it measured,
+so the executions bought a slower endpoint and nothing else.
+
+It now plans every candidate and executes only `ANALYZE_EXECUTE_LIMIT` of them
+(default 4), chosen by `_execution_order`: the plan the model picked, then the
+cheapest by the planner's own estimate. **1.19 s to 0.19 s.** The response
+carries `n_candidates_planned` and `n_candidates_executed` so a reader can tell
+which numbers are measured and which are estimates.
+
+Not parallelised, deliberately. Running candidates concurrently would cut wall
+time and make them compete for CPU and shared buffers, so every latency would be
+contaminated by whatever ran beside it — unequally, because different plan
+shapes have different memory and parallelism profiles. Those latencies are what
+the whole project is built on and are logged as training data. Executing fewer
+of them sequentially is 12.5x faster *and* leaves every number comparable.
 
 ---
 
@@ -375,6 +392,8 @@ backend/app/
 ├── experiment.py           paired A/B with confidence intervals
 ├── measurement.py          fairness, prewarming, and a deterministic session
 ├── audit_binding.py        asks pg_hint_plan whether every candidate bound
+├── generalisation.py       prediction error on unseen queries vs trained ones
+├── sql_errors.py           a failed query, explained, with a corrected statement
 ├── diagnostics.py          why the model is or is not confident
 ├── query_template.py       query identity, with hints stripped out
 ├── stats.py                matched-pair reporting for the dashboard
@@ -414,7 +433,7 @@ backend/app/
 | Endpoint | Purpose |
 |---|---|
 | `POST /query/optimize` | Production path — plans N, executes 1 |
-| `POST /query/analyze` | Measurement path — executes every candidate |
+| `POST /query/analyze` | Measurement path — plans every candidate, executes `ANALYZE_EXECUTE_LIMIT` of them |
 | `GET /stats/trend` | Matched-pair history and decision quality |
 | `GET /stats/cost-model` | How well PostgreSQL's estimates predict reality |
 | `GET /stats/regret` | Cumulative regret vs native |
@@ -436,8 +455,8 @@ not for PostgreSQL to accept connections.
 ## 12. Testing
 
 ```bash
-pytest -m "not integration"   # 247 tests, no database required
-pytest -m integration         # 11 tests, needs a live PostgreSQL
+pytest -m "not integration"   # 1,090 tests, no database required
+pytest -m integration         # 17 tests, needs a live PostgreSQL
 ```
 
 The split exists for a reason. Early on, a configuration mistake meant
@@ -453,6 +472,20 @@ The integration tests assert the effect: hints bind, candidates are genuinely
 different plans, `Rows(a b *100)` really does multiply the estimate by 100. CI
 runs the unit suite with no database at all (which keeps them honestly
 decoupled) and the integration suite against a purpose-built PostgreSQL image.
+
+Two of them have since earned their place twice over. `TestEveryCandidateBinds`
+asks `pg_hint_plan` directly whether each generated hint was applied, rather
+than inferring it from a cost difference — a distinction that matters because a
+hint that bound and changed nothing looks identical to one that never bound.
+Both cost 3979.3 on the four-table query. And the `DisableIndex` test was
+written to **fail when the world changed**: it asserted the keyword was rejected,
+with a message saying to wire the family in if an upgrade ever made it work. It
+fired on the first run against PostgreSQL 18.
+
+That is the difference between a test that pins a mechanism and one that pins a
+number. Nothing caught the `disable_cost` change in the same upgrade, because
+the veto's tests asserted "returns True above 1e9" rather than "a forbidden plan
+is refused" (`docs/WRITEUP.md` 2.29).
 
 ---
 

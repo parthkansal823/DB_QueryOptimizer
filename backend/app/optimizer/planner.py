@@ -379,6 +379,7 @@ def plan_query(
     candidates = []
     seen_plans = {plan_fingerprint(baseline)}
     n_duplicates = 0
+    n_disabled = 0
     for hint in hints[:attempt_cap]:
         if len(candidates) >= budget:
             break
@@ -386,6 +387,29 @@ def plan_query(
             plan = get_plan(cur, apply_hint(sql, hint), analyze=False)
         except Exception:  # noqa: BLE001 - a rejected hint is not a request failure
             continue
+        # A plan the planner was forbidden to build is not a candidate, and on
+        # PostgreSQL 18 it is actively dangerous to treat as one.
+        #
+        # Until 18, such a plan carried `disable_cost` (~1e10) and was therefore
+        # self-punishing: every cost comparison put it last. PG18 dropped the
+        # inflation, and the result inverts. Measured on 18.6, a four-table join:
+        #
+        #     Leading(o u oi p)   connected      cost 6990.8   disabled: none
+        #     Leading(p o oi u)   disconnected   cost   20.5   disabled: Nested Loop
+        #
+        # The broken plan now looks **340x cheaper** than the correct one, so
+        # `_select_heuristic` -- which picks the minimum cost -- would choose it
+        # every time, and `total_cost` as a model feature becomes actively
+        # misleading. `_is_unsafe` catches it at the veto, but only after it has
+        # displaced a real candidate from the budget and been written to the
+        # log as training data.
+        #
+        # Dropping it here keeps it out of the action space, the model, and the
+        # log. See docs/WRITEUP.md 2.29.
+        if plan.get("disabled_nodes"):
+            n_disabled += 1
+            continue
+
         fingerprint = plan_fingerprint(plan)
         if fingerprint in seen_plans:
             n_duplicates += 1
@@ -428,6 +452,11 @@ def plan_query(
         # query's alternatives all collapse to the same plan", and only the
         # second is a reason to generate a different *kind* of candidate.
         "n_duplicate_plans": n_duplicates,
+        # Candidates whose hint forced the planner into a node it was told not
+        # to use. Reported separately from duplicates because they mean
+        # something different: a duplicate is a hint that changed nothing, this
+        # is a hint the planner could not honour.
+        "n_disabled_plans": n_disabled,
         "optimizer_overhead_ms": planning_ms,
     }
 

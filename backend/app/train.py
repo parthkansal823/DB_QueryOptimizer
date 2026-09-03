@@ -108,6 +108,47 @@ def _is_join_method_hint(hint: str | None) -> bool:
     return bool(hint) and _JOIN_METHOD_RE.search(hint) is not None
 
 
+def rows_without_disabled_plans(rows: list[dict]) -> tuple[list[dict], dict]:
+    """
+    Drop rows whose plan carries nodes the planner was forbidden to build.
+
+    A candidate whose hint the planner could not honour is not what the row
+    claims: it is the best plan available under a constraint that was never
+    satisfiable. `planner.plan_query` drops those from the action space and
+    `collect_data` no longer records them, so training on them is the train/serve
+    skew of 2.18 -- teaching the model to score candidates it will never be
+    asked about.
+
+    This exists for rows collected *before* those two filters, which on this
+    database is most of them. It matters more since PostgreSQL 18: before 18
+    such a plan carried `disable_cost` (~1e10) and was unmistakable, while on 18
+    a disconnected four-table order costs 20.5 against the correct plan's
+    6990.8. As a training row that is a label saying a structurally broken plan
+    is 340x cheap -- and `total_cost` is a model feature.
+
+    A PG16 row has no `Disabled` key anywhere and is kept untouched.
+    """
+    from app.plan_extractor import count_disabled_nodes
+
+    kept = []
+    for row in rows:
+        plan = row.get("raw_plan")
+        if isinstance(plan, dict) and count_disabled_nodes(plan):
+            continue
+        kept.append(row)
+
+    dropped = len(rows) - len(kept)
+    return kept, {
+        "filtered": bool(dropped),
+        "dropped_rows": dropped,
+        "kept_rows": len(kept),
+        "reason": (
+            "the planner could not honour the hint, so the plan is not the "
+            "candidate it claims to be and serving never offers it"
+        ),
+    }
+
+
 def rows_for_served_action_space(rows: list[dict]) -> tuple[list[dict], dict]:
     """
     Drop candidates from families the serving path does not offer.
@@ -463,6 +504,12 @@ def train(
 
     # Before aggregation, so a family that is not served contributes nothing at
     # all -- not even to a median.
+    rows, disabled_report = rows_without_disabled_plans(rows)
+    if disabled_report["filtered"]:
+        print(
+            f"Dropped {disabled_report['dropped_rows']} row(s) whose plan carried "
+            f"disabled nodes -- {disabled_report['reason']}."
+        )
     rows, action_space_report = rows_for_served_action_space(rows)
     if action_space_report.get("filtered"):
         print(

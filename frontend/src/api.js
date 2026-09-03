@@ -4,7 +4,26 @@ async function request(path, options) {
   const res = await fetch(`${BASE_URL}${path}`, options);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText}: ${body}`);
+    // A 400 from /query/analyze or /query/optimize carries a structured
+    // explanation of what is wrong with the SQL -- the offending token, a
+    // caret under it, and often a corrected statement. Flattening that into
+    // `400 Bad Request: {"detail":{...}}` and showing it as a string throws
+    // away the whole point of producing it.
+    let sqlError = null;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed.detail === "object" && parsed.detail !== null) {
+        sqlError = parsed.detail;
+      }
+    } catch {
+      // Not JSON. Fall through to the plain-text error below.
+    }
+    const err = new Error(
+      sqlError?.message ?? `${res.status} ${res.statusText}: ${body}`,
+    );
+    err.status = res.status;
+    err.sqlError = sqlError;
+    throw err;
   }
   return res.json();
 }

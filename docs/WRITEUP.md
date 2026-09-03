@@ -2709,9 +2709,490 @@ This is the fourth time the same mistake has been found in this system:
 | 2.21 | calibration's implicit caution of 1.0 | the 1.33-2.0 the gate applies |
 | 2.22 | collection's `include_join_methods=True` | `INCLUDE_JOIN_METHODS` |
 | 2.28 | promotion's `policy="risk_averse"` | `SELECTION_POLICY` |
+| 2.28 | the collector CLI's `not args.no_join_methods` | `collect()`'s own default |
 
 Each one was a value restating a decision owned somewhere else. None was wrong
 when written. Every one drifted, silently, and each was found only by comparing
 two things nobody had thought to compare -- which is the same lesson as 2.20,
 one layer up: **where a decision has an owner, read it from the owner.** A copy
 is a bug with a delay on it.
+
+
+### A postscript: the fifth instance, hiding behind the fourth
+
+2.22 gave `collect()` a `None` default for `include_join_methods` so it would
+read `planner.INCLUDE_JOIN_METHODS` rather than assert an answer of its own. The
+CLI underneath it still passed:
+
+```python
+include_join_methods=not args.no_join_methods
+```
+
+which is `True` whenever the flag is absent -- so every command-line run
+overrode the default that had just been added to stop exactly this. The function
+was fixed and its only caller was not.
+
+Found by watching a live collection rather than by reading either file: the
+active query was `HashJoin(o u) HashJoin(o u oi) HashJoin(o u oi p)`, a family
+that is switched off at serving. Measured over that run: **567 of 2,501 rows --
+23% -- were join-method candidates**, collected at the slowest rate in the
+action space (mean ratio 5.49 against 1.97) and destined to be discarded by
+`rows_for_served_action_space` before training saw them.
+
+Two lessons, and the second is the useful one. Fixing a function and leaving its
+caller is how a bug survives being fixed. And the reason this was caught at all
+is that a long-running job was watched while it ran -- neither the test suite
+nor a code reading had anything to say about it, because both files were
+individually correct.
+
+## 2.29 The upgrade switched off a safety veto, silently
+
+`docs/TECHNIQUES_BACKLOG.md` argued that `Disabled: true` was the one feature
+worth upgrading PostgreSQL *for*, because it turns "this candidate did nothing"
+from an inference into a fact the planner states. That was right, and for a
+sharper reason than the one given.
+
+### What the veto was doing
+
+`learned._is_unsafe` refuses a candidate the planner considers structurally
+broken -- typically a forced cartesian product. It detected them by cost:
+
+```python
+DISABLE_COST_SCALE = 1e9
+...
+return chosen_cost >= self.DISABLE_COST_SCALE
+```
+
+That worked because PostgreSQL priced a node reached under `enable_x = off` at
+`disable_cost` (~1e10) and added it to the plan total, so a forbidden plan
+announced itself. Measured on 16.15: `/*+ Set(enable_seqscan off) */` on a
+two-table join cost **10000003979.3**.
+
+### What PostgreSQL 18 did
+
+It removed the inflation. Disabled nodes are counted separately and compared
+before cost, rather than being priced out of contention. Measured on 18.6, one
+query, with and without three scan types banned:
+
+| | total cost | disabled nodes |
+|---|---|---|
+| no hint | **8.0** | -- |
+| `enable_seq/index/bitmapscan off` | **8.0** | `Seq Scan`, `Index Scan` |
+
+Identical cost. **No cost comparison can distinguish a plan the planner was
+forbidden to use from one it chose freely**, so the veto stopped being reachable
+the instant the server was upgraded -- with no error, no failing test, and a
+`DISABLE_COST_SCALE` constant still sitting in the file looking like it did
+something.
+
+This is the project's own recurring failure mode arriving from a new direction.
+Every previous instance was a value that drifted from a decision owned elsewhere
+(2.18, 2.21, 2.22, 2.28). This one is a **fact about the world** that the code
+encoded and the world then changed. Nothing in the repository was edited; a
+dependency was upgraded, and a safety mechanism became decorative.
+
+### The fix, and why it is better than what it replaces
+
+`plan_extractor.count_disabled_nodes` walks the tree and reads the flag;
+`_is_unsafe` refuses on a non-zero count and keeps the cost test underneath it,
+because that one is still correct on PG16 and costs nothing to leave in.
+
+Reading the fact beats inferring it on two counts beyond simply working:
+
+* It says **which** nodes were disabled, not merely that the total looked large.
+* It cannot be fooled by a plan that is legitimately expensive. The cost test
+  had a threshold, and a threshold on a quantity with no natural scale is a
+  guess -- 2.4's measured example, a candidate costed 1.8x native that ran 6x
+  faster, is exactly the kind of plan a cost-based veto risks catching.
+
+### It was not only the veto
+
+Chasing the same change through the rest of the system found three more places
+that depended on the cost signal, and one of them is worse than the veto.
+
+**A forbidden plan now looks cheaper than a correct one.** Measured on 18.6, a
+four-table join:
+
+| `Leading()` order | | total cost | disabled |
+|---|---|---|---|
+| `o u oi p` | connected | **6990.8** | none |
+| `p o oi u` | disconnected | **20.5** | `Nested Loop` |
+
+The unusable plan is **340x cheaper** on the planner's own estimate. That is not
+a cosmetic problem:
+
+* `_select_heuristic` picks the minimum cost, so it would take the broken plan
+  every time -- and it is the fallback whenever no model is loaded and the
+  tie-break for `pairwise_rank`.
+* `total_cost` is a **model feature**. A training row pairing cost 20.5 with a
+  plan that cannot run teaches exactly the wrong thing.
+* The candidate consumes a budget slot that a real alternative would have used.
+
+So the flag is now read in four places: `planner.plan_query` drops such plans
+from the action space, `collect_data` stops recording them,
+`train.rows_without_disabled_plans` removes the ones collected before either
+filter existed, and `stats.COST_VS_LATENCY_SQL` keeps them out of the
+cost-vs-latency chart.
+
+That fourth one was found later, by reading the docs line by line rather than
+the code: `docs/METRICS.md` asserted that disabled plans are excluded from the
+chart "because PostgreSQL adds `disable_cost` (10^10)". The exclusion was a
+`total_cost < 1e9` floor, and on PG18 nothing reaches it. Measured on the log:
+**8,576 rows plotted, 1,157 of them (13.5%) carrying `Disabled`, and 0 caught by
+the floor.** The filter had been entirely dead.
+
+The reasoning behind it had also inverted, which is the part worth keeping. The
+original argument was that disabled plans would *flatter* the correlation, being
+"reliably both top-of-scale and slow". On PG18 they are bottom-of-scale and
+slow, so the same rows were dragging the correlation down and making the cost
+model look worse than it is. A stale comment can be wrong in the opposite
+direction to the one it warns about. **Measured on the freshly collected PG18 log: 258 of 2,135 rows
+-- 12% -- carried a genuinely disabled plan.** Every one would have been a label
+asserting that a plan the planner refused to build is fast.
+
+The comments were wrong too, in four places, all variations on *"Postgres prices
+that at disable_cost and never picks it"*. They were true when written and are
+now precisely backwards: the connectivity filter in
+`generate_join_order_candidates` was described as saving planning effort, when on
+PG18 it is the thing standing between a minimum-cost selector and a cartesian
+product.
+
+### The general point
+
+An upgrade is not only a source of new capability; it is a source of **silent
+capability loss**, because the thing that breaks is the assumption a piece of
+code was written against rather than any line in it. The test suite caught the
+`DisableIndex` change on the first run after the upgrade, because a test had
+been written to fail when the world changed (2.20). Nothing caught this one --
+there was no test asserting that a forbidden plan is refused, only tests that
+`_is_unsafe` returns True for a cost above a constant.
+
+A test that pins the mechanism survives the world changing. A test that pins the
+number does not.
+
+
+## 2.30 The benchmark changes the system it is measuring
+
+2.26 established that a single benchmark run does not measure this system,
+because run-to-run variation on this database is 18.6%. Re-benchmarking on
+PostgreSQL 18 found a second, worse problem: **the benchmark mutates state the
+next benchmark reads.**
+
+Three consecutive runs:
+
+| run | gate | guard blocks | overall | held-out |
+|---|---|---|---|---|
+| 1 | `z=1.0, gain=0.1` | 0 / 24 | **15.6%** | **21.6%** |
+| 2 | `z=1.5, gain=0.1` (recalibrated) | 0 / 24 | -3.8% | -14.0% |
+| 3 | `z=1.0, gain=0.1` -- **the same gate as run 1** | **10 / 24** | 7.2% | 7.7% |
+
+Runs 1 and 3 differ only in when they happened. Between them, the regression
+guard accumulated history from runs 1 and 2, and began blocking ten queries it
+had watched regress. The guard is doing exactly its job. It also means the
+measurement is not repeatable, and that **run 2 cannot be attributed to the gate
+change** -- it shares its state with whatever preceded it.
+
+This invalidates the obvious way to evaluate a gate setting: apply it, run the
+benchmark, compare the number. Every run leaves the guard in a different place,
+so the second measurement is taken on a different system.
+
+### The protocol this project uses
+
+There were three options, and the resolution is that **there are two questions,
+not one**, and they need opposite treatment:
+
+| protocol | question | guard | passes |
+|---|---|---|---|
+| **`compare`** | is configuration X better than Y? | **off** | **3** |
+| **`deploy`** | what is the running system delivering? | on | 1 |
+
+`compare` turns the guard off, and this costs nothing in fidelity. A guard with
+no history blocks nothing anyway: it requires `min_observations` served
+executions before it will act, and a single workload pass supplies one. So
+"reset the guard between runs" and "disable the guard" produce the *identical*
+first run -- disabling is simply honest about which is happening, and does not
+pretend to a control it is not providing.
+
+`compare` also repeats, because 2.26 measured 18.6% run-to-run variation and a
+single pass cannot resolve a difference smaller than the noise. It prints the
+median, the range, and the sentence that matters: *a difference smaller than
+this sample's own spread should not be argued about.* Most of the differences
+this project has argued about were smaller than that.
+
+`deploy` keeps the guard on, does one pass, and its number is a point on a
+trend. It is never comparable with a `compare` number, and the output says so
+rather than leaving a reader to notice.
+
+The rule that falls out: **the question travels with the number.** Every
+protocol carries the question it answers, and the summary prints it above the
+result, because the failure this exists to prevent is not a wrong measurement --
+it is a right measurement quoted against the wrong question.
+
+For the record, the rejected options and why:
+
+* **Reset the guard between runs**, making each measurement independent and
+  losing the thing the guard exists to provide.
+* **Measure with the guard disabled** (`--no-guard` already exists), which
+  measures the model and gate in isolation and overstates what production does.
+* **Treat the benchmark as a sequential process** and compare only runs from the
+  same starting state, which is the most faithful and the most expensive.
+
+What is *not* honest is quoting a single number without saying which run it came
+from and what the guard had already learned. Every headline figure in this
+repository predating this section was measured without that qualification.
+
+The recalibrated gate was reverted, but not because run 2 proved it worse --
+run 2 proves nothing on its own. It was reverted because the incumbent has a
+measurement behind it and the challenger does not, and reverting is the cheaper
+mistake to undo.
+
+### What the protocol said the first time it was used
+
+Immediately, and it is not flattering:
+
+```
+headroom captured    -5.3%   range -13.6% to -2.0%   runs -5.3, -13.6, -2.0
+held-out captured     6.7%   range  -1.7% to  7.6%   runs -1.7,  6.7,  7.6
+
+A difference smaller than 11.7 points is inside this sample's own spread.
+```
+
+Three controlled passes on PostgreSQL 18 say the system **does not currently
+beat native overall** -- median -5.3%, and every individual run negative. The
+held-out median is positive at +6.7%, but its range crosses zero.
+
+Set against the single runs quoted earlier in this same session -- 39.2% on
+PG16, 15.6% on PG18 -- the gap is the whole point of the exercise. Those were
+each one pass, and the spread measured here is **11.7 points**, wider than most
+of the differences this project has spent effort arguing about. They were not
+wrong measurements; they were unrepeated ones, and an unrepeated measurement on
+this database cannot distinguish a real effect from a draw.
+
+Two things follow, and the second is uncomfortable.
+
+The system's honest current standing on PG18 is **around break-even overall,
+with a positive but noisy held-out signal**. That is a worse claim than any
+previously made in this document and it is the first one with error bars on it.
+
+And the protocol earned its place in a single use. It was built to stop the
+guard confounding comparisons, and the first thing it did was overturn the
+headline figure. A measurement method that only ever confirms what you already
+reported is not measuring anything.
+
+
+## 2.31 The promotion metric could not see the failure that mattered
+
+The `compare` protocol (2.30) said the system was losing on PostgreSQL 18:
+median **-5.3%** captured headroom across three controlled runs. Reading the
+per-query output rather than the summary showed the losses were not spread
+around. One hint dominated them:
+
+| query | native | served | model predicted |
+|---|---|---|---|
+| `corr_3w_brand_chain` | 137.3 ms | **160.4 ms** | 0.27x |
+| `corr_3w_city_electronics` | 96.9 ms | **133.6 ms** | 0.75x |
+| `corr_brand_band` | 68.8 ms | **85.7 ms** | 0.58x |
+| `corr_brand_category` | 68.7 ms | **83.2 ms** | 0.53x |
+
+All four are `Set(max_parallel_workers_per_gather 0)`. Predicting 0.27x and
+measuring 1.17x is not a near miss.
+
+Two hypotheses were wrong before the right one turned up, and both are worth
+recording because they were plausible:
+
+* **A measurement-order bias.** `collect_data` measures the baseline *once*,
+  first, then each candidate `reps` times and takes the median -- so the
+  denominator of every training label carries full run-to-run noise while the
+  numerator has it filtered out, and the baseline runs on the coldest cache.
+  Real, and measured at **1.8%** (median-of-3 over first-sample, 8 queries).
+  Far too small to explain a 4x error, though worth fixing on its own.
+* **A missing feature.** If the model cannot see parallelism it cannot learn
+  that removing it hurts. It can: `n_gather` and `n_parallel_aware` have been
+  in the vector all along.
+
+### What it actually was
+
+The deployed model was trained on PostgreSQL 16. Asked about that exact
+query and hint:
+
+| | predicts | spread |
+|---|---|---|
+| champion, PG16-trained, **deployed** | **0.291x** | 0.397 |
+| challenger, PG18-trained | **1.273x** | 0.134 |
+| the training data's own answer (147.4 / 130.0 ms, n=20) | **1.134x** | |
+
+The challenger is nearly right and confident. The champion is wrong by a factor
+of four and, with a spread of 0.397, uncertain enough that a wider gate would
+have caught it -- but the point estimate cleared the bar.
+
+**And the registry had already compared these two models and scored them 1.0%
+apart**, below its 2% promotion bar, so it kept the champion.
+
+### Why the comparison missed it
+
+`retrain._score_bundle` reduces a model to the average latency of the plans it
+would have picked across a held-out set. On most queries both models pick the
+same plan, so the average barely moves. The difference lives entirely in the
+handful of queries where they diverge -- and on those, the champion picks a plan
+that runs 17% slower while predicting a 73% speedup.
+
+An average over queries answers "how good is this model on a typical query".
+Promotion needs to answer "is this model ever catastrophically wrong", and those
+are different questions. A metric that cannot distinguish a model that is
+uniformly mediocre from one that is usually fine and occasionally disastrous is
+not measuring the thing the safety gate exists to protect against.
+
+This is the fourth time in this document that an aggregate has hidden the case
+that mattered: 2.2 (a mean over queries hiding a regression), 2.19 (a regression
+*rate* hiding that every regression was 1%), 2.30 (a single run hiding an 11.7
+point spread), and now a mean over held-out queries hiding a 4x prediction
+error. **The aggregate is where the interesting case goes to die**, and the
+consistent fix has been to report the distribution -- worst case, spread, or the
+per-item breakdown -- beside it.
+
+
+## 2.32 The protocol measured itself, and failed
+
+2.30 built a `compare` protocol -- guard off, three repetitions, report the
+spread -- because a single benchmark run could not resolve anything. Used in
+anger on the champion/challenger question, it worked: the PostgreSQL 16-trained
+champion measured **-5.3%** captured headroom (range -13.6 to -2.0) against the
+PG18-trained challenger's **+8.0%** (range 7.4 to 10.8). Non-overlapping ranges,
+a system that had gone from net-losing to net-winning, and the promotion in 2.31
+was justified.
+
+Then the same three-run measurement was repeated on the same model:
+
+| measurement | median | range |
+|---|---|---|
+| set A | **8.0%** | 7.4 - 10.8 |
+| set B | **16.0%** | 8.2 - 16.6 |
+
+Two controlled measurements of an **identical configuration**, differing by 8
+points. Nothing changed between them but time.
+
+The protocol had already said so. Its summary prints:
+
+> A difference smaller than 8.4 points is inside this sample's own spread and
+> should not be argued about.
+
+That line was describing the sample it had just taken. It turned out to be
+describing the protocol as well.
+
+### What survives, and what does not
+
+Pooling all six runs of the challenger against the champion's three:
+
+    champion    -13.6  -5.3  -2.0
+    challenger    7.4   8.0   8.2  10.8  16.0  16.6
+
+The ranges do not overlap. **That** is the claim the data supports: the
+challenger is better. What it does not support is *by how much* -- "13.3 points
+better", which the first comparison seemed to license, was reading a median
+difference smaller than the spread either sample would show on a re-run.
+
+The default repetition count is now five. That is not enough either, and saying
+so is the point: the usable test here was never "is the median higher", it was
+"do the ranges overlap". A protocol that reports a spread and then compares
+medians across it has built the instrument and ignored the reading.
+
+### The held-out column, and why it is not measuring what it looks like
+
+Held-out capture went the other way: **+6.7%** for the champion against **-4.8%**
+and **-2.2%** for the challenger, with spreads of 19.8 and 14.4 points. The
+obvious reading is that the new model generalises worse. Breaking the column
+down per query says otherwise:
+
+| held-out query | native | served | what happened |
+|---|---|---|---|
+| `corr_4w_cancelled_premium` | 71.0 ms | **67.8 ms** | acted, and won |
+| `corr_city_country` | 60.5 ms | 60.5 ms | vetoed |
+| `corr_brand_band` | 75.0 ms | 75.0 ms | vetoed |
+| `corr_5w_supplier_chain` | 93.7 ms | 93.7 ms | vetoed |
+| `ctl_3w_recent` | 125.6 ms | 125.6 ms | vetoed |
+| `ctl_supplier_rating` | 5.8 ms | 5.8 ms | vetoed |
+
+**The model acts on one held-out query in six**, and on that one it is right.
+The other five are refused by the gate, which is what the caution multiplier is
+for: a query with no served history gets a stricter bar (2.21).
+
+So the held-out percentage is a ratio whose numerator is contributed by one or
+two queries and whose denominator is the headroom of all six. A single win or
+loss moves it by ten points or more. That is not a measurement of
+generalisation; it is a measurement of whichever query the gate happened to
+allow, and it explains the 19.8-point spread far better than any story about
+the model.
+
+Which leaves the real question unanswered rather than answered badly. Whether
+this model generalises cannot be read off a metric dominated by five abstentions
+-- it needs either many more held-out queries, or a measurement of prediction
+*accuracy* on the held-out set independent of whether the gate chose to act.
+The second is cheap and does not exist yet.
+
+The overall improvement is real. The generalisation question is open, and the
+instrument currently pointed at it cannot resolve it.
+
+
+## 2.33 It generalises. That was never the problem.
+
+2.32 left the generalisation question open and said the instrument pointed at it
+could not resolve it. `app.generalisation` is the instrument that can: for every
+logged candidate with a real latency, how far is the predicted ratio from the
+actual one, split by whether the query was in the training set. It has an answer
+whether or not the gate ever fires, which the benchmark's held-out column does
+not.
+
+Building it took three corrections, each the same class of mistake this
+document keeps recording.
+
+* **Scoring rows the model was never taught.** `_load_rows()` returns everything,
+  including the 567 forced join-method and 294 disabled-plan rows that `train`
+  deliberately drops. Measuring the model on families it will never be asked
+  about is the train/serve skew of 2.18 -- committed while building the
+  instrument for it.
+* **Scoring raw executions against a model fitted on medians.** That charges it
+  for the 18.6% run-to-run variation it was never asked to predict.
+* **Writing a number before measuring it.** The comment explaining the second
+  fix claimed aggregation would bring typical error to "1.4x". It was a
+  prediction, typed as though it were a result. Aggregating actually moved it
+  from 2.21x to **2.93x** -- collapsing 4,764 rows to 432 strips the weighting
+  that repeated easy candidates had been getting. The comment now says what
+  happened.
+
+### The answer
+
+| | typical error | p90 | n |
+|---|---|---|---|
+| trained on (18 queries) | **2.93x** | 4.18x | 432 |
+| held out (6 queries) | **3.25x** | 4.12x | 137 |
+
+Ratio **1.11**. The model predicts unseen queries about as well as the ones it
+learned from. **It generalises.**
+
+It also predicts both of them badly. Typically a factor of **three** out, on a
+target that lives between roughly 0.3x and 3x. That single number explains what
+several earlier sections found the hard way:
+
+* 2.21's uncertainty bands are wide because the model *is* inaccurate -- 1.43x,
+  1.56x, 1.58x pessimistic bounds are an honest ensemble reporting honest
+  disagreement, not a miscalibration to be tuned away.
+* The gate vetoes five held-out queries in six because a model three times out
+  cannot clear a bar that asks for confidence.
+* 2.31's champion predicting 0.291x where the truth was 1.134x is not an
+  outlier. It is this error distribution, sampled once, on the candidate that
+  happened to matter.
+
+### What this changes
+
+Every previous section treated "why is it never confident" as a gate problem,
+a calibration problem, a train/serve skew problem, or a promotion-metric
+problem. Each of those was real and each fix was worth making -- the system went
+from net-losing to net-winning on the strength of them. None of them was the
+main thing.
+
+**The model is not accurate enough, and it is uniformly not accurate enough.**
+That is a better problem to have than memorisation, because it points somewhere
+specific: more data, better features, or a different target -- not more
+threshold tuning. The thresholds are now honest, and what they honestly report
+is a model that does not know enough.
+

@@ -208,3 +208,106 @@ class TestSafety:
         err = explain(ValueError("connection closed"), "SELECT 1")
         assert err.message == "connection closed"
         assert err.suggestion is None
+
+
+class TestUnquotedSubjects:
+    """
+    PostgreSQL does not quote a *qualified* column reference.
+
+    Measured on 18.6:
+
+        SELECT u.nmae FROM users u   ->  column u.nmae does not exist
+        SELECT * FROM userss         ->  relation "userss" does not exist
+
+    The first version of this module looked only for a quoted token, so the
+    qualified case -- by far the commoner way to mistype a column in a joined
+    query -- produced a suggestion from PostgreSQL's own hint and then no
+    corrected SQL to apply it to, because nothing had been identified to
+    replace. Caught by running real queries at the server, not by rereading the
+    regex.
+    """
+
+    def test_a_qualified_column_is_identified_without_quotes(self):
+        err = explain(
+            FakeError(
+                "column u.nmae does not exist",
+                sqlstate="42703",
+                hint='Perhaps you meant to reference the column "u.name".',
+                position=8,
+            ),
+            "SELECT u.nmae FROM users u LIMIT 5",
+        )
+        assert err.offending == "u.nmae"
+        assert err.suggested_sql == "SELECT u.name FROM users u LIMIT 5"
+
+    def test_an_unqualified_column_still_works(self):
+        err = explain(
+            FakeError("column nmae does not exist", sqlstate="42703", position=8),
+            "SELECT nmae FROM users",
+            known_names=["name", "email"],
+        )
+        assert err.offending == "nmae"
+        assert err.suggested_sql == "SELECT name FROM users"
+
+    def test_a_syntax_error_has_no_subject_to_replace(self):
+        """
+        `syntax error at or near "orders"` names where parsing stopped, not a
+        thing that is wrong -- the mistake is usually the token *before* it.
+        Offering `orders` as the offending identifier would point at innocent
+        text, so nothing is claimed.
+        """
+        err = explain(
+            FakeError('syntax error at or near "orders"', sqlstate="42601", position=15),
+            "SELECT id, ts FORM orders",
+            known_names=["orders", "users"],
+        )
+        assert err.suggested_sql is None
+
+
+class TestPositionIsRebasedOntoTheUsersSql:
+    """
+    PostgreSQL's offset is into the statement *it* received, not the one the
+    user wrote.
+
+    `/query/optimize` wraps the query in `EXPLAIN (FORMAT JSON) `, and a
+    candidate carries a `/*+ ... */` hint in front; both shift every offset
+    after them. Measured: `SELECT u.nmae FROM users u LIMIT 5` reported position
+    30 -- 8 in the user's text plus the 22 characters of the EXPLAIN prefix --
+    and the caret landed under `users u`, confidently pointing at the one part
+    of the line that was correct.
+    """
+
+    EXPLAIN_PREFIX = "EXPLAIN (FORMAT JSON) "
+
+    def test_an_explain_prefix_does_not_move_the_caret(self):
+        sql = "SELECT u.nmae FROM users u LIMIT 5"
+        shifted = len(self.EXPLAIN_PREFIX) + sql.index("u.nmae") + 1
+        err = explain(
+            FakeError("column u.nmae does not exist", sqlstate="42703", position=shifted),
+            sql,
+        )
+        assert err.column == sql.index("u.nmae") + 1
+        assert err.excerpt.split("\n")[1].index("^") == sql.index("u.nmae")
+
+    def test_a_correct_position_is_left_alone(self):
+        sql = "SELECT u.nmae FROM users u"
+        err = explain(
+            FakeError("column u.nmae does not exist", sqlstate="42703", position=8),
+            sql,
+        )
+        assert err.position == 8
+
+    def test_an_ambiguous_token_points_nowhere_rather_than_somewhere_wrong(self):
+        """
+        Two occurrences and no reliable offset: a caret under the wrong one is
+        exactly the failure this rebasing exists to prevent, so it points at
+        neither. The message and suggestion still stand.
+        """
+        sql = "SELECT nmae FROM users WHERE nmae IS NOT NULL"
+        err = explain(
+            FakeError("column nmae does not exist", sqlstate="42703", position=999),
+            sql,
+            known_names=["name"],
+        )
+        assert err.excerpt is None
+        assert err.suggestion == "name"

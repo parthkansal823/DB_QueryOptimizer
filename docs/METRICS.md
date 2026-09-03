@@ -133,9 +133,18 @@ This is the fairer score. A database where PostgreSQL is already optimal
 offers no headroom, and scoring 0% improvement there is not a failure. When
 headroom is zero the metric reports `null` instead of dividing by zero.
 
-Knowing the oracle is only possible because `/query/analyze` executes every
-candidate. In production you never learn what the plans you skipped would have
-cost, which makes this an offline diagnostic.
+Knowing the oracle depends on having executed the candidates, which is why it
+is an offline diagnostic: in production you never learn what the plans you
+skipped would have cost.
+
+**`app.benchmark` still executes every candidate, so its oracle is the real
+ceiling.** `/query/analyze` no longer does. It plans every candidate and
+executes `ANALYZE_EXECUTE_LIMIT` of them (default 4), so the dashboard's
+"fastest seen" is the best of those four rather than the best available — a
+weaker claim, and the response says which by carrying both
+`n_candidates_planned` and `n_candidates_executed`. Raise the limit if you want
+the dashboard's figure to approach the benchmark's; the endpoint went from
+1.19 s to 0.19 s by not doing so.
 
 ### Deviation rate
 
@@ -245,17 +254,38 @@ linear fit between them would not mean anything.
 - `~0.67` — the value measured on the sample database.
 - Vertical spread at a fixed cost is the exploitable gap.
 
-### Disabled plans are excluded
+### Disabled plans are excluded, and how they are detected changed
 
-PostgreSQL does not remove a disabled node type. It adds `disable_cost` (10¹⁰)
-so the arithmetic buries it. Operator hints like `Set(enable_hashjoin off)`
-therefore produce plans whose `total_cost` is a sentinel, not an estimate —
-670 of 1618 rows on the sample database.
+A plan the planner was told not to build is not a prediction, so it is not
+evidence about prediction quality. Operator hints like `Set(enable_hashjoin off)`
+produce them routinely.
 
-They are excluded, for two reasons. They would compress every real estimate
-into the first pixel of a log axis, and they would flatter the correlation,
-since a disabled plan is reliably both top-of-scale and slow. They are not
-predictions, so they say nothing about prediction quality.
+**Until PostgreSQL 18** such a plan carried `disable_cost` (10¹⁰), so its
+`total_cost` was a sentinel rather than an estimate and a `total_cost < 1e9`
+floor caught it. The argument for excluding them was that they would compress
+every real estimate into the first pixel of a log axis and *flatter* the rank
+correlation, a disabled plan being reliably both top-of-scale and slow.
+
+**PostgreSQL 18 removed the inflation.** Measured on 18.6: a query with three
+scan types banned costs **8.0**, exactly what it costs unconstrained. So the
+floor stopped catching anything, and on the log at the time of writing:
+
+| | rows |
+|---|---|
+| passed the cost floor and were plotted | 8,576 |
+| of those, carrying `"Disabled": true` | **1,157 (13.5%)** |
+| caught by the old `total_cost >= 1e9` filter | **0** |
+
+The exclusion had been completely dead, and the reasoning behind it had
+inverted. On PG18 a disabled plan is *bottom*-of-scale and slow — a disconnected
+four-table order costs 20.5 against the correct plan's 6990.8 — so instead of
+flattering the correlation those rows were dragging it down, and the cost model
+looked worse than it is.
+
+The filter now reads the planner's own `Disabled` flag. The cost floor is kept
+underneath it because it is still correct on PostgreSQL 16 and costs nothing.
+This was the third place one upgrade silently disabled a cost-based test; see
+`docs/WRITEUP.md` 2.29.
 
 Code: `backend/app/stats.py` — `cost_vs_latency`, `_spearman`
 

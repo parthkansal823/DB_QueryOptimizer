@@ -48,6 +48,21 @@ BASE_FEATURES = [
     "n_nestloop_join",
     "n_merge_join",
     "has_hint",
+    # PostgreSQL 18 signals. Both are absent on 16, where they read as 0.0 --
+    # which is the correct value there, not a gap being papered over.
+    #
+    # `n_index_searches` (C5) counts how many times an index was actually
+    # searched, which `Plan Rows` and `loops` together only approximate. A
+    # nested loop that probes an index 50,000 times and one that probes it once
+    # are the difference between a good plan and a disaster, and until PG18
+    # nothing in the plan said which had happened.
+    "n_index_searches",
+    # `n_disabled_nodes` is 0 for every candidate the optimizer will now serve,
+    # because `planner.plan_query` filters them out. It is here for the rows in
+    # the log that predate that filter, so the model can learn that `total_cost`
+    # means nothing on a plan carrying one -- see docs/WRITEUP.md 2.29, where a
+    # disconnected order came back 340x cheaper than the correct plan.
+    "n_disabled_nodes",
 ]
 PER_TABLE_SUFFIXES = ("present", "join_position", "selectivity", "index_scan", "occurrences")
 
@@ -104,6 +119,31 @@ def _classify_join_types(join_types: list[str]) -> tuple[int, int, int]:
     return n_hash, n_nestloop, n_merge
 
 
+def _sum_node_key(plan: dict, key: str) -> float:
+    """Sum a numeric field over every node in the tree, 0.0 where absent."""
+    if not isinstance(plan, dict):
+        return 0.0
+    total = float(plan.get(key) or 0.0)
+    for child in plan.get("Plans", []) or []:
+        total += _sum_node_key(child, key)
+    return total
+
+
+def _count_disabled(plan: dict) -> int:
+    """
+    Nodes the planner was forbidden to use, counted from the raw tree.
+
+    `plan_extractor` already computes this, but `featurize` is also handed rows
+    read straight back out of `plan_execution_log`, which carry only `raw_plan`.
+    """
+    if not isinstance(plan, dict):
+        return 0
+    count = 1 if plan.get("Disabled") else 0
+    for child in plan.get("Plans", []) or []:
+        count += _count_disabled(child)
+    return count
+
+
 def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> dict[str, float]:
     """
     Build the feature dict for one executed candidate plan (the dict shape
@@ -134,6 +174,10 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
     features["n_nestloop_join"] = float(n_nestloop)
     features["n_merge_join"] = float(n_merge)
     features["has_hint"] = 1.0 if candidate_plan.get("hint") else 0.0
+    features["n_index_searches"] = float(_sum_node_key(raw_plan, "Index Searches"))
+    features["n_disabled_nodes"] = float(
+        candidate_plan.get("disabled_nodes") or _count_disabled(raw_plan)
+    )
 
     features.update(encode_plan_tree(raw_plan))
 

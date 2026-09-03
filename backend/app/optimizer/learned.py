@@ -585,6 +585,23 @@ class LearnedOptimizer:
         left to the model and the confidence gate, which reason about
         predicted *latency* -- the thing actually being optimised.
         """
+        # Two ways to detect the same thing, because the server changed how it
+        # says it.
+        #
+        # PG16 prices a node reached under `enable_x = off` at `disable_cost`
+        # (~1e10), so a forbidden plan announces itself in the total cost.
+        # **PG18 removed that inflation.** Measured on 18.6, the same query with
+        # three scan types banned costs 8.0 -- exactly what it costs
+        # unconstrained -- with `Disabled: true` on two nodes instead. So on
+        # PG18 the cost test below can never fire, and this veto quietly
+        # stopped existing the moment the server was upgraded.
+        #
+        # Reading the flag is also strictly better than the cost heuristic was:
+        # it names *which* nodes, and it cannot be confused by a plan that is
+        # legitimately expensive.
+        if chosen.get("disabled_nodes"):
+            return True
+
         chosen_cost = chosen.get("total_cost")
         if not chosen_cost:
             return False
