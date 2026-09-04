@@ -66,6 +66,12 @@ jobs:
       # server and loaded via shared_preload_libraries. A stock postgres image
       # would let every hint silently become a comment, which is the exact
       # failure these tests exist to catch.
+      #
+      # The preload list must match docker-compose.yml. `pg_stat_statements` is
+      # created by postgres/init/01_extensions.sql, and `CREATE EXTENSION`
+      # succeeds whether or not the library is preloaded -- it is *querying* the
+      # view that then fails. So a mismatch here does not break the build, it
+      # breaks the advisor at the point something reads it.
       - name: Build Postgres with pg_hint_plan
         run: docker build -t lqo-postgres ./postgres
 
@@ -77,7 +83,7 @@ jobs:
             -v "$PWD/postgres/init:/docker-entrypoint-initdb.d" \
             -v "$PWD/data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql" \
             lqo-postgres \
-            postgres -c shared_preload_libraries=pg_hint_plan
+            postgres -c shared_preload_libraries=pg_hint_plan,pg_stat_statements
 
       - name: Wait for the seed data to load
         run: |

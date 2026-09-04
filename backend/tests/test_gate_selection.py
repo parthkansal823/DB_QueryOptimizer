@@ -168,9 +168,22 @@ class _Ensemble:
         return self.means[: len(X)]
 
 
+class _FirstRanker:
+    """Picks index 0, which is what a single-candidate fixture leaves anyway.
+
+    `pairwise_rank` is the shipped default (2.43), and `evaluate_setting` now
+    refuses a bundle that cannot be scored under it rather than silently
+    skipping every query -- which used to return a flawless gate computed from
+    an empty sample."""
+
+    def select(self, vectors, tie_break_costs=None):
+        return 0
+
+
 def _bundle(held_out=None):
     bundle = {
         "model": _Ensemble([math.log(0.5)] * 8, [0.0] * 8),
+        "ranker": _FirstRanker(),
         "feature_columns": [],
         "table_cardinalities": {},
         "target": "log_ratio_vs_native",

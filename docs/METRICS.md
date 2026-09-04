@@ -85,7 +85,7 @@ and those skew cheap.
 
 On the sample database this produced:
 
-| | Value |
+| Quantity | Value |
 |---|---|
 | Average of the plans it chose | 2.54 ms (7 runs) |
 | Average of all PostgreSQL plans | 94.16 ms (52 runs) |
@@ -270,7 +270,7 @@ correlation, a disabled plan being reliably both top-of-scale and slow.
 scan types banned costs **8.0**, exactly what it costs unconstrained. So the
 floor stopped catching anything, and on the log at the time of writing:
 
-| | rows |
+| Plans in the log | rows |
 |---|---|
 | passed the cost floor and were plotted | 8,576 |
 | of those, carrying `"Disabled": true` | **1,157 (13.5%)** |

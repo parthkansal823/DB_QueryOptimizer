@@ -48,7 +48,11 @@ FIELDS: dict[str, dict] = {
             "latency. Which one wins is dataset-dependent."
         ),
         "env": "SELECTION_POLICY",
-        "default": "greedy",
+        # `learned.DEFAULT_SELECTION_POLICY` -- restated as a literal only
+        # because FIELDS is plain data read by the dashboard. The test suite
+        # asserts the two agree, which is the part that was missing when this
+        # said "greedy" and the container served `pairwise_rank`.
+        "default": "pairwise_rank",
     },
     "risk_lambda": {
         "type": "float", "min": 0.0, "max": 10.0, "step": 0.1,
@@ -66,10 +70,13 @@ FIELDS: dict[str, dict] = {
         "help": (
             "How the bound on a predicted speedup is worked out. `fixed_z` is "
             "mean + z x sigma, which assumes ensemble spread is a calibrated "
-            "standard deviation. `conformal` measures the multiplier from the "
-            "model's own out-of-bag residuals at a stated risk level, and holds "
-            "whatever shape those residuals have. Needs a model trained since "
-            "the gate was added; older bundles fall back to `fixed_z`."
+            "standard deviation -- and this project measured that spread "
+            "understating true error by 3.75x. `conformal` measures the "
+            "multiplier from the model's own out-of-bag residuals at a stated "
+            "risk level, and holds whatever shape those residuals have. Needs "
+            "a model trained since the gate was added; older bundles fall back "
+            "to `fixed_z`. `app.calibrate` now sweeps both and writes the "
+            "winner to models/gate.json; setting this overrides that choice."
         ),
         "env": "GATE_MODE",
         "default": "fixed_z",
@@ -147,10 +154,18 @@ FIELDS: dict[str, dict] = {
             "random_page_cost and a pinned join order. These change what the "
             "executor is given rather than the plan's shape, so they reach "
             "speedups no join order or operator toggle can -- a hash join that "
-            "no longer spills to disk, or a scan that runs in parallel."
+            "no longer spills to disk, or a scan that runs in parallel. "
+            "Measured against that argument (WRITEUP 2.48), the family costs "
+            "about three points of held-out headroom, so it is off by default; "
+            "re-measure with `app.autotune` on your own data before trusting "
+            "either setting."
         ),
         "env": "INCLUDE_TUNING",
-        "default": True,
+        # `planner.INCLUDE_TUNING` -- restated as a literal only because FIELDS
+        # is plain data read by the dashboard. `test_settings` asserts the two
+        # agree, which is the part that was missing when this said True and the
+        # planner had been measured to be better off without it.
+        "default": False,
     },
     "include_join_methods": {
         "type": "bool",

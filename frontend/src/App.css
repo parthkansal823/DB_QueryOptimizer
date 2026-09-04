@@ -882,6 +882,18 @@ input:focus, select:focus, textarea:focus {
   max-width: 74ch;
 }
 
+/* Shown when the running optimizer holds a different value than the control
+   above -- `confidence_z` and `min_relative_gain` defer to the measured gate in
+   models/gate.json unless someone explicitly chose them, so the panel used to
+   read 1.0 while the gate in force was 1.5. Warning-coloured rather than
+   error-coloured: the calibration winning is correct behaviour, and only the
+   silence about it was the bug. */
+.setting-overridden {
+  color: var(--warn, var(--ink));
+  border-left: 2px solid var(--warn, var(--ink-muted));
+  padding-left: var(--space-2, 0.5rem);
+}
+
 /* -- misc ------------------------------------------------------------------ */
 
 .probe-ok { color: var(--good); }

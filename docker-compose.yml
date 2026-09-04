@@ -52,16 +52,43 @@ services:
       # survives `docker compose down -v` being forgotten; this does not.
       #
       # `data/pgdata/` is gitignored -- it is 9.5GB of database, not source.
-      # PostgreSQL 18 changed the recommended mount point: a single mount at
-      # /var/lib/postgresql, with the server placing its cluster in a version
-      # subdirectory beneath it. Mounting .../data directly still works but puts
-      # a mount-point boundary exactly where `pg_upgrade --link` needs to move
-      # files, so the next major upgrade would have to copy 9 GB instead of
-      # hard-linking it. The PG16 cluster this replaced is preserved at
-      # data/pgdata_pg16 -- its `job` (IMDB/JOB) database is not regenerable
-      # from schema.sql and can be reached by pointing a postgres:16 container
-      # at that directory.
-      - ./data/pgdata:/var/lib/postgresql
+      # A named volume, not a bind mount -- and the reversal is worth explaining
+      # because the bind mount was a deliberate choice.
+      #
+      # It was chosen so "where is my data" had one answer you could see, copy
+      # and delete like any other directory, rather than something invisible
+      # that a stray `docker compose down -v` destroys. That reasoning still
+      # holds. What it did not account for is that a PostgreSQL data directory
+      # on a Windows filesystem is exposed to every other process that opens
+      # files there.
+      #
+      # Measured, in one session: Windows Defender real-time scanning (on, with
+      # no exclusion for this path) and the Search indexer took exclusive locks
+      # on relation files, and PostgreSQL cannot open a file something else has
+      # open. `ANALYZE` failed three times on three *different* relations, 14
+      # integration tests failed, and `wsl --shutdown` cleared it only until the
+      # next time. Worse, an attempt to route around a locked index with
+      # `REINDEX` committed, could not unlink the old file, and left the server
+      # unable to start at all -- WAL redo kept replaying a commit that
+      # referenced the locked file. Nothing was lost, but a read error had been
+      # turned into an unbootable database.
+      #
+      # A named volume lives inside the Docker VM, where no host scanner can
+      # reach it, so the failure class becomes impossible rather than unlikely.
+      # It is also markedly faster: bind-mounted I/O on Windows crosses a 9p/
+      # virtiofs boundary on every page.
+      #
+      # The property that is lost -- seeing the files in Explorer -- is worth
+      # less than it sounds, because what anyone actually wants from it is a
+      # backup, and `pg_dump` gives a better one: portable across versions,
+      # verifiable with `pg_restore --list`, and a fifteenth the size. See
+      # README, "Where the data lives", for the commands.
+      #
+      # The PostgreSQL 16 cluster is still a bind-mounted directory at
+      # data/pgdata_pg16 -- it holds the `job` (IMDB/JOB) database, which is not
+      # regenerable from schema.sql -- and data/pgdata keeps the last PG18
+      # cluster as a snapshot. Neither is mounted by anything now.
+      - pgdata:/var/lib/postgresql
       - ./postgres/init:/docker-entrypoint-initdb.d
       - ./data/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql
       # Read-only: lets `data/job/load_job.sh` COPY the JOB/IMDB CSVs
@@ -88,11 +115,25 @@ services:
       # holding the real `lqo_v2` is preserved at data/pgdata_pg16.
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/lqo
       FRONTEND_ORIGIN: http://localhost:5173
-      # Measured best on this dataset: 87.8% of oracle headroom captured
-      # versus 77.2% for the ensemble policies (docs/WRITEUP.md 2.1).
-      # Which policy wins is dataset-dependent -- re-check with app.model_zoo
-      # after onboarding a new database.
-      SELECTION_POLICY: pairwise_rank
+      # SELECTION_POLICY is deliberately NOT set here.
+      #
+      # It used to be, as `pairwise_rank` -- measured best on this dataset,
+      # 87.8% of oracle headroom against 77.2% for the ensemble policies
+      # (docs/WRITEUP.md 2.1). Correct value, wrong place. Setting it on this
+      # service put it inside this container only, and `app.calibrate`,
+      # `app.retrain` and `app.benchmark` are run from the host, where it was
+      # unset and the code default `greedy` applied. So the gate in
+      # models/gate.json was swept under a policy the server does not use, and
+      # promotion scored one too.
+      #
+      # Measured on 15 held-out queries (2.43), that gap is the whole result:
+      # `greedy` lands at 104.1% of native and `pairwise_rank` at 95.1%,
+      # against an oracle of 83.6%. The only policy that beats PostgreSQL was
+      # the only one never calibrated.
+      #
+      # The default now lives once, in `learned.DEFAULT_SELECTION_POLICY`, so
+      # host and container agree without anything having to be kept in sync.
+      # Export SELECTION_POLICY to override it in both places at once.
     ports:
       - "8000:8000"
     depends_on:
@@ -116,9 +157,12 @@ services:
       - frontend_node_modules:/app/node_modules
 
 volumes:
-  # `node_modules` stays a named volume on purpose, unlike the database above.
-  # It is not project data -- it is a build artifact, and it has to be the
-  # *Linux* build. The repo is bind-mounted into the container, so without this
+  pgdata:
+  # `node_modules` is a named volume for a different reason than the database
+  # above, and the distinction is worth keeping: the database moved to one to
+  # escape host file locks, while this one was never a candidate for a bind
+  # mount at all. It is not project data -- it is a build artifact, and it has
+  # to be the *Linux* build. The repo is bind-mounted into the container, so without this
   # shadowing it the container would import modules compiled for the host
   # platform, and anything with a native binding would fail at runtime.
   frontend_node_modules:

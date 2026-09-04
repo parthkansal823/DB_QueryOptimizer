@@ -79,6 +79,15 @@ evidence that the diagnosis was right. Full analysis in `docs/WRITEUP.md` §2.9.
 > model was scoring plan types it had never seen. That is train/serve skew,
 > not a bug.
 
+> **The same applies to plan *shapes*, and that took longer to notice.** The
+> workload was 24 queries all of one shape — a select over joins with filters.
+> None aggregated, sorted, de-duplicated or used a subquery, so no training plan
+> ever contained a `HashAggregate`, a `WindowAgg` or a semi-join, and the
+> `n_aggregate` / `n_sort` features were near-zero in every row the model had
+> seen. A feature that never varies teaches nothing. The workload is now 32,
+> with a `shape_` group covering aggregation, DISTINCT, top-N, a window
+> function, and semi- and anti-joins.
+
 ## Point it at *any* PostgreSQL database
 
 One command sets up a database it has never seen. It discovers the schema,
@@ -98,10 +107,19 @@ JOB/IMDB benchmark, whose schema declares none.
 
 The same command was checked on two unrelated databases:
 
-| Database | Tables | Join edges | Rows | Best policy |
+| Database | Tables | Join edges | Rows | Best policy, on the workload it generated |
 |---|---|---|---|---|
 | Synthetic e-commerce | 4 | 3 declared | 755k | `pairwise_rank`, **+60%** of oracle headroom |
 | **Real JOB/IMDB** | 21 | 11 *inferred* | 74.2M | `risk_averse`, **+77%** of oracle headroom |
+
+**Read that second row narrowly.** It says the generator produced a workload on
+a 21-table schema with no declared foreign keys, and that one policy did well on
+*those* queries — native averages 210.9 ms on them. It does **not** say this
+system is good at JOB. Run against the real Join Order Benchmark queries, where
+native averages 3703 ms and the best available plan averages 919 ms, it captures
+**none** of that 75% gap: every selector returns the native plan
+(`docs/JOB_RESULTS.md`). Two numbers, two workloads, and the harder one is the
+one that matters — see `docs/WRITEUP.md` §4 and `docs/ROADMAP.md` item 1.
 
 The generated workload is written to `models/workload_<db>.json`, so you can
 read it, edit it, and replay it. Auto-generation is a starting point, not a
@@ -283,15 +301,55 @@ Compare policies, or the regression guard, in a single run:
 
 ```bash
 docker compose exec backend python -m app.benchmark --policy risk_averse
-docker compose exec backend python -m app.benchmark --policy pairwise_rank
+docker compose exec backend python -m app.benchmark   # --policy defaults to the served one
 docker compose exec backend python -m app.benchmark --no-guard      # A/B the guard
 ```
+
+### Picking the settings
+
+`app.autotune` is the one command for "what should I set". It sweeps the
+**selection policy**, the **action space** and the **safety gate** together, on
+the queries the model held out, under the same safety bounds, and prints one
+configuration plus the variables to export:
+
+```
+        policy           extra families     z  gain  dev%  reg%   worst    net%  spread
+ pairwise_rank                     none  2.00  0.00   33%   20%   1.21x   10.5%
+      thompson                     none  2.00  0.02   33%   20%   1.21x    9.6%  +7.6 to +10.0 over 5 draws
+        greedy                     none  2.00  0.02   33%   20%   1.21x    9.2%
+   risk_averse                     none  2.00  0.02   33%   20%   1.21x    7.3%
+```
+
+Sweeping them **together** is the point. They are not independent: a gate
+threshold is a property of the selection policy it was measured against, and the
+action space decides what there is to select from. `docs/WRITEUP.md` 2.43 is
+what happens otherwise -- the gate was calibrated under `greedy` for the life of
+the project while the server selected with `pairwise_rank`, and those land at
+104.1% and 95.1% of native on the same held-out queries.
+
+Two things it does on purpose:
+
+- **Stochastic policies are drawn five times and scored on the median**, with
+  the range printed. `thompson` samples an ensemble member per decision; three
+  identical sweeps of it returned +14.16%, +10.61% and +12.33%. Comparing one
+  draw against a deterministic policy's exact value is how a tuner ends up
+  recommending whichever option is noisiest, and the first version of this tool
+  did exactly that (2.48).
+- **`--apply` writes the gate and only prints the rest.** Thresholds live in
+  `models/gate.json`, which this tool owns. What a running server selects with
+  is not something a tuning run should change behind you.
+
+It is a replay, not an execution, so confirm the winner with
+`python -m app.benchmark --protocol compare` -- 2.32 measured two identical
+3-run benchmarks landing 8 points apart.
 
 Drive the learning loop (the dashboard has buttons for these too):
 
 ```bash
 docker compose exec backend python -m app.diagnostics           # should I believe this model?
-docker compose exec backend python -m app.calibrate --apply    # measure and apply the best confidence gate
+docker compose exec backend python -m app.autotune             # what are the best settings?
+docker compose exec backend python -m app.autotune --apply     # ...and write the gate they imply
+docker compose exec backend python -m app.calibrate --apply    # just the gate, at fixed policy
 docker compose exec backend python -m app.retrain --status     # deployed version, pending feedback
 docker compose exec backend python -m app.retrain              # retrain if there is enough new data
 docker compose exec backend python -m app.retrain --rollback   # go back to the previous version
@@ -404,7 +462,7 @@ learned-query-optimizer/
 │       ├── hypothetical.py       what an index would be worth, via HypoPG
 │       ├── query_template.py     parameterised statements share one identity
 │       ├── experiment_job.py     paired A/B comparisons, run from the dashboard
-│       ├── workload.py           the 24-query benchmark workload
+│       ├── workload.py           the 32-query benchmark workload
 │       ├── collect_data.py       offline collection -> plan_execution_log
 │       ├── train.py              trains and evaluates the model
 │       ├── benchmark.py          CLI: native vs. learned; --protocol compare|deploy
@@ -468,18 +526,40 @@ switches when the predicted win is bigger than its own uncertainty. Live runs
 went from `+40%, −25%, −149%` to `+14%, +42%, +1%`, all positive. §2.4.1
 documents the two attempts that failed first.
 
-**It optimizes about 44% of queries, and that is deliberate.** For the rest it
-keeps PostgreSQL's plan, because the model is not confident enough to gamble.
-That threshold is *measured*, not guessed: `python -m app.calibrate` sweeps it
-against your own logged results.
+**It declines most queries, and how deliberate that is depends on the
+calibration set.** For every query it declines, PostgreSQL's plan runs
+unchanged, because the model is not confident enough to gamble. The threshold is
+*measured*, not guessed: `python -m app.calibrate` sweeps it against your own
+logged results.
+
+An earlier calibration, on a larger set, produced the trade-off this section
+originally reported:
 
 | Setting | Deviates | Regresses | Net gain |
 |---|---|---|---|
 | calibrated | 63% | **0%** | **+14.5%** |
 | forced to act more | 87% | 15% | +13.9% |
 
-Making it optimize more queries produces *less* net improvement and starts
-causing regressions. The extra activity is all bets the model was unsure about.
+Making it optimize more produced *less* net improvement and started causing
+regressions -- the extra activity was all bets the model was unsure about.
+
+**That is not what the current calibration does, and the difference is worth
+stating plainly.** The most recent sweep ran on **8 held-out queries**, over a
+grid whose operating points differed by 0.4 percentage points of net gain. It
+chose a bar of `min_relative_gain = 0.10`, and the measured consequence across
+eleven benchmark runs was a held-out deviation rate of **exactly zero** — the
+same 0.0% every run.
+
+Those eight queries were not short of opportunity. Five of them have more than
+**20%** available between PostgreSQL's plan and the best candidate the optimizer
+can already reach, up to **43.4%** on a six-way join. The system took none of it.
+
+A calibration asked to choose between options separated by less than its own
+resolution will pick the one that does nothing, because doing nothing is the
+only option whose downside it can bound. So the honest reading of a low
+deviation rate here is **a property of the calibration set size, not a measured
+statement about the model** — `docs/WRITEUP.md` §2.37 has the working, including
+an A/B of a looser bar that came back *unresolved* rather than better.
 
 **Correcting the estimate is not the same as having somewhere to go.** The
 newest addition learns how wrong PostgreSQL's *join* row estimates are and
@@ -570,8 +650,8 @@ deviate on any predicted win at all.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SELECTION_POLICY` | `pairwise_rank` | `greedy`, `thompson`, `risk_averse`, `pairwise_rank` |
-| `GATE_MODE` | `fixed_z` | `fixed_z` (mean + z·sigma) or `conformal` (measured bound, see below) |
+| `SELECTION_POLICY` | `pairwise_rank` | `greedy`, `thompson`, `risk_averse`, `pairwise_rank`. The default lives in `learned.DEFAULT_SELECTION_POLICY` and **nothing else restates it** -- `docker-compose.yml` used to, on the backend service only, so every host-run tool measured `greedy` instead (`docs/WRITEUP.md` 2.43) |
+| `GATE_MODE` | from `models/gate.json`, else `fixed_z` | `fixed_z` (mean + z·sigma) or `conformal` (measured bound, see below). `app.calibrate` sweeps both and writes the winner; setting this overrides that |
 | `CONFORMAL_ALPHA` | `0.1` | Risk level for the conformal gate; applied when the model trains |
 | `INCLUDE_JOIN_METHODS` | `0` (off) | Serve forced `HashJoin`/`NestLoop`/`MergeJoin` candidates as well as join orders |
 | `INCLUDE_TUNING` | `1` | Resource/cost-model candidates: parallel workers, `work_mem`, `random_page_cost`, `join_collapse_limit` |
@@ -680,6 +760,26 @@ ensembles built exactly the way `bandit.py` builds this one.
 `app.train` reports the achieved coverage on held-out queries, so the guarantee
 is checked rather than asserted.
 
+**Which bound is used is measured, not chosen.** `app.calibrate` sweeps
+`fixed_z` and `conformal` as one grid over the same held-out queries, and
+`--apply` writes the winner into `models/gate.json` alongside the thresholds it
+was swept under -- the two have to travel together, because a
+`min_relative_gain` chosen against a conformal bound is not the right threshold
+for a fixed-z one.
+
+That sweep is worth running rather than trusting the default. Measured on a
+model with 15 held-out queries (docs/WRITEUP.md 2.42), `fixed_z`'s net result
+moved from **-4.04% to +1.17%** depending on where `min_relative_gain` was set,
+with a worst case of 1.73x native; `conformal` returned **+1.10%** at every
+value of that knob with a worst case of 1.07x. The best single number belongs
+to `fixed_z` by 0.07 points, which is far below what this project's measurement
+noise can resolve (2.18, 2.32) -- the 5-point swing is not.
+
+Precedence: explicit constructor argument, then `GATE_MODE`, then
+`models/gate.json`, then `fixed_z`. The environment variable outranks the gate
+file here (unlike `CONFIDENCE_Z`) because exporting it is an override of the
+method itself, and a stale sweep should not silently undo that.
+
 ### What it actually measured, which was not what it was built for
 
 On a calibration run here (936 executions, 17 queries, 237 training rows) the
@@ -687,7 +787,7 @@ calibration comes back with **q = 8.5** — the bound needs
 *eight and a half* sigmas to cover 90% of held-out outcomes, where `z = 1.0`
 had been assumed sufficient. The reason is visible in the same eval output:
 
-| | log-ratio units |
+| Spread against error | log-ratio units |
 |---|---|
 | mean ensemble spread on held-out rows | 0.175 |
 | actual mean absolute error | **0.403** |

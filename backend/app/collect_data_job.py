@@ -25,7 +25,14 @@ import re
 
 from app.collect_data import DEFAULT_REPS, collect
 
-QUERY_DIR = "/job_queries"  # see the backend service's volume mount in docker-compose.yml
+# The backend service mounts the query files at /job_queries (see
+# docker-compose.yml). Run from the host -- which is how every other tool in
+# this project is driven -- that path does not exist, so the repo copy is the
+# fallback and `--query-dir` overrides both.
+QUERY_DIR = os.getenv(
+    "JOB_QUERY_DIR",
+    "/job_queries" if os.path.isdir("/job_queries") else "../data/job/queries",
+)
 SKIP_FILES = {"schema.sql", "fkindexes.sql"}
 
 
@@ -57,9 +64,13 @@ if __name__ == "__main__":
     parser.add_argument("--n", type=int, default=8, help="number of (smallest) JOB queries to collect")
     parser.add_argument("--reps", type=int, default=DEFAULT_REPS)
     parser.add_argument("--timeout-ms", type=int, default=60_000)
+    parser.add_argument(
+        "--query-dir", default=QUERY_DIR,
+        help="directory holding the JOB .sql files (default: %(default)s)",
+    )
     args = parser.parse_args()
 
-    workload = load_job_workload(args.n)
+    workload = load_job_workload(args.n, query_dir=args.query_dir)
     print(f"Selected {len(workload)} JOB queries: {[q['id'] for q in workload]}")
     collect(
         reps=args.reps,

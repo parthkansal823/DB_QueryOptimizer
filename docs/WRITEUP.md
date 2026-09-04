@@ -142,7 +142,7 @@ On pg_hint_plan 1.6.3 -- the version pinned in `postgres/Dockerfile` -- a hint
 placed *after* the `EXPLAIN` keyword binds exactly as well as one placed
 before it. Measured on a 4-table query:
 
-| | Total cost |
+| Hint, and where it was placed | Total cost |
 |---|---|
 | No hint | 11,699 |
 | `Set(enable_hashjoin off)` before `EXPLAIN` | 42,094 |
@@ -771,7 +771,7 @@ calibration kept setting it to zero -- correctly, given what it could measure.
 The reason is a units error rather than a bug. Measured out-of-bag on this
 model:
 
-| | log-ratio units |
+| Measured on out-of-bag rows | log-ratio units |
 |---|---|
 | mean \|out-of-bag residual\| | 0.143 |
 | mean out-of-bag sigma | 0.071 |
@@ -826,7 +826,7 @@ conservative, not less, so a fuller collection moves `q` down, not up.
 229 of 237 training rows (96.6%) produced an out-of-bag residual, so the
 no-cost claim holds. The calibration then returns:
 
-| | value |
+| Conformal calibration | value |
 |---|---|
 | alpha | 0.10 |
 | **conformal multiplier q** | **8.51** |
@@ -836,7 +836,7 @@ no-cost claim holds. The calibration then returns:
 **q = 8.51 against an assumed z = 1.0.** Covering 90% of outcomes takes eight
 and a half sigmas, not one. The reason is in the same eval output:
 
-| | log-ratio units |
+| Spread against error | log-ratio units |
 |---|---|
 | mean ensemble spread, held-out | 0.175 |
 | actual mean absolute error | 0.403 |
@@ -928,6 +928,16 @@ edges are labelled as inferred in `/schema` rather than presented as fact.
 Both rows are from auto-generated workloads, so this is the system solving a
 problem it set itself.
 
+**And the JOB column must not be read as a JOB result.** `app.onboard` generated
+those queries, and native averages **210.9 ms** on them. The actual Join Order
+Benchmark queries on the same database average **3703 ms** native against a best
+available plan of 919 ms, and against those this system captures **0%** of the
+75% gap -- every selector returns the native plan (`docs/JOB_RESULTS.md`). The
++77.2% below is a real measurement of a real difficulty; it is not the
+difficulty JOB is famous for. Quoting it without that sentence is how a project
+ends up believing its own easiest number, which is the failure this section's
+whole method exists to avoid.
+
 **The disagreement between the two columns is the interesting part.** On the
 small, well-sampled synthetic schema, pairwise ranking wins. On JOB, with 21
 tables, 74M rows and only 103 training rows after aggregation, every selector
@@ -971,7 +981,7 @@ repeating the same mistake. Averages hide that completely.
 
 Over 500 logged decisions:
 
-| | Cumulative regret |
+| Path taken | Cumulative regret |
 |---|---|
 | Learned path | 5,016 ms |
 | Native PostgreSQL | 6,261 ms |
@@ -2242,7 +2252,7 @@ measurement instead -- three of them, and they all point the same way.
 
 Measured across all 24 workload queries through the real endpoint:
 
-| | |
+| measurement | value |
 |---|---|
 | optimizer overhead, median | **26.3 ms** |
 | optimizer overhead, worst | 58.2 ms |
@@ -2504,7 +2514,7 @@ baseline plan's own conditions (`Hash Cond`, `Merge Cond`, `Index Cond`), and
 generation only produces connected orders. Measured over the workload's 3- and
 4-table queries:
 
-| | Usable candidates |
+| Join-order sampling | Usable candidates |
 |---|---|
 | Blind permutation | 23 / 48 (48%) |
 | Graph-aware | 40 / 40 (**100%**) |
@@ -2567,6 +2577,29 @@ call -- training saw one subset, inference another, and two benchmark runs
 meant to differ only in a flag were also comparing different candidates.
 Seeding from the table list makes generation deterministic per query.
 
+**A bind-mounted data directory on Windows was exposed to host file locks.**
+Demonstrated the hard way: a host process took an exclusive lock on one index
+file, a `REINDEX` intended to route around it committed and then could not
+unlink the old file, and PostgreSQL panicked and would not restart -- WAL redo
+kept replaying a commit that referenced a file it could not open. Nothing was
+lost and `wsl --shutdown` released it, but a transient read error had been
+turned into an unbootable database, and the lock recurred three times on three
+different relations.
+
+The bind mount was a deliberate choice -- "where is my data" with one visible,
+copyable answer that a stray `docker compose down -v` cannot destroy -- and the
+reasoning still holds. What it did not account for is that a PostgreSQL data
+directory on a Windows filesystem is open to every other process on the host:
+Defender's real-time scanner and the Search indexer both take handles there, and
+a file open elsewhere is a file PostgreSQL cannot open.
+
+`docker-compose.yml` uses a named volume now. It lives inside the Docker VM
+where no host scanner reaches it, which makes the failure class impossible
+rather than unlikely, and it avoids crossing a 9p/virtiofs boundary on every
+page. What is lost is seeing the files in Explorer, and what anyone actually
+wanted from that is a backup -- `pg_dump` gives a better one: portable across
+versions, verifiable with `pg_restore --list`, and a fifteenth the size.
+
 ### Already present, just undocumented
 
 **Scheduled retraining.** The list said retraining was "triggered, not
@@ -2579,15 +2612,158 @@ was a documentation gap, not a missing feature.
 
 ### Still open
 
-**Prediction error against available headroom.** ~400 rows across 25 queries
-gives an error comparable to the opportunity being measured. More repetitions
-help and are now the default; the real fix is more data, which is compute time
-rather than a design question.
+**On unseen queries it now captures 45.7% of the available headroom, and the
+spread is 19.3 to 50.4.** This entry has been rewritten three times and all
+three are worth keeping, because the mistakes were more instructive than the
+result.
 
-**The safety veto is cost-based, not learned.** It compares estimated costs,
-and distrusting those estimates is the premise of the project. It reliably
-catches catastrophes (`disable_cost` marks them clearly) but cannot catch a
-plan that is cheap on paper and slow in reality.
+The symptom was held-out capture of **exactly 0.0%** on every run ever measured
+-- eleven across three sets (2.37), three more this session -- while five of
+eight held-out queries had 20-43% available. 2.37 blamed the gate for declining
+opportunities and prescribed a larger workload. 2.41 ran that measurement and
+concluded the opposite: with the gate fully open the model was net -2.93%, so
+there was nothing behind the gate to take.
+
+Both were measuring `greedy`. The container serves `pairwise_rank` (2.43). And
+the replay could not see the safety veto at all, so it scored plans the server
+refuses (2.47). Corrected, the benchmark reads:
+
+| | measured |
+|---|---|
+| headroom captured | 41.3% (38.9 - 43.0) |
+| **held-out captured** | **45.7% (19.3 - 50.4)** |
+| curated only, no generated queries | 33.0% (20.8 - 34.2) |
+
+Nothing in the model, the features or the action space changed to produce that.
+Six corrections did, each silently wrong for months: 2.42, 2.43, 2.44, 2.45,
+2.47, 2.50. The system was capable of this the whole time; what it lacked was a
+measurement that agreed with what it was running.
+
+**What is still open is how much to trust the number.** A 31-point spread across
+three runs is enormous, on the same instrument 2.32 caught giving two identical
+configurations medians eight points apart. The benchmark's own summary says
+differences under 4.2 points should not be argued about. The honest claim is
+"clearly not zero and probably around a third to a half", not "45.7%".
+
+And the gap between the headline and the curated-only figure -- 41.3% against
+33.0% -- is the selection effect, measured rather than warned about for the
+first time. 27 of the 59 queries were generated and kept *because* the best plan
+in the action space beat native by 8%.
+
+**30.1% of available headroom, on queries the model has never seen.** The three
+ensemble policies all land above 100% -- worse than leaving PostgreSQL alone --
+and one of them was what every benchmark, every calibration and every promotion
+decision in this project had measured.
+
+So the limitation is no longer "the model does not work". It is that the project
+could not tell, for its entire history, whether it worked, because the thing it
+measured and the thing it ran were different. The numbers in section 2 predating
+2.43 should be read as statements about `greedy`.
+
+What is genuinely still open is the size of the remaining gap: 95.1% against an
+oracle of 83.6% means two thirds of the available headroom is still unclaimed,
+and `docs/ROADMAP.md` item 2 sets out why the ranker rather than the ensemble is
+where that work belongs.
+
+**Prediction error against available headroom.** Now 22,544 servable rows
+across 59 queries -- fifty times the data this entry was first written about --
+and the conclusion has not changed. 2.35 measured **2.51x** typical
+multiplicative error on trained queries and **2.66x** on held-out ones; the
+model promoted on 2026-09-04 measures **1.32x**, which is better and still the
+same order as the speedups worth chasing. `app.diagnostics` puts it plainly:
+*predictions are typically off by 32%, which is the same order as the speedups
+worth chasing*.
+
+2.33 established the model generalises fine and is *uniformly* inaccurate, which
+points at the features and the label rather than the sample size.
+
+**2.43 sharpens what that means rather than softening it.** Uniform inaccuracy
+is survivable for a *ranker* and fatal for a *regressor used as a ranker*: a
+2.5x error that is roughly constant across a query's candidates mostly cancels
+in a comparison and not at all in a prediction. That is why `pairwise_rank`
+lands at 95.1% of native on held-out queries while every policy reading the
+ensemble's point predictions lands above 100%. The error bar has not shrunk;
+the system stopped depending on it.
+
+**The ensemble spread is not a standard deviation, and `fixed_z` assumes it
+is.** `uncertainty_scale` is **3.75**: the members agree with each other that
+much more than they agree with reality. Bootstrap resampling measures sampling
+variability and is blind to model bias and measurement noise, both of which
+dominate here (2.4.5).
+
+This was the top fix on the list until 2.42, and it is downgraded because the
+gate no longer has to believe the spread. The conformal bound is an axis of
+`app.calibrate`'s sweep now, so a bound taken from the empirical quantile of the
+model's own out-of-bag residuals competes with `mean + z * sigma` on measured
+terms, per bundle. Over 15 held-out queries `fixed_z`'s net moved from **-4.04%
+to +1.17%** depending where `min_relative_gain` was set, worst case 1.73x;
+`conformal` returned **+1.10%** at every value of that knob, worst case
+**1.07x**. The best single number still belongs to `fixed_z` -- by 0.07 points,
+far below what this project's measurement can resolve (2.18, 2.32). The 5-point
+swing is not.
+
+Both columns of that comparison were measured under `greedy`, and re-scoring
+them under the served policy reverses the verdict entirely (2.46): `fixed_z` at
+z=2.0 returns **+3.10%** with a worst regression of **1 ms**, while `conformal`
+returns **-11.64%** with a worst regression of **293 ms**. A constant-width
+bound is too loose exactly where the ensemble is unsure, and the ranker's worst
+picks are where it is unsure.
+
+So neither bound is settled, and the durable part is that `app.calibrate` scores
+both per bundle under the served policy and records which it chose. The current
+answer is `fixed_z, z=2.0` on one model and 15 queries.
+
+What remains is that `uncertainty_scale` is a standing reason to distrust
+`sigma` as a probability anywhere else it is read.
+
+**The workload is partly selected to be winnable.** 27 of the 59 queries were
+generated and then kept *because* the best plan in the served action space beat
+native by at least 8%. That was the right call for training coverage -- a query
+with nowhere to go teaches nothing -- but it means any capture percentage over
+this workload is measured on a benchmark chosen, in part, for having something
+to capture.
+
+`app.benchmark` prints the 18 correlation traps, 6 controls and 8 shape queries
+as their own subtotal now, next to the headline. Those were written by hand
+against a mechanism and never filtered on whether this optimizer could win them,
+so the gap between the two figures *is* the selection effect, rather than
+something a reader has to take on trust.
+
+The split also carries information. On held-out queries the model does **worse**
+on the generated ones -- 80% of deviations regress against 33% on the curated
+ones (2.41) -- which is the opposite of what selecting for headroom would
+predict, and one more argument that the ranking rather than the opportunity is
+the binding constraint.
+
+**Measurement cannot resolve the differences being argued about.** Three
+compounding problems, all measured: repeated executions of the same plan vary
+**18.6%** (2.18); the benchmark mutates the regression guard's state, so two runs
+of an identical gate gave 15.6% and 7.2% (2.30); and two independent 3-run
+measurements of an identical configuration gave medians 8 points apart (2.32).
+The `compare` protocol repeats and reports spread rather than a point, and the
+usable test is whether ranges overlap -- but at five repetitions it still cannot
+settle a 4-point difference, and most differences worth arguing about are
+smaller than that.
+
+**The safety veto is structural, not learned.** It asks whether PostgreSQL
+flagged the plan as one it was forced into -- `Disabled: true` nodes on PG18,
+`disable_cost` before that -- and not whether the plan is likely to be slow.
+Distrusting cost estimates is the premise of the project, so a veto that read
+them would be arguing with itself; the version that did, before 2.29, vetoed
+every genuine win it found, because the plans worth serving are exactly the ones
+PostgreSQL costs above its own choice.
+
+What it therefore cannot catch is a plan that is structurally ordinary and slow
+anyway. That is the confidence gate's job, and 2.47 measured the two overlapping
+more than expected: on the deployed model's eight held-out queries the veto
+fired on three, and in all three every remaining candidate was predicted worse
+than native, so the gate would have declined them regardless.
+
+The one repair measured and rejected is falling through to the runner-up when
+the veto fires. Walking the ranker's ordering until a candidate clears the gate
+scored **-3.00%** against top-1-only's **+1.00%** at a loose setting, and tied
+at a tight one. Candidates ranked below the top pick are worse, and letting the
+gate authorise them admits marginal plans without finding better ones.
 
 **Cold start.** Before a model exists, selection falls back to the cost
 heuristic. Reasonable, but there is no bootstrapped warm-up of the kind Neo
@@ -2602,6 +2778,63 @@ cost.
 deliberately clean compared to real data's long tails, which is exactly why the
 JOB results in §2.3 matter for external validity -- and why the synthetic
 numbers should not be assumed to carry over.
+
+**The JOB result is no longer zero, and no longer unverifiable -- but the
+question it posed is still open.** `docs/JOB_RESULTS.md` recorded this system
+capturing **none** of a 75% oracle gap on the real 21-table IMDB benchmark,
+with every selector returning the native plan to the second decimal place.
+Everything built since -- shape coverage, the 59-query workload, the worst-case
+promotion metric, the PostgreSQL 18 features, and the six corrections in
+2.42-2.50 -- had never been tested against it, because the `job` database did
+not survive the upgrade.
+
+It is reloaded: 8.7 GB, 73.0M rows, 22 tables. On the 14 queries collected so
+far, `pairwise_rank` captures **39.3%** of the available headroom on four
+held-out queries -- the first non-zero figure this project has recorded on real
+IMDB data.
+
+**And it does not answer the original question.** The earlier run's held-out
+queries averaged **3703 ms** native; these average **185 ms**. Both runs asked
+for the smallest JOB queries and got different ones into the held-out quarter,
+so this is a new measurement rather than a re-run, and the specific claim -- 75%
+available on expensive queries, 0% captured -- has not been retested. The
+collection needed to retest it is still running, because the `17*` family times
+out on most of its candidates at 120 s each.
+
+Four held-out queries is also too few to lean on: a rate over four moves in
+steps of 25%.
+
+**Fifteen-plus silent bugs found, and the rate is not falling.** Every failure
+catalogued in section 2 produced a plausible number as its only symptom -- a
+hint that did nothing, a veto that could not fire, a metric that could not see a
+4x error, an advisor returning an empty list because an extension was never
+created.
+
+The count was "eight-plus" until 2.42-2.52 added seven more in a single session,
+including the two most consequential in the project's history: the gate
+calibrated under a policy the server does not run (2.43), and a replay that
+could not see the safety veto and so scored plans the server refuses (2.47).
+Between them they account for the entire difference between 0.0% and 45.7% of
+held-out headroom captured. Neither produced an error, a warning, or an
+implausible number at any point.
+
+Three things are worth extracting from that, because "there are probably more
+bugs" is not actionable on its own:
+
+- **The productive question was "is this code reached", not "is this code
+  correct".** It found `pg_stat_statements` never created (2.36), two hint
+  families switched off and never re-measured (2.27), a conformal gate fitted
+  on every training run and consulted on none (2.42), and a swept `gate_mode`
+  the API server ignored (2.50). Every one was correct code that nothing ran.
+- **The second productive question was "does this measurement agree with what
+  runs".** Policy (2.43), action space (2.50), candidate pool (2.47), promotion
+  yardstick (2.45), drift window (2.49). Five instances, all of the same shape:
+  a number computed over a configuration nobody serves.
+- **Checks now exist for the three that are checkable.** `models/gate.json`
+  records the policy, the action space and the moment it was applied, and
+  `app.diagnostics` compares each against reality. That is a response to the
+  base rate rather than an answer to it -- but it is a response that would have
+  caught 2.43 in seconds, and did catch 2.52's repeat of it.
 
 ## 2.27 The two switched-off families do not earn their place
 
@@ -2619,7 +2852,7 @@ so a weak model cannot hide a strong family.
 
 **Result.**
 
-| | value |
+| Extra-family measurement | value |
 |---|---|
 | queries measured | 24 |
 | queries where an extra-family candidate wins | **0** |
@@ -3249,3 +3482,1649 @@ Two properties made this bad rather than annoying:
 Both are worth a second look before adding any future hook that can return
 exit 2.
 
+
+## 2.35 The missing data was shapes, not rows
+
+2.33 measured the model at **2.93x out on trained queries and 3.25x on unseen
+ones** and concluded it generalises and is uniformly inaccurate -- so the fix was
+not regularisation, and more rows of the same thing had already been tried.
+
+What had not been tried was covering the *plan space* rather than the row count.
+All 24 workload queries were the same shape: a select over joins with filters.
+None aggregated, sorted, de-duplicated or used a subquery, so no training plan
+had ever contained a `HashAggregate`, a `WindowAgg`, a `Sort` above a join, or a
+semi-join. The feature vector counts `n_aggregate`, `n_sort` and `n_materialize`,
+and those columns were near-zero in every row the model had ever seen. **A
+feature that never varies teaches nothing, and a plan shape absent from training
+is one the model is guessing about at serving time.**
+
+Eight queries were added covering aggregation, DISTINCT, top-N, a window
+function, and semi- and anti-joins. Each was measured before being included --
+native latency against the best plan the served action space actually reaches,
+three executions, median -- and two candidates were **rejected** on that
+evidence: a top-N showing 39% headroom on a 1.7 ms query (a large percentage of
+nothing) and a five-way join that linked `suppliers` to `users` on `country`,
+which ran 1.77 s at 0% headroom because it is a near-cartesian join with no key
+path rather than a hard query.
+
+### What it bought
+
+| | 24 queries | 32 queries, with shapes |
+|---|---|---|
+| prediction error, trained queries | 2.93x | **2.51x** |
+| prediction error, unseen queries | 3.25x | **2.66x** |
+| held-out / trained ratio | 1.11 | **1.06** |
+| `uncertainty_scale` | 3.88 | **3.19** |
+
+An 18% reduction in error on queries the model has never seen, from eight
+queries -- a third more workload, not a different model, a different loss, or
+more data of the same kind. The ensemble's self-agreement also moved closer to
+its agreement with reality (3.88 to 3.19), which is the gap 2.4.5 identified as
+the thing to fix before the deviation rate can be raised safely.
+
+### And what the promotion metric caught on the way
+
+The champion/challenger comparison promoted the new model on a 25.2% mean
+improvement. The number worth reading is the other one:
+
+| | champion | challenger |
+|---|---|---|
+| mean latency over held-out queries | 295.8 ms | 221.2 ms |
+| **worst pick, as a ratio of the best available plan** | **228.2x** | **1.36x** |
+
+The incumbent's worst single pick was **228 times worse than the best plan
+available for that query**. That is precisely the failure 2.31 added
+`worst_ratio_vs_best` to see, and precisely the failure a mean cannot: 228x on
+one query out of eight moves a mean by a few percent and moves nothing else.
+
+### The honest limit
+
+2.51x and 2.66x are better and still large. The model is roughly two and a half
+times out on a typical prediction, against available headroom that is often
+smaller than that. Shape coverage was a real gain and not a solution, and the
+next thing to try is more of the same -- the workload is 32 queries against a
+six-table schema, which is small in the way that matters.
+
+
+## 2.36 An init script is only as good as the last time someone started from nothing
+
+Sweeping the repository for anything still assuming PostgreSQL 16 turned up
+three functional assumptions rather than the expected pile of stale comments.
+Two survived contact with the new server: `SHOW lc_collate` still errors on 18,
+so `index_advice.py`'s workaround is still right, and `last_idx_scan` is still
+there. The third did not.
+
+**`pg_stat_statements` was not installed at all.**
+
+`docker-compose.yml` puts it in `shared_preload_libraries`, so the collector was
+running and accumulating statistics. `postgres/init/01_extensions.sql` creates
+`pg_hint_plan` and `hypopg` -- and never created `pg_stat_statements`. Preloading
+starts the collector; `CREATE EXTENSION` registers the view that reads it. With
+only the first, the statistics pile up somewhere nothing can look.
+
+This is 2.0's bug from the opposite side. There, `CREATE EXTENSION` had been run
+and the library was *not* preloaded, so every hint became a comment. Here the
+library was preloaded and the extension was *not* created, so an entire advisor
+returned nothing. Both are the same gap between "the library is loaded" and "the
+SQL objects exist", and both are silent.
+
+### Why it took a rebuild to notice
+
+The PostgreSQL 16 cluster had the extension created by hand at some point, long
+enough ago that nobody remembered. Every run since had read a working view. The
+18 upgrade rebuilt the cluster from the init scripts, and the omission surfaced
+on the first query -- **an init script is only as good as the last time someone
+started from nothing**, and this one had not been exercised end to end in a very
+long time.
+
+Fixed in `01_extensions.sql`, and the same mismatch was waiting in CI:
+`.github/workflows/ci.yml` preloaded only `pg_hint_plan`, so adding the
+`CREATE EXTENSION` would have produced a green build and a broken advisor. The
+two preload lists are now the same list.
+
+### What it was worth
+
+On the live database, immediately: **34 query-statistics findings and 4
+observability findings** where there had been none. Nine advisor sections and 49
+findings in total, against a section that had been silently returning an empty
+list.
+
+A fresh cluster now comes up complete -- PostgreSQL 18.6, pg_hint_plan 1.8.1,
+hypopg 1.4.3, pg_stat_statements 1.12, verified by building one from scratch and
+running the integration suite against it (18 passed).
+
+One thing that did *not* need fixing, which is worth recording because the
+temptation was there: `query_stats.py` reads a column renamed between 16 and 17
+(`blk_read_time` to `shared_blk_read_time`) and already probed
+`information_schema` for whichever exists rather than assuming. Written against
+1.10, it worked unchanged on 1.12. **Code that asks the server what it has
+outlives the version it was written for**; only its comment needed updating.
+
+
+## 2.37 Zero is not the same as nothing to take
+
+Eleven benchmark runs across three independent measurement sets, on the model
+trained with shape coverage (2.35), reported the same held-out figure every
+time:
+
+| run set | headroom captured | held-out captured |
+|---|---|---|
+| 3 runs | 4.3% (range 0.6-14.3) | **0.0%** |
+| **5 runs** | 5.9% (range 3.6-7.7) | **0.0%** |
+| 3 runs | 4.1% (range 2.5-5.2) | **0.0%** |
+
+An identical 0.0% eleven times is not noise. Something is deterministic.
+
+Two explanations fit, and they call for opposite responses. Either the held-out
+queries have no headroom -- in which case capturing none of it is correct and
+the number is uninteresting -- or they have headroom and the gate declines it.
+
+That is answerable from the log without executing anything: for each held-out
+query, the median native latency against the median of the best candidate the
+served action space actually reaches.
+
+| held-out query | native | best available | headroom |
+|---|---|---|---|
+| `corr_6w_everything` | 159.9 ms | 90.5 ms | **43.4%** |
+| `corr_4w_full_correlated` | 154.3 ms | 100.6 ms | **34.8%** |
+| `shape_anti_join_unsold` | 81.7 ms | 59.9 ms | **26.7%** |
+| `corr_4w_cancelled_premium` | 126.8 ms | 93.2 ms | **26.5%** |
+| `corr_city_country` | 60.5 ms | 47.6 ms | **21.4%** |
+| `corr_5w_supplier_chain` | 162.2 ms | 147.3 ms | 9.2% |
+| `shape_distinct_brands` | 189.1 ms | 179.4 ms | 5.1% |
+| `ctl_country_only` | 40.9 ms | 39.1 ms | 4.3% |
+
+**Five of eight have more than 20% available. The system takes none of it.**
+
+So the 0.0% is the gate, in full. Not a shortage of opportunity, not a model
+that cannot rank -- 2.35 measured the same model at 2.66x prediction error on
+these very queries, and 2.33 established that its ranking survives on unseen
+queries even when its level does not.
+
+### How the gate got here
+
+The recalibration that produced this setting ran on **8 held-out queries** and
+swept a grid whose operating points differed by 0.4 percentage points of net
+gain. It chose `min_relative_gain = 0.10` -- a demand for a predicted 10% win --
+because that point showed 0% regressions and +0.1% net, and every looser point
+showed a regression rate it could not distinguish from noise on 8 queries.
+
+A calibration asked to choose between options separated by less than its own
+resolution will pick the one that does nothing, because doing nothing is the
+only option whose downside it can bound. That is not a bug in the sweep; it is
+what a sweep does when the evidence runs out, and 2.19 rewrote its refusal
+message for a version of exactly this. The failure is upstream: **8 queries
+cannot calibrate a threshold whose effect is worth 20% on five of them.**
+
+### What this changes about the project's own account of itself
+
+The README has said for a long time that the optimizer "optimizes about 44% of
+queries, and that is deliberate", with the deviation rate presented as a
+measured trade-off. On this workload and this gate the held-out deviation rate
+is **zero**, and the trade-off being made is not the one described: it is
+declining a measured 43% because a sweep over 8 queries could not prove that
+taking it was safe.
+
+That is a defensible thing for a safety-first system to do once. It is not
+defensible to report it as a capture rate without saying that the capture rate
+is a property of the calibration set size rather than of the model.
+
+### Loosening it, measured
+
+The obvious response is to lower the bar to the `0.02` an earlier, larger
+calibration had picked, and run the same protocol against it:
+
+| | strict, `gain=0.10` | loose, `gain=0.02` |
+|---|---|---|
+| headroom captured | 4.1 - 5.9% across 11 runs | 4.1% (range 3.6 - 7.4) |
+| **held-out captured** | **0.0%, every run** | **2.1%** (range -5.7 to 6.5) |
+
+The deterministic zero is gone, which proves the gate is now acting -- one run
+came back at **-5.7%**, and a setting that can lose is a setting that is doing
+something. But the median gain of 2.1% sits inside a 12.2-point spread, and
+overall capture did not move at all.
+
+**Neither setting is demonstrably better than the other**, by the rule 2.32
+established: a difference smaller than the sample's own spread is not a
+difference. So the calibrated setting was restored, not because it won, but
+because the override did not, and reverting an unproven change is the cheaper
+mistake.
+
+That is the second time in this document a controlled A/B has come back
+"unresolved" rather than wrong (2.30 was the first), and the response is the
+same both times: the instrument is not sensitive enough, and making it sensitive
+enough means more queries, not more runs. Eleven runs already agree with each
+other to within a few points. Eight queries do not agree about anything.
+
+
+## 2.38 The C++ port works, is exactly right, and does not matter
+
+Built because it was asked for, after a profile that said not to. The honest
+place to start is that profile, because it was also wrong -- in the direction
+that made the case *weaker*.
+
+`docs/TECHNIQUES_BACKLOG.md` and the project report had recorded feature
+extraction at **2.43 ms** per 18 candidates. Re-measuring found **0.816 ms**:
+three times smaller than documented. Splitting it further, the recursive tree
+walk is 45% of that and the rest is per-table dictionary manipulation, where a
+compiled language gains almost nothing because it pays the same `PyDict`
+lookups.
+
+So the target was the tree walk, and only the tree walk.
+
+### The result
+
+`native/plan_tree_native.cpp` is a CPython C-API port of
+`plan_tree._encode_plan_tree_py`. Measured on **400 real plans** from the
+execution log, median of 25 passes:
+
+| | per plan | per query (18 candidates) |
+|---|---|---|
+| Python | 0.0188 ms | 0.338 ms |
+| C++ | **0.0082 ms** | 0.148 ms |
+| | **2.29x** | **saves 0.191 ms** |
+
+0.191 ms, against an optimizer overhead of roughly 26 ms on a query that takes
+about 110 ms. **0.7% of the overhead, under 0.2% end to end.** The profile was
+right: this is not where the time goes.
+
+### What was actually hard, and it was not the speed
+
+Correctness. A feature vector that differs between the compiled and interpreted
+paths is a silent divergence between what the model trained on and what it is
+served -- the failure class this document catalogues seven instances of, every
+one of which produced plausible numbers while being wrong.
+
+So the bar was **exact equality**, not `approx`: both implementations perform the
+same operations in the same order on the same doubles, so there is no numerical
+reason to differ, and a difference would be a bug rather than float noise.
+`tests/test_plan_tree_native.py` is 30 tests, and the one that matters compares
+against every plan in the execution log.
+
+Three specific things had to be reproduced rather than approximated, and each
+would have passed a casual eye:
+
+* `float(node.get(k) or 0)` collapses **missing, `None` and `0`** to the same
+  value. An implementation treating "missing" as "skip" changes every sum.
+* `join_rows_reduction` is guarded by `if largest else 1.0` -- a *falsiness*
+  test, so a join estimated at exactly zero rows yields 1.0 rather than
+  `(root+1)/1`.
+* `cost_concentration` excludes the root node, whose `Total Cost` is cumulative.
+  Including it makes the feature 1.0 for every plan ever.
+
+The build also had to be `-O2`, not `-O3 -ffast-math`: fast-math licenses
+reassociation of the sums, which would make results differ from Python in the
+last bits. The one optimisation flag that would plausibly help is the one that
+would break the only property that matters.
+
+### Disposition
+
+Kept, and optional in both directions. `plan_tree.py` imports the extension if
+it has been built and runs the Python if it has not, so a checkout with no
+compiler is a working checkout, and the differential test skips itself rather
+than failing. Nobody has to build it; anyone who does gets a 2.29x faster
+encoder and an assurance that it computes the same thing.
+
+That is the right disposition for a change that is correct, measurable, and
+worth 0.2%. Shipping it as mandatory would trade a build dependency for nothing.
+
+
+## 2.39 The convenience layer cost more than the language
+
+2.38 finished the C++ port and reported it honestly: correct, 2.29x on its
+target, worth 0.19 ms of a 27 ms overhead. The question that produced it -- "what
+if the whole codebase were C++?" -- deserved a measurement rather than an
+opinion, so the serving path was profiled by component:
+
+| | time | share |
+|---|---|---|
+| PostgreSQL `EXPLAIN` round trips | 16.00 ms | 58% |
+| feature extraction (Python) | 3.08 ms | 11% |
+| model inference (LightGBM, already C) | **8.40 ms** | **31%** |
+
+**88.8% was already running in C**, so a rewrite of all 19,450 lines could
+address 11% of the overhead -- under 3% of a 110 ms query. That is the answer to
+the question as asked.
+
+The interesting part was the 31%. An 8-member ensemble over 19 candidates taking
+8.4 ms is a lot for a small gradient-boosted model, so it was worth asking where
+the time went:
+
+| candidates | inference |
+|---|---|
+| 1 | 7.54 ms |
+| 19 | 8.27 ms |
+| 50 | 9.23 ms |
+
+Predicting fifty candidates cost barely more than predicting one. The cost was
+**fixed**, not per-candidate -- which meant it was not computation at all.
+
+### Where it was
+
+    LGBMRegressor.predict(list of lists)   1.211 ms
+    LGBMRegressor.predict(numpy array)     0.797 ms
+    booster_.predict(numpy array)          0.092 ms
+
+The scikit-learn wrapper spends roughly **0.7 ms per call** on input validation
+and DataFrame handling before reaching the model, and `predict_all` called it
+once per member -- eight times per query, on data the wrapper had to convert
+from a list of lists every time.
+
+Going straight to the booster, on a float64 array built once:
+
+**`predict_mean_std` on 19 candidates: 8.27 ms to 0.786 ms. A 10.5x speedup.**
+
+Against the earlier uncontended baseline that is 27.5 ms of planning overhead
+down to about 20 ms -- a **26% cut**. (Stated as a projection, not a fresh
+measurement: the re-run happened while a 59-query collection was using the
+database, which pushed the `EXPLAIN` component from 16.0 ms to 28.2 ms. The
+inference figure is pure CPU and unaffected; the round-trip figure from that run
+is not comparable and is not used here.)
+
+### The comparison that matters
+
+| change | speedup | saved |
+|---|---|---|
+| C++ port of the feature encoder | 2.29x | 0.19 ms |
+| **not calling a wrapper eight times** | **10.5x** | **~7.0 ms** |
+
+**Thirty-seven times more time was recovered by deleting a convenience layer
+than by changing language**, and the second one is a five-line diff in Python.
+
+It is bit-identical, and that was checked before it was believed: across 600
+real feature vectors from the execution log, all 8 members produced exactly
+equal output from both paths, worst absolute difference **0.0**. A ranker whose
+scores shift slightly is a different ranker.
+
+### What this says about the original question
+
+"Rewrite it in C++" and "stop paying for something you are not using" are both
+performance work, and only one of them was worth doing here. The profile is what
+distinguished them, and the profile was cheap -- three timers and twenty
+minutes.
+
+It also shows why 2.24's answer was right for the wrong reason. It concluded
+C++ was not warranted because PostgreSQL dominates the overhead, which is true.
+It did not notice that a third of the remaining time was a Python library
+validating its inputs eight times, because it measured *language boundaries*
+rather than *calls*. The right granularity for a profile is the one where the
+waste is, and you find that by looking rather than by reasoning about it.
+
+
+## 2.40 More data, better predictions, worse picks -- and one query explaining all of it
+
+The workload went from 32 queries to 59 (2.35 and the `gen_` group), collection
+produced 20,529 usable rows against 777 before, and the retrained model came out
+with the **best prediction accuracy of any version in the registry**:
+
+| version | held-out queries | rows | typical multiplicative error |
+|---|---|---|---|
+| `20260903T163742Z` (deployed) | 8 | 777 | 1.311 |
+| `20260904T082635Z` (challenger) | **15** | **1437** | **1.254** |
+
+Promotion rejected it: mean latency of the plans it picks was **25% worse**, and
+its worst single pick was **3.36x** the best available plan against the
+champion's 2.73x. The worst-case rule from 2.31 fired for the second time.
+
+That is a contradiction worth resolving rather than accepting. A model cannot
+predict better and pick worse unless the errors it still makes are concentrated
+somewhere expensive. Scoring both models per held-out query:
+
+| query | champion | challenger | best available |
+|---|---|---|---|
+| `shape_6w_supplier_reach` | 606.5 ms | **1270.5 ms** | 378.3 ms |
+| `shape_distinct_brands` | 197.5 ms | **115.9 ms** | 89.9 ms |
+| `shape_range_recent` | 70.8 ms | **57.6 ms** | 25.9 ms |
+| ... 12 others | | roughly tied | |
+| **total** | **2712.0 ms** | **3394.2 ms** | |
+
+**One query is 664 ms of the 682 ms difference.** Remove it and the two models
+are within 0.9% of each other -- 2105.5 ms against 2123.7 ms -- with the
+challenger winning outright on two queries and losing on none by more than 30%.
+
+### What that says
+
+The rejection is correct: a 2.1x loss on a single query is exactly what the
+worst-case rule exists to stop, and the mean would have hidden it in the other
+direction this time. But the *diagnosis* is narrow, and narrow diagnoses are
+actionable in a way that "the model got worse" is not.
+
+`shape_6w_supplier_reach` is a six-way join under a grouped aggregate -- the
+most complex query in the workload. There are **three** six-table queries among
+fifty-nine, and the twenty-seven queries added in this round are almost all two
+to five tables. The training distribution moved toward narrow joins, and the
+model followed it.
+
+This is the cost of the workload expansion showing up where the limitations list
+predicted it would: adding queries improves coverage on average and can degrade
+it exactly where coverage was already thinnest. It is also direct evidence for
+the roadmap's per-join-width models, or at minimum for stratifying the training
+sample by width rather than letting the generator's preferences set it.
+
+### And a structural problem it exposes
+
+`app.calibrate` reads the *deployed* model's held-out list. The 15-query model
+was rejected, so the gate is still being calibrated on the champion's **8**
+queries -- which is the constraint 2.37 identified and this whole round of work
+set out to remove. The fix arrived and could not be adopted, because the thing
+that decides adoption measures a different property than the thing that needed
+the fix.
+
+Two properties are being conflated: *is this model a better predictor* and *does
+this model come with a better calibration set*. They are not the same question,
+and promotion currently answers only the first.
+
+
+## 2.41 The gate was never the bottleneck
+
+2.40 ended on a structural complaint: `app.calibrate` read the *deployed*
+model's held-out list, so a rejected challenger's better calibration set could
+not be used. That is a real coupling and it is now removed -- `--bundle` points
+the sweep at any bundle, and `apply_gate` records `calibrated_against_bundle`
+so a gate fitted to a challenger is not silently mistaken for one fitted to the
+champion. A gate setting is a property of one model's error distribution; a
+gate file that does not name its model is ambiguous the moment a second model
+exists.
+
+The interesting part is what the unblocked measurement said.
+
+### The measurement 2.37 was waiting for
+
+2.37 found held-out capture of exactly 0.0% across eleven runs, established
+that five of eight held-out queries had 20-43% available, and concluded the
+gate was refusing opportunities it should have taken -- calibrated on 8 queries
+over a grid finer than its own resolution. The prescription was a larger
+workload. The workload is now 59 queries with 15 held out, and the same replay
+sweep can now be run against that model without promoting it.
+
+Both models, same log, same policy, `greedy`:
+
+| | z | gain | deviates | of those regress | worst | net |
+|---|---|---|---|---|---|---|
+| **deployed**, 8 held out | 0.0 | 0.00 | 62% | 20% | 1.31x | **+4.68%** |
+| | 0.5 | 0.10 | 12% | 0% | 1.00x | +3.75% |
+| | 1.0 | 0.20 | 0% | -- | 1.00x | 0.00% |
+| **challenger**, 15 held out | 0.0 | 0.00 | 93% | **50%** | **1.73x** | **-2.93%** |
+| | 0.5 | 0.10 | 33% | 40% | 1.73x | -4.04% |
+| | 1.0 | 0.20 | 7% | 0% | 1.00x | +1.17% |
+
+The top-left number is the ceiling: what the model is worth with no gate at
+all, following every pick. On 8 held-out queries that ceiling is **+4.68%**, and
+a gate capturing none of it is leaving something real behind -- which is what
+2.37 argued.
+
+On 15 held-out queries the ceiling is **-2.93%**. Half of the deviations are
+regressions and the worst is 1.73x. There is nothing behind the gate to take.
+
+### So the diagnosis was wrong, and in an instructive direction
+
+2.37 asked whether the held-out queries had headroom, found that they did, and
+concluded the gate was the problem. Both halves were right and the inference
+was not: the headroom was measured against the *oracle* -- the best plan in the
+action space -- and the gate does not have access to the oracle. It has access
+to the model's ranking. Headroom exists; the model cannot find it. Confirming
+that the money is on the table says nothing about whether this system knows
+which pocket it is in.
+
+The 0.0% was the gate declining to act on a ranking that, followed everywhere,
+loses. Widening it would have converted a null result into a negative one.
+
+The split by group says the same thing twice:
+
+| held-out subset | n | deviates | of those regress | net at z=0, gain=0 |
+|---|---|---|---|---|
+| curated (`corr`/`ctl`/`shape`) | 9 | 100% | 33% | **-1.61%** |
+| generated (`gen_*`) | 6 | 83% | **80%** | **-6.90%** |
+
+Worse on the generated queries, and those were the ones *selected for having
+headroom*. A query kept because the action space contained a 15% win is a query
+where the model had every chance and took the wrong branch four times in five.
+
+### What this changes
+
+The gate is doing its job. Every conservative setting scores 0.00% net because
+it declines everything, and 0.00% is better than every wide setting on this
+model. A safety gate whose refusals are all correct is not misconfigured.
+
+The bottleneck is the ranking on unseen queries, which relocates the work:
+
+- **2.35's conclusion holds and sharpens.** It found the model *uniformly*
+  inaccurate rather than overfitted -- 2.51x typical multiplicative error on
+  trained queries, 2.66x on held-out. That is not a gap that more rows close,
+  and 20,529 rows across 59 queries have not closed it. The features and the
+  label are the suspects.
+- **`uncertainty_scale = 3.75` is now the top item, not a nice-to-have.** The
+  only positive setting in the whole sweep is `z=1.0, gain=0.20`, which acts on
+  1 query in 15. The gate's risk term reads an ensemble spread known to be
+  mis-scaled by nearly 4x (2.4.5). Quantile regression replaces a number the
+  gate is currently forced to over-trust.
+- **Per-join-width models get a second, independent argument.** 2.40 reached
+  them from one 6-table query carrying 664 ms of a 682 ms promotion gap. This
+  reaches them from held-out ranking failing across the board.
+
+### The uncomfortable reading, stated plainly
+
+On queries it has not seen, this optimizer's plan choices are currently worse
+than PostgreSQL's, and the only reason the deployed system does not lose time
+is that a correctly-calibrated gate refuses to use them. The honest description
+of the current state is *a safety mechanism that works, wrapped around a model
+that does not yet*.
+
+That is not the result this round of work was aiming for. It is a better
+position than the previous one, where the same fact was hidden behind a 0.0%
+attributed to the wrong cause -- and it names the next problem specifically
+enough to attack.
+
+## 2.42 A method that was implemented, fitted, documented -- and never measured
+
+2.41 ended by relocating the problem from the gate to the ranking. Before
+accepting that, one thing was worth checking: the gate has two possible forms,
+and only one of them had ever been used.
+
+`optimizer/conformal.py` implements split conformal prediction. `app.train`
+fits it on every run -- the challenger's gate has `n_calibration=1037` and
+`q=0.2064` in log space, a 90% upper bound of **1.229x** on the point
+prediction. `README` documents `GATE_MODE=conformal`. `app.settings` exposes
+it in the UI. Everything is wired.
+
+`LearnedOptimizer.__init__` read `os.getenv("GATE_MODE", "fixed_z")`, with a
+comment explaining that a change of method should be settled by measurement
+rather than by editing a default. That comment is correct. It is also the
+reason nothing was measured: it justified the default without scheduling the
+measurement, and a method reachable only through an environment variable that
+nobody exports is not deployed, it is shelved.
+
+So: score both bounds on the same held-out queries, same log, same policy.
+
+| held-out set | bound | min_gain | deviates | of those regress | worst | net |
+|---|---|---|---|---|---|---|
+| challenger, 15 | `fixed_z` | 0.00 | 93% | 50% | 1.73x | **-2.93%** |
+| | `fixed_z` | 0.05 | 60% | 33% | 1.73x | -1.21% |
+| | `fixed_z` | 0.10 | 33% | 40% | 1.73x | **-4.04%** |
+| | `fixed_z` | 0.20 | 7% | 0% | 1.00x | +1.17% |
+| | `conformal` | 0.00 | 20% | 33% | **1.07x** | **+1.10%** |
+| | `conformal` | 0.05 | 20% | 33% | 1.07x | +1.10% |
+| | `conformal` | 0.10 | 20% | 33% | 1.07x | +1.10% |
+| | `conformal` | 0.20 | 7% | 0% | 1.00x | +1.17% |
+
+Read the two blocks as columns rather than rows. `fixed_z` scores -2.93%,
+-1.21%, -4.04%, +1.17% as `min_relative_gain` moves across its plausible
+range. `conformal` scores +1.10%, +1.10%, +1.10%, +1.17% across the same range.
+
+### The interesting property is not the number, it is the flatness
+
+`fixed_z`'s best setting beats conformal's: +1.17% against +1.10%, and the
+sweep duly recommends it. Taken alone that is the whole story and conformal
+loses.
+
+It is the wrong reading, for a reason this project has already paid for. 2.32
+measured two independent 3-run benchmarks of an **identical** configuration and
+got medians 8 points apart; 2.18 measured 18.6% variation between repeated
+executions of the same plan. A 0.07-point difference is far below anything the
+measurement apparatus can resolve. What *is* resolvable is a 5-point swing from
+-4.04% to +1.17%, and that swing belongs entirely to `fixed_z`.
+
+The two bounds are therefore not "1.17 versus 1.10". They are:
+
+- **`fixed_z`**: correct only if `min_relative_gain` is set to 0.20 and not
+  0.10. At 0.10 it loses 4% and its worst query is 1.73x native. The right
+  value cannot be determined by execution, because the differences between
+  candidate values are smaller than the noise.
+- **`conformal`**: the same answer at every value of that knob, because the
+  binding constraint is a quantile measured from the model's own residuals
+  rather than a threshold someone picked. Worst case 1.07x instead of 1.73x.
+
+One of these has a parameter that must be tuned and cannot be. The other
+measured its own.
+
+That is also the deeper reason `fixed_z` is fragile here: `z * sigma` treats
+the ensemble spread as a calibrated standard deviation, and 2.4.5 measured that
+spread as understating true error by **3.75x**. `fixed_z` spends `z` on a ruler
+with the wrong units. Conformal never asks what the spread means -- it takes
+the empirical quantile of the residuals and holds whatever shape they have.
+`uncertainty_scale = 3.75` is not a number to correct; it is the reason not to
+build a gate on `sigma` in the first place.
+
+### What changed
+
+`app.calibrate` sweeps the bound's *form* as one more axis of the grid, so
+`fixed_z` and `conformal` compete on the same held-out rows under the same
+dominance rule that already chooses `z` and `min_relative_gain`. Bundles with
+no fitted conformal gate contribute no conformal rows and behave exactly as
+before.
+
+`--apply` writes `gate_mode` into `models/gate.json`, and `LearnedOptimizer`
+reads it when neither a constructor argument nor `GATE_MODE` was given.
+Thresholds and the bound they were swept under have to travel together: a
+`min_relative_gain` chosen against a conformal bound is not the right threshold
+for a fixed-z one. Writing one without the other is 2.28's failure again --
+calibrating a configuration nobody runs.
+
+Precedence is explicit argument, then `GATE_MODE`, then the gate file, then
+`fixed_z`. The env var deliberately outranks `models/gate.json` here, unlike
+`confidence_z`: an operator exporting `GATE_MODE` is overriding the method
+itself, and a stale sweep should not quietly undo that.
+
+### The general shape of this bug
+
+Nothing here was missing. The algorithm was implemented and correct, the model
+fitted it on every training run, the README documented it, the settings UI
+exposed it, and a thoughtful comment explained why it was not on by default.
+The gap was that no measurement was ever attached to the decision, so the
+default became permanent by inertia and the comment made that look deliberate.
+
+The audits in this project mostly ask "does this code work". This one came from
+asking "is this code *reached*", which found `pg_stat_statements` never created
+(2.36), two hint families switched off (2.27), and now a safety bound fitted on
+every run and consulted on none.
+
+## 2.43 Every calibration this project ever ran measured the wrong policy
+
+2.41 concluded the model's ranking on unseen queries loses, and 2.42 measured
+the two gate bounds against each other on that basis. Both are correct about
+what they measured. Both measured `greedy`.
+
+The server runs `pairwise_rank`.
+
+### How the disagreement survived being fixed twice
+
+`retrain.served_policy()` exists *because* of this class of bug. Its docstring
+says so:
+
+> It used to hardcode `risk_averse` while `docker-compose.yml` sets
+> `SELECTION_POLICY: pairwise_rank` and the code default is `greedy` -- three
+> policies named in three places. [...] 2.22 names the pattern: a constant that
+> duplicates a decision made elsewhere will eventually disagree with it. This
+> is the fourth instance.
+
+The fix was to read the environment instead of restating the value. That
+removed the *hardcoding* and left the *disagreement*, because of where the
+environment variable lived:
+
+```yaml
+  backend:
+    environment:
+      SELECTION_POLICY: pairwise_rank
+```
+
+On the `backend` service. So the variable exists inside that container and
+nowhere else -- and `app.calibrate`, `app.retrain` and `app.benchmark` are run
+from the host, where it is unset and the code default applies. `served_policy()`
+returned `greedy` on the host while the container served `pairwise_rank`, and
+`app.calibrate --policy` defaulted to the literal string `"greedy"` besides.
+
+Every gate ever written to `models/gate.json` was swept under a policy the
+server does not use.
+
+### The two policies differ in sign
+
+If they were near-neighbours this would be a tidiness complaint. Measured on
+the same held-out rows, same bundle, same candidate sets:
+
+| | deployed, 8 held out | challenger, 15 held out |
+|---|---|---|
+| native | 100.0% | 100.0% |
+| oracle (best candidate) | 86.0% | 83.6% |
+| `greedy` | 103.9% | 104.1% |
+| `thompson` | 102.7% | 109.9% |
+| `risk_averse` | 102.0% | 103.7% |
+| **`pairwise_rank`** | **92.7%** | **95.1%** |
+| random pick | 445.8% | 163.7% |
+
+Three policies land *above* 100% -- worse than leaving PostgreSQL alone. The
+fourth captures **30%** of the available headroom on queries it has never seen.
+It is the only one that beats native, and it was the only one never calibrated.
+
+The gate sweep says the same thing. Wide open, on the challenger's 15 held-out
+queries:
+
+| policy | deviates | of those regress | worst | net |
+|---|---|---|---|---|
+| `greedy` | 87% | 38% | 1.72x | **-4.45%** |
+| `thompson` | 73% | 45% | 1.81x | -7.31% |
+| `risk_averse` | 87% | 38% | 1.72x | -4.01% |
+| `pairwise_rank` | 80% | 50% | 1.70x | **+4.55%** |
+
+Note that `pairwise_rank` regresses *more often* -- 50% against 38% -- and wins
+anyway. A rate says how often and not how much (2.19, again).
+
+### So 2.41's verdict was measured on a policy nobody runs
+
+Its central claim -- "on queries it has not seen, this optimizer's plan choices
+are currently worse than PostgreSQL's" -- holds for `greedy`, `thompson` and
+`risk_averse`, and is false for the policy that serves. The corrected statement
+is narrower and much better:
+
+> On unseen queries the served policy beats PostgreSQL by 4.9% and reaches 30%
+> of the oracle's headroom. Every ensemble policy loses. The safety gate was
+> calibrated on a losing policy and correctly refused to act, which is why the
+> measured capture was 0.0%.
+
+2.41 is left standing rather than rewritten, because the reasoning in it is
+sound and the failure is instructive: a measurement is only as good as its
+agreement with the deployment, and nothing in that section could have revealed
+the disagreement. It took asking a different question -- *which policy does the
+container actually run* -- which is the same question that found
+`pg_stat_statements` never created (2.36) and the conformal gate never used
+(2.42).
+
+### Why the ensemble policies lose, and `pairwise_rank` does not
+
+The ranking diagnostic explains it. Within a query's candidate set, the
+ensemble's predictions correlate with true latency at Spearman **+0.533**
+(median over 15 held-out queries, positive on 14 of them). That is real signal:
+a random pick costs 163.7% of native, and the ensemble's argmin costs 104.1%.
+It removes 60 of the 64 points between random and native.
+
+But the bar is not "better than random", it is "better than native", and native
+sits only 16.4 points above the oracle. The ensemble is being asked to resolve
+a band it cannot resolve: good enough to avoid disasters, not good enough to
+separate the top few candidates, which is where the entire remaining
+opportunity lives.
+
+`pairwise_rank` is trained on exactly that -- orderings between candidates
+rather than a latency each -- so it spends its capacity on the comparison that
+matters instead of on absolute values that are 2.5x off (2.35) in a way that
+mostly cancels when comparing.
+
+That reframes 2.35's "uniformly inaccurate" result. Uniform inaccuracy is
+survivable for a *ranker* and fatal for a *regressor used as a ranker*, and
+this project has been measuring the latter while serving the former.
+
+### What changed
+
+- `learned.DEFAULT_SELECTION_POLICY = "pairwise_rank"` -- one constant.
+- The `SELECTION_POLICY` line is **deleted** from `docker-compose.yml`. The
+  lesson from 2.22 is to remove the duplicate, not to synchronise it; exporting
+  the variable still overrides both host and container at once.
+- Every default that named a policy now reads that constant: `LearnedOptimizer`,
+  `app.settings`, `retrain.served_policy`, `benchmark.run`, `benchmark`'s
+  `--policy` argument, and `calibrate`'s `sweep`, `evaluate_setting` and
+  `measure_settings`. That is **eight** places, which is the measure of how far
+  a duplicated decision spreads before anyone notices.
+- Three tests assert the deletion stays deleted, that `app.settings` and
+  `learned` name the same default, and that `served_policy()` returns it.
+
+The eighth site is the uncomfortable one. `benchmark.run(policy="greedy")` was a
+default *argument*, not a missing environment variable, so it applied inside the
+container too. **Every benchmark number this project has published was measured
+under `greedy`** -- including the held-out 0.0% of 2.37 and the eleven runs
+behind it. Those numbers are not wrong about what they measured; they are
+answers to a question nobody asked.
+
+### A note on how this kept happening
+
+Each fix in this chain was correct and each was defeated by where the value
+lived. Hardcoding `risk_averse` was replaced by reading `SELECTION_POLICY` --
+which the host could not see. Compose was given the right value -- on one
+service. `served_policy()` was written to centralise the answer -- and three
+call sites kept their own literal defaults, because a default argument is not a
+lookup.
+
+The pattern is not "someone forgot". It is that a policy is a *deployment*
+property being expressed as a *language* default, and Python evaluates those per
+call site. The only fix that holds is one name.
+
+The gate has not been re-applied yet, because under the served policy every
+setting in the grid is refused by `--max-worst-regression`: the best is
+`z=0.0, gain=0.0` at **+4.5% (+188 ms)** with one query landing at **1.70x**
+native, against a bound of 1.25x. That is the safety bound working, on a real
+opportunity, and the answer is a better worst case rather than a looser bound.
+
+## 2.44 A five-millisecond regression was vetoing a 188 ms win
+
+With 2.43's policy fix in place, the sweep under `pairwise_rank` produced a
+real opportunity and then refused all of it:
+
+```
+No setting qualified. The closest was z=0.0, min_gain=0.0 (net +4.5%, +188 ms).
+  refused by --max-worst-regression: one query ends up 1.70x slower than
+  native, bound is 1.25x.
+```
+
+The query is `ctl_supplier_rating`, and the regression is **7.8 ms to 13.2 ms**.
+
+### The bound cannot see magnitude
+
+Per-query, under the served policy on the challenger's 15 held-out queries:
+
+| query | native | served | ratio | absolute | verdict |
+|---|---|---|---|---|---|
+| `ctl_supplier_rating` | 7.8 | 13.2 | **1.70x** | **+5.4 ms** | refuses the gate |
+| `gen_07_2w` | 91.8 | 114.8 | 1.25x | +23.0 ms | admitted |
+| `shape_top_n_orders` | 514.4 | 627.1 | 1.22x | **+112.7 ms** | admitted |
+
+The rule this bound encodes is the one from 2.19: *a single user-facing query
+getting 3x slower outweighs a diffuse average win*. The operative idea is a
+person waiting. Expressed purely as a ratio, it refuses a 5 ms loss and admits
+a 113 ms one -- exactly backwards, and for a mechanical reason: on a query that
+finishes in under ten milliseconds, any regression at all is a large multiple.
+
+`ctl_supplier_rating` is a control query. Its whole purpose is to have no
+headroom, and it does not: its *oracle* is also 13.2 ms, so every candidate is
+worse than native and the ranker is picking the best of a bad set. The bound was
+not protecting anything that could be improved. It was refusing 188 ms of wins
+elsewhere over 5.4 ms on a query where nothing better exists.
+
+### The fix, and the reason it is not a loosened threshold
+
+`MIN_REGRESSION_MS = 10.0`: a regression below this does not enter the
+worst-case *ratio*. It still enters the regression *rate* -- "how often" and
+"how badly" are different questions and only the second is about size (2.19
+again) -- and `worst_regression_ms` is reported alongside the ratio, so the two
+measures that disagree about which regression is the bad one are both visible.
+
+This is deliberately not a raised `--max-worst-regression`. Raising the ratio to
+1.75x would admit this 5.4 ms loss *and* a 900 ms loss on `shape_top_n_orders`.
+The floor admits the first and leaves the second bounded at 1.25x, which is the
+distinction the original rule was trying to draw.
+
+10 ms is a judgement and is labelled one. What is measured is that it is not
+delicately poised. Sweeping the floor from 0 to 200 ms, the recommendation
+changes at exactly one point -- 5.4 ms, the size of this regression -- and is
+identical everywhere above it:
+
+| floor | recommended | net | worst regression |
+|---|---|---|---|
+| ≤ 5.4 ms | z=1.00, gain=0.20 | +0.89% | none |
+| ≥ 5.5 ms | z=2.00, gain=0.02 | **+3.29%** | 5.4 ms |
+
+Any value from ~6 ms to 200 ms gives the same gate, and that gate's worst
+regression *is* the 5.4 ms one -- there is no second, larger regression waiting
+behind it. `--min-regression-ms 0` restores the previous behaviour exactly,
+which matters because every number published before this was produced without
+it.
+
+### What the workload gets
+
+The gate the floor admits is not the wide-open one. It is `z=2.0, gain=0.02`:
+**+3.29% net, worst regression 5.4 ms, worst ratio 1.00x on anything material**.
+The wide-open setting was worth +4.5% but carried the 1.70x. Trading 1.2 points
+of net for a gate whose largest material regression is *zero* is the trade the
+bound was written to make -- and it could only be made once the bound could tell
+5 ms from 113 ms.
+
+## 2.45 The promotion yardstick was the alphabet
+
+2.43 fixed *which policy* promotion scores. This is about *which queries*.
+
+```python
+def _held_out_rows(fraction: float = 0.25) -> dict[str, list[dict]]:
+    """The most recent queries' rows, grouped -- a shared yardstick for both models."""
+    ...
+    query_ids = sorted(by_query)
+    return {q: by_query[q] for q in query_ids[-n_test:]}
+```
+
+`sorted(by_query)` sorts query **ids**, alphabetically. Nothing in this function
+is chronological, and `created_at` is present on every row and unused. "The most
+recent queries" was a description of intent that the code never implemented.
+
+### What the alphabet selected
+
+On this workload the last quarter of the alphabet is `gen_21` through `gen_27`
+and eight `shape_*` queries -- a group defined by naming convention. Whether
+that set is a fair test of a model depends entirely on coincidence.
+
+It was not fair. Measured on the bundles in hand:
+
+| Model | queries in the yardstick it had trained on |
+|---|---|
+| champion | **13 of 15** |
+| challenger | **10 of 15** |
+
+Promotion was comparing two models on a sample both had largely memorised, and
+the one that had memorised less of it is the one that looks better on the
+out-of-sample fraction. The +20.8% "improvement" that decides promotion is being
+read off five uncontaminated queries at most, and the arithmetic does not say
+which five.
+
+### Two fixes, and one that was rejected
+
+**Recency is measured.** Queries are ordered by their latest `created_at`, so
+the name is now accurate. Rows without a timestamp fall back to the id, keeping
+the order total and the selection reproducible.
+
+On the current log this changes nothing -- the newest queries are also the last
+alphabetically, because `gen_*` and `shape_*` were added most recently. That is
+the coincidence the old code was resting on, and it would have broken the first
+time anyone added a query starting with `a`.
+
+**Contamination is preferred against, and reported when it cannot be avoided.**
+`_held_out_rows(bundles=[...])` prefers queries that *no* model in the
+comparison trained on.
+
+The rejected fix is to require that. The champion held out 8 queries and the
+challenger 15, and the two lists intersect in **two** -- `corr_6w_everything`
+and `shape_distinct_brands`. Two queries cannot separate two models; a bound
+computed on them would be noise wearing a clean label. So the recency yardstick
+stands when the clean set is under five queries, and `yardstick_provenance`
+records what each model had already seen, which goes into the promotion
+decision and out through `app.retrain --status`.
+
+An honest contaminated measurement beats a clean one too small to read. What is
+not acceptable is the third option, which is what was there: a contaminated
+measurement that looks clean.
+
+### The finding that fell out of fixing it
+
+Scored under the served policy rather than `greedy` (2.43), the champion and
+challenger diverge on the metric 2.31 added:
+
+| | mean | worst pick vs best available |
+|---|---|---|
+| champion | 299.1 ms | **118.98x** |
+| challenger | 238.5 ms | 4.88x |
+
+The champion's 119x is `shape_window_rank`: it picks a 91.7 ms plan where the
+best candidate runs in 0.8 ms. Worth stating precisely -- native is 280.9 ms, so
+that pick still beats PostgreSQL by 3x. It is not a regression, it is a missed
+opportunity, and `worst_ratio_vs_best` measures distance from the oracle rather
+than danger to the user. Under `greedy` both models score an identical 3.820x on
+this metric, so the entire difference between "these two models are the same"
+and "one of them leaves 119x on the table" lives in the policy that was not
+being scored.
+
+## 2.46 The bound comparison reverses under the policy that serves
+
+2.42 scored `fixed_z` against `conformal` and concluded that conformal was the
+better-behaved bound: flat at +1.10% across every value of `min_relative_gain`
+where `fixed_z` swung from -4.04% to +1.17%, with a worst case of 1.07x against
+1.73x. The argument was about robustness rather than magnitude, and it was a
+good argument.
+
+It was also measured under `greedy` (2.43). Re-scored under `pairwise_rank`, on
+the same 15 held-out queries, with the absolute regression floor from 2.44:
+
+| bound | min_gain | deviates | of those regress | worst | worst ms | net |
+|---|---|---|---|---|---|---|
+| `fixed_z` (z=2.0) | 0.00 | 40% | 17% | **1.00x** | **1.0 ms** | **+3.10%** |
+| `conformal` | 0.00 | 13% | 50% | 1.96x | **292.9 ms** | **-11.64%** |
+| `fixed_z` (z=2.0) | 0.05 | 20% | 33% | 1.00x | 1.0 ms | +0.95% |
+| `conformal` | 0.05 | 13% | 50% | 1.96x | 292.9 ms | -11.64% |
+
+Conformal is still flat. It is flat at **-11.64%**.
+
+### The mechanism, as far as 15 queries can show it
+
+`ConformalGate` here is fitted with `normalize=False`, so the bound is
+`mean + q` -- a single constant, identical for every candidate. `fixed_z` is
+`mean + z·sigma`, which varies per candidate. Per-query, the picks the two
+bounds disagree about:
+
+| query | ensemble spread | `fixed_z(2)` | `conformal` | native | served |
+|---|---|---|---|---|---|
+| `shape_top_n_orders` | **0.266** | 2.013 — blocked | **1.051 — admitted** | 305.5 | **598.4** |
+| `corr_5w_premium_supplier` | 0.071 | 1.095 — admitted | 1.247 — blocked | 122.3 | 107.2 |
+| `ctl_supplier_rating` | 0.066 | 1.012 — admitted | 1.173 — blocked | 6.0 | 7.0 |
+
+A constant-width interval is too loose where the ensemble is unsure and too
+tight where it is confident. `shape_top_n_orders` is the whole -11.64%: a
+predicted 0.70x that came back at 1.96x, admitted by a bound that could not see
+a spread of 0.266.
+
+**This is weaker evidence than it looks and is worth saying so.** Across all 15
+held-out picks, the correlation between ensemble spread and the served ratio is
+Spearman **+0.250** -- the right sign and not much more. Splitting at 0.10:
+high-spread picks regress 4 times in 7 with a median ratio of 1.288; low-spread
+picks regress 2 in 8 with a median of 0.929. Directionally consistent, on a
+sample far too small to establish. The honest reading is that the two worst
+picks also happened to carry the two largest spreads, and `z·sigma` blocked
+both.
+
+### The calibration and the serving distribution differ in the one thing the bound depends on
+
+There is a real tension here worth stating, because both sides are measured.
+
+`optimizer/conformal.py` chose `normalize=False` on evidence: over 2,483
+calibration rows, the normalised bound was unusable at every risk level worth
+having -- 1.38x at alpha=0.10, numerically meaningless at 0.05 -- because rows
+where the eight members agree almost exactly produce a near-zero denominator
+that dominates the quantile. The members disagree by 0.026 while the model's
+error is 0.106: they agree because they are all making the same mistake.
+
+That is true of the **calibration rows**, which are training rows. On the
+held-out queries above, the spreads are 0.018 to 0.334 -- an order of magnitude
+larger, which is what `learned._upper_bound` already documents. So the bound is
+calibrated on a distribution where its key input is nearly degenerate and
+applied on one where it is not.
+
+That is train/serve skew located inside the safety calibration itself, and it
+explains both measurements without either being wrong.
+
+### What this changes
+
+**2.42's recommendation does not survive, and no replacement is declared.**
+`fixed_z` wins on the served policy by a wide margin, but 2.32 already
+established that this workload cannot resolve differences of a few points by
+execution, and this is a replay of 15 queries. Naming a winner here would repeat
+the mistake 2.42 made -- reading a result as settled when it was conditional on
+something unexamined.
+
+What the sweep does is score both and record which it chose, per bundle, under
+the served policy. That machinery is the durable part; the current answer is
+`fixed_z, z=2.0`, and it is an answer about one model and 15 queries.
+
+The specific follow-up is concrete: refit the conformal gate with
+`normalize=True` on residuals whose spreads resemble serving rather than
+training, and re-score. The near-zero-denominator failure is a property of the
+calibration sample, not of the method, and the sample was chosen before anyone
+had measured what serving spreads look like.
+
+## 2.47 The replay could not see the veto it was supposed to model
+
+The benchmark under the served policy reported the headline at 41.0% of
+available headroom and held-out capture at **0.0%**, three runs, unchanged. The
+replay, on the same model and the same deployed gate, said those held-out
+queries should deviate twice and net **+5.38%**.
+
+Both cannot be right, and this project has now spent enough time on
+replay-versus-execution gaps (2.30, 2.32) to treat the disagreement as the
+finding rather than the noise.
+
+### Reproducing the serving decision, without executing anything
+
+Driving `LearnedOptimizer` over the eight held-out queries with live candidate
+generation and printing `last_decision`:
+
+| query | candidates | ranker's pick | ensemble's best | outcome |
+|---|---|---|---|---|
+| `corr_city_country` | 3 | #1 @ 0.748x | #1 @ 0.748x | **vetoed** |
+| `corr_4w_full_correlated` | 10 | #2 @ 1.278x | #4 @ 1.014x | no gain |
+| `corr_4w_cancelled_premium` | 11 | #0 @ 0.965x | #0 @ 0.965x | no gain |
+| `corr_5w_supplier_chain` | 13 | #7 @ 1.128x | #12 @ 1.020x | no gain |
+| `corr_6w_everything` | 18 | #17 @ 1.160x | #0 @ 1.118x | no gain |
+| `ctl_country_only` | 3 | #1 @ 0.745x | #1 @ 0.745x | **vetoed** |
+| `shape_distinct_brands` | 10 | #9 @ 1.472x | **#5 @ 0.703x** | no gain |
+| `shape_anti_join_unsold` | 4 | #1 @ 0.912x | #1 @ 0.912x | **vetoed** |
+
+Eight of eight kept native. Three were killed by `learned._is_unsafe`, which
+refuses any chosen plan carrying `Disabled: true` nodes.
+
+### The replay had no way to apply that veto
+
+`_row_to_candidate` rebuilds a candidate dict from a logged row. It
+reconstructed `tables_scanned`, `scan_relations`, `join_types` and `total_cost`
+from the stored plan -- and not `disabled_nodes`. `plan_extractor.get_plan` sets
+that field on every *live* plan; nothing set it on a replayed one.
+
+`featurize` did not care, because it falls back to counting the tree itself:
+
+```python
+features["n_disabled_nodes"] = float(
+    candidate_plan.get("disabled_nodes") or _count_disabled(raw_plan)
+)
+```
+
+So the *feature* was always right, every model trained on the correct value, and
+nothing looked wrong anywhere. `_is_unsafe` reads the key directly with no
+fallback, saw `None` for every replayed candidate, and the safety veto simply
+did not exist inside `app.calibrate`.
+
+Counting the same four queries before and after the one-line fix:
+
+| query | replay candidates | with `Disabled` before | after |
+|---|---|---|---|
+| `ctl_country_only` | 3 | 0 | **1** |
+| `corr_city_country` | 3 | 0 | **1** |
+| `shape_anti_join_unsold` | 4 | 0 | **2** |
+| `shape_distinct_brands` | 10 | 0 | **2** |
+
+With the veto applied, the replay reproduces execution exactly: the deployed
+gate on the deployed model deviates on **0%** of its held-out queries and nets
+**0.00%** -- which is the 0.0% the benchmark measured eleven times, finally
+explained rather than merely observed.
+
+On PostgreSQL 18 this matters more than it would have on 16. 2.29 records that
+the version removed `disable_cost`, so a forbidden plan no longer announces
+itself with an astronomical cost; the flag is the only signal left.
+
+### The same blindness was in the promotion path, twice over
+
+`retrain._score_bundle` shared `_row_to_candidate` and so shared the veto
+blindness, and it had two more divergences of its own:
+
+- it scored **every** logged candidate, including hint families the serving path
+  does not offer -- the exact mistake `calibrate._servable` was written to fix,
+  and whose cost that function documents (an all-candidates replay had every
+  gate losing 10-25% on forced nested-loop plans the live path drops);
+- it scored the **baseline row** as a candidate. Serving calls
+  `select_plan(candidates, baseline_plan=native)`: the policy chooses among
+  candidates and the *gate* decides whether to use the choice. Leaving native in
+  the pool let a model score well by "picking" a plan it never had the option
+  to pick.
+
+All three are now filtered, so promotion ranks two models on the action space
+they will actually be given.
+
+### What was not the problem
+
+Worth recording, because it was the obvious hypothesis and it is wrong.
+
+`_select_against_native` vetoes the chosen plan and returns the baseline; it
+does not fall through to the runner-up. That looks like a bug -- one
+out-of-distribution candidate discarding every other option for the query --
+so it was measured. Walking the ranker's ordering until a candidate clears the
+gate, against taking the top pick or nothing:
+
+| | deviates | worst regression | net |
+|---|---|---|---|
+| top-1 only, z=0.5 gain=0.10 | 4/15 | 10.6 ms | **+1.00%** |
+| walk the ordering | 5/15 | 59.8 ms | **-3.00%** |
+| top-1 only, z=2.0 gain=0.02 | 4/15 | 0.0 ms | **+6.65%** |
+| walk the ordering | 4/15 | 0.0 ms | +6.65% |
+
+Neutral at the good setting and clearly worse at the loose one. The candidates
+ranked below the top pick are worse, and letting the gate authorise them admits
+marginal plans without finding better ones. Top-1-or-nothing stays.
+
+## 2.48 A tuner that picks the noisiest option, and the fix
+
+Four tools swept the configuration and none of them swept it together:
+
+    app.calibrate    confidence_z, min_relative_gain, gate_mode
+    app.model_zoo    the model class
+    app.experiment   an A/B of two arms you name
+    (nothing)        the selection policy, the action space
+
+Each held everything it was not sweeping at whatever the environment said, and
+2.43 is the bill for assuming those are independent. `app.autotune` sweeps
+policy x action space x gate on the same held-out rows under the same safety
+bounds, and prints one configuration plus the variables to export.
+
+### The first version was wrong, in a way worth keeping
+
+Its first run recommended:
+
+```
+  selection policy   : thompson
+  confidence_z       : 1.5
+  net +11.9% (+177 ms)
+```
+
+against `pairwise_rank` at +10.5%. So the deterministic policy the project had
+just spent 2.43 establishing as the right one lost, by 1.4 points, to Thompson
+sampling.
+
+`thompson` samples one ensemble member per decision. Running the identical
+sweep three times:
+
+| run | recommended z | net |
+|---|---|---|
+| 1 | 0.75 | **+14.16%** |
+| 2 | 1.50 | **+10.61%** |
+| 3 | 2.00 | **+12.33%** |
+| `pairwise_rank` | 2.00 | +10.51%, every time |
+
+Different threshold each time, and a 3.5-point range. The +11.9% was one draw,
+and the tuner had compared it against a deterministic policy's exact value.
+
+**Taking a max over configurations is a machine for finding whichever one got
+lucky**, and it favours whichever option is noisiest -- the more a
+configuration's score varies, the higher its maximum. This is 2.26 ("a single
+benchmark run does not measure this system") arriving from the other direction:
+there, one run was mistaken for a measurement; here, one run was mistaken for a
+measurement *and then maximised over*.
+
+### The fix
+
+- `evaluate_setting` takes a `seed` and passes `random.Random(seed)` into
+  `select_index`, so a replay of a stochastic policy is reproducible at all.
+- `app.autotune` draws stochastic policies `--repeats` times (default 5) and
+  scores them on the **median**, reporting the range beside it.
+- A stochastic policy that clears the safety bounds on some draws and not others
+  has **not** cleared them. Requiring every draw stops a bound being satisfied
+  by luck, which is the one thing a safety bound must not permit.
+- The setting reported is the draw nearest the median, not an average of
+  settings -- an averaged `z` and `min_relative_gain` may never have been
+  measured together.
+
+Re-run:
+
+```
+        policy           extra families     z  gain  dev%  reg%   worst    net%  spread
+ pairwise_rank                     none  2.00  0.00   33%   20%   1.21x   10.5%
+ pairwise_rank              join_method  2.00  0.00   33%   20%   1.21x   10.5%
+      thompson                     none  2.00  0.02   33%   20%   1.21x    9.6%  +7.6 to +10.0 over 5 draws
+        greedy                     none  2.00  0.02   33%   20%   1.21x    9.2%
+   risk_averse                     none  2.00  0.02   33%   20%   1.21x    7.3%
+```
+
+`thompson`'s median is 9.6% and its range does not reach `pairwise_rank`'s
+10.5%. The ordering now matches 2.43's independent measurement, which is the
+first evidence that the tuner is measuring the thing it claims to.
+
+### What it found
+
+**Turning the `resource` family off is worth about 3 points.** `pairwise_rank`
+with the default action space scores 7.7%; without `resource` it scores 10.5%.
+`INCLUDE_TUNING` has defaulted to `1` for the life of the project. 2.27
+measured the switched-off families earning nothing across 24 queries and left
+`resource` on; nobody re-measured it after the workload tripled or after the
+PostgreSQL 18 upgrade, and a family whose inclusion nobody re-checks is a
+decision that has stopped being evidence.
+
+The winner and its runner-up differ only in an action space that changes
+nothing, so the tool says so and prefers the narrower one -- extra candidates
+are planning round trips at serving time, and a tie should resolve towards
+fewer.
+
+### What it deliberately does not do
+
+`--apply` writes `models/gate.json` and **prints** the policy and action space
+rather than exporting them. Thresholds are a file this tool owns; what a running
+server selects with is not something a tuning run should change behind the
+operator's back.
+
+And it does not execute. It is a replay, inheriting every caveat `app.calibrate`
+carries -- with the corrections of 2.43 and 2.47 now included. The last line of
+its output says to confirm the winner with `app.benchmark --protocol compare`,
+because 2.32 measured two identical 3-run benchmarks landing 8 points apart and
+a replay difference of a few points is not a result.
+
+## 2.49 A new gate, reported broken on the previous gate's history
+
+Straight after the recalibration in 2.48, `app.diagnostics` said:
+
+```
+[  high] gate_promise_not_met
+   the calibration promised 20% of deviations would regress; 31% of the last
+   1310 matched runs did.
+```
+
+The gate had existed for about a minute. All 1310 of those runs were served
+under the previous gate, the previous model and -- given 2.43 -- effectively the
+previous policy.
+
+`drift_report` compares `expected_regression_rate` against the observed rate
+over `stats.served_vs_native`, which returns the whole matched history. It is a
+genuinely good check: a promise nobody verifies is decoration, and this is the
+only thing in the project that verifies one. But it had no notion of *which*
+gate produced the history it was reading, so every recalibration inherited the
+verdict on its predecessor -- and the worse the old gate was, the louder the new
+one was declared broken.
+
+The fix is small and in two halves. `apply_gate` records `applied_at`;
+`served_vs_native` takes a `since` and restricts `decision_quality` to runs from
+that moment. The run series and the totals stay unfiltered, because the
+dashboard's history is a history.
+
+The second half is the part worth insisting on. A gate file written before
+`applied_at` existed has no cutoff, and the warning now says so rather than
+quietly reverting to the whole log:
+
+> ...though this gate file records no `applied_at`, so some of those runs may
+> predate it and belong to a different gate entirely
+
+That distinction -- "measured, and here is the number" against "could not
+measure, here is the closest thing" -- is the same one `apply_gate` had to learn
+when it was writing `0.0` for regression rates nobody had computed. It keeps
+coming up because the failure is comfortable: both readings produce a number,
+and only one of them is an answer.
+
+### The cost of the honest version
+
+A freshly applied gate now has **no** history and cannot be judged at all until
+`MIN_RUNS_FOR_DRIFT` runs accumulate under it. That is worse than a
+misattributed verdict only if the misattributed verdict was worth having, and
+it was not: the previous behaviour reported a defect in the gate that had just
+been installed to fix that defect.
+
+## 2.50 The same divergence, in the two places left
+
+2.47 fixed the replay's blindness to the safety veto in `app.calibrate` and
+`retrain._score_bundle`. Auditing for the pattern rather than the instance found
+it twice more.
+
+### `train._evaluate_selection`
+
+This produces `headroom_captured_vs_oracle` -- the number `app.retrain` prints
+and the dashboard shows. It built its candidate list as:
+
+```python
+candidates = [_row_to_candidate(r) for r in rows]
+```
+
+Every logged row, the **baseline included**, and no `_servable` filter. Two
+consequences, both of which flatter:
+
+- Native is not a candidate. Serving calls
+  `select_plan(candidates, baseline_plan=native)`: the policy chooses among
+  candidates and the *gate* decides whether to use the choice. With native in
+  the pool a policy scores well by "picking" a plan it was never offered -- and
+  the oracle, the ceiling every headroom figure is divided by, silently becomes
+  `min(candidates + [native])`.
+- The log records everything ever collected, and collection explores wider than
+  serving does. That is `calibrate._servable`'s entire subject.
+
+So the headline the retrain prints described an action space no query is given.
+Filtered now, all three ways.
+
+### `main._optimizer_from`
+
+```python
+    return LearnedOptimizer(
+        ...
+        # Not part of `gate` above: which bound to apply is a plain choice with
+        # no calibrated-file default to defer to, unlike the thresholds.
+        gate_mode=values["gate_mode"],
+```
+
+The comment was true when written and stopped being true in 2.42, when
+`app.calibrate` learned to sweep the bound's form and write the winner into
+`models/gate.json`. Passing it unconditionally means the constructor argument
+always wins, so the API server never read the swept value.
+
+A calibration the server ignores: 2.43's policy, 2.42's unused conformal gate,
+and now this. `gate_mode` joins the thresholds and is forwarded only when
+someone actually chose it in the settings panel -- which is also correct on its
+own terms, since a `min_relative_gain` chosen against a conformal bound is not
+the right threshold for a fixed-z one.
+
+### And a check, so the next one is loud
+
+`app.autotune` records `calibrated_with_families` in the gate file, and
+`app.diagnostics` now compares it against what the deployment offers. On the
+current configuration it fires immediately:
+
+```
+[medium] gate_calibrated_for_another_action_space
+   the gate was swept over cardinality, join_order, operator_toggle but the
+   server also offers resource.
+```
+
+Which is correct: `app.autotune` recommended dropping the `resource` family and
+nothing has exported `INCLUDE_TUNING=0` yet. The gate is measuring a system the
+server is not running, and now it says so instead of being discovered a month
+later.
+
+Three checks of this shape exist now -- policy (2.43), action space, and the
+drift window (2.49) -- and they share a rule: a configuration file that records
+what it was measured under can be checked against reality, and one that does not
+cannot. Every one of them was added after the corresponding mismatch had already
+been serving for months.
+
+### What the feature audit found, and why nothing was changed
+
+Counting how often each of the 64 features is split on across the 8 ensemble
+members, over 411 servable candidate vectors:
+
+| | count |
+|---|---|
+| constant across every row | 3 (`has_hint`, two `*_index_scan`) |
+| never split on by any member | **16** |
+| split on 5 times or fewer | 1 |
+
+A quarter of the feature vector is dead weight that still costs a `featurize`
+call on the serving path. `has_hint` is the clearest case: it is always 1.0,
+because candidates always carry a hint and native is not a candidate.
+
+Nothing was removed, and the reason is worth stating rather than leaving as an
+omission. §2.39 measured `featurize` at 3.08 ms of a 27.5 ms request, so
+deleting a quarter of the features saves under 1 ms -- around 3% -- while
+`has_hint` is still load-bearing on the legacy absolute-latency path, which
+*does* score native alongside the candidates. Trading a real behavioural risk on
+one code path for 0.8 ms on another is a bad trade, and "measured, not worth
+acting on" is a result. It is recorded here so the next person does not have to
+measure it again.
+
+## 2.51 Zero becomes forty-six
+
+The benchmark, re-run under the configuration `app.autotune` chose, on the model
+promoted after the yardstick fix, with the veto-aware gate:
+
+```
+=== protocol: compare (3 runs) ===
+headroom captured        41.3%   range 38.9% to 43.0%   runs 38.9, 41.3, 43.0
+held-out captured        45.7%   range 19.3% to 50.4%   runs 19.3, 45.7, 50.4
+curated only             33.0%   range 20.8% to 34.2%   runs 34.2, 20.8, 33.0
+```
+
+The middle line is the one this project exists to produce. It had read **0.0%**
+on every run ever measured -- eleven of them across three independent sets
+(2.37), and three more this session (2.41's benchmark). It now reads **45.7%**.
+
+### What actually changed
+
+Nothing in the model architecture, the features, or the action space. Six
+corrections, each of which had been silently wrong for months:
+
+| | |
+|---|---|
+| 2.43 | the gate was calibrated under `greedy`; the server selects with `pairwise_rank`, and on held-out queries those land at 104.1% and 95.1% of native |
+| 2.44 | a 5.4 ms regression on an 8 ms query read as 1.70x and vetoed a gate worth +188 ms |
+| 2.45 | the promotion yardstick was the alphabet, and the challenger had trained on 10 of its 15 queries |
+| 2.42 | the conformal bound was fitted every run and consulted on none |
+| 2.47 | the replay could not see the safety veto, so it scored plans the server refuses |
+| 2.50 | the training eval scored native as a candidate, and the API ignored the swept `gate_mode` |
+
+The system was capable of this the whole time. What it lacked was any
+measurement that agreed with what it was running.
+
+### Read the third line too
+
+`curated only` -- the 18 correlation traps, 6 controls and 8 shape queries,
+written by hand against PostgreSQL's independence assumption and never filtered
+on whether this optimizer could win them -- captures **33.0%** against the
+headline's 41.3%.
+
+That gap is the selection effect, and this is the first time it has been
+measured rather than warned about. 27 of the 59 workload queries were generated
+and then kept *because* the best plan in the served action space beat native by
+at least 8%, so the headline is measured partly on a benchmark chosen for having
+something to capture. Eight points, and the curated number is still a third of
+the available headroom.
+
+### And the caveat the tool itself insists on
+
+The held-out range is **19.3% to 50.4%** across three runs. That is enormous,
+and it is the same instrument 2.32 caught giving two identical configurations
+medians eight points apart. The summary line the benchmark prints says a
+difference smaller than 4.2 points should not be argued about; a 31-point spread
+on the headline metric says the honest claim is "clearly not zero", not "45.7%".
+
+What is safe to say: on queries this model never trained on, the served
+configuration is now taking a substantial fraction of the available headroom,
+and every prior measurement of that quantity was 0.0% because the thing being
+measured and the thing being run were different systems.
+
+## 2.52 The tuner re-created the bug it was built to prevent
+
+`app.autotune` exists because 2.43 found the gate calibrated under one policy
+and the server selecting with another. Run against the promoted model, it said:
+
+```
+=== best configuration ===
+  selection policy   : greedy
+  net +13.1% (+228 ms)
+  the runner-up (greedy with resource, +13.1%) is close enough that this replay
+  cannot separate them.
+```
+
+`pairwise_rank`, the running policy, scored **12.3%**. A gap of 0.8 points, and
+`--apply` duly wrote:
+
+```json
+  "calibrated_with_policy": "greedy",
+```
+
+into a gate the server would apply while selecting with `pairwise_rank`. The
+instrument built to prevent 2.43 committed 2.43, and printed a line admitting
+it could not resolve the difference it was acting on.
+
+The mismatch check added an hour earlier caught it in seconds:
+
+```
+[  high] gate_calibrated_for_another_policy
+   the gate was swept under `greedy` and the server selects with `pairwise_rank`.
+```
+
+### Why the existing tie rule did not stop it
+
+`calibrate.TIE_FRACTION` is 5% relative, about 0.65 points on these numbers, so
+0.8 points cleared it. That threshold is right *within* a sweep, where every row
+is the same policy and a tie means "these thresholds are equivalent". Across
+policies it is wrong twice over:
+
+- **It is far below what execution can resolve.** The benchmark prints its own
+  floor from the spread of its runs, and this session's read *"a difference
+  smaller than 4.2 points is inside this sample's own spread"*. 2.32 measured
+  two identical 3-run benchmarks landing **8 points** apart.
+- **Switching is not free.** It costs a recalibration, a re-benchmark, and a
+  window in which the gate file and the server disagree.
+
+So `MIN_POLICY_SWITCH_POINTS = 2.0`: a challenger must beat the *running* policy
+by two percentage points before the tool recommends changing it. Deliberately
+looser than the 4.2 execution could resolve -- this stops the flips that are
+obviously noise without pretending replay settles what execution cannot. The
+report says when it declined:
+
+> kept the running policy over `greedy`, which scored higher by less than this
+> replay can resolve. Switching costs a recalibration and a window where the
+> gate and the server disagree; the incumbent has to be beaten, not matched.
+
+A tool that silently declines to change something is worse than one that
+changes it, because the reader cannot tell it considered the alternative.
+
+### The general shape
+
+An optimiser that maximises over configurations will find whichever one got
+lucky. 2.48 caught that in its stochastic form -- `thompson`'s best draw beating
+`pairwise_rank`'s exact value -- and fixed it with repeats and a median. This is
+the same error in its deterministic form: two policies whose true difference is
+smaller than the measurement, where whichever lands higher wins by construction.
+The repeat-and-median fix does not touch it, because neither policy is noisy;
+the *comparison* is.
+
+The general rule this project keeps arriving at from different directions: a
+selection procedure needs to know the resolution of its own instrument, and act
+only on differences larger than it.
+
+### A cost worth stating
+
+Turning the `resource` family off (2.48) had an effect nobody planned. The
+sweep reads `latest_run_only=True` -- the most recent run per query, so a
+comparison is not contaminated by measurements taken months and workloads apart.
+The benchmark that confirmed the new configuration ran with
+`INCLUDE_TUNING=0`, so its rows contain **no `resource` candidates at all**, and
+the next sweep found the action-space column entirely inert: all four spaces
+scored identically for a given policy.
+
+**Switching a family off removes the evidence needed to switch it back on.**
+The measurement that justified it (10.5% against 7.73%, and no qualifying gate
+at all for `join_order + cardinality + resource`) is now historical, and
+re-testing it requires deliberately collecting with the family on again. That
+is a property of any system that learns from what it chose to do -- the standard
+bandit problem -- and it is worth naming here because nothing in the pipeline
+currently explores against its own configuration.
+
+## 2.53 A setting with six lines of help text and no effect
+
+Auditing the settings surface the same way -- *is this reached?* rather than *is
+this correct?* -- against every field the dashboard declares:
+
+```
+group_by_template   0 references outside app/settings.py
+```
+
+It is referenced, as it happens: `logging_store.py` reads
+`GROUP_BY_TEMPLATE` from the environment. **At import.** The settings panel
+writes `models/settings.json`, and `logging_store` never consults it, so
+toggling *"Treat parameters as the same query"* in the dashboard did nothing at
+all.
+
+`main._apply_settings` exists precisely to push a settings change into the
+running system. It syncs the optimizer, the regression guard, the decision cache
+and fifteen `planner` flags. It did not sync this one, and there was no way to
+notice: the panel showed the new value, `GET /settings` returned the new value,
+and the behaviour was the old one.
+
+The setting is not decorative. Its own help text explains that every per-query
+mechanism -- the regression guard, the caution applied to unseen queries, the
+decision cache, the trend chart -- is keyed on query identity, and that keying on
+literal text makes a parameterised application look like thousands of one-off
+queries. Someone turning it off to debug exactly that would have seen no change
+and concluded something else was wrong.
+
+### The check, rather than the fix
+
+The fix is one line. The interesting part is that this is the fourth instance of
+the same shape in one session -- the conformal gate fitted every run and
+consulted on none (2.42), two hint families switched off and never re-measured
+(2.27), a swept `gate_mode` the API ignored (2.50) -- so the fix worth having is
+the one that catches the fifth.
+
+`test_every_declared_setting_is_actually_applied` reads the source of
+`_apply_settings` and `_optimizer_from` and asserts that every name in
+`settings.FIELDS` appears in one of them, or in an explicit exemption list that
+has to carry a reason:
+
+```python
+NOT_APPLIED_AT_SERVE_TIME = {
+    # Read by `app.train` when the conformal gate is fitted; changing it takes
+    # effect on the next training run, not on the next query.
+    "conformal_alpha",
+    ...
+}
+```
+
+Grepping source text from a test is crude and it is the right crudeness here:
+the failure mode is a name that exists in one file and nowhere else, which is
+exactly what a text search detects and a behavioural test does not. A second
+test asserts every exemption names a field that still exists, so an exemption
+cannot outlive the setting it was carved for and silently re-open the hole.
+
+## 2.54 The panel said 1.0 while the gate applied 1.5
+
+Smoke-testing the running API rather than the test suite -- start `uvicorn`,
+call the endpoints a browser calls:
+
+```
+GET /settings            confidence_z: 1.0    min_relative_gain: 0.05
+GET /model/diagnostics   confidence_z: 1.5    min_relative_gain: 0.02
+```
+
+Both are correct and they disagree. `app.settings` declares 1.0 and 0.05 as
+defaults; `LearnedOptimizer` overrides both with the measured gate in
+`models/gate.json` unless someone explicitly chose them, which is exactly what
+`_optimizer_from` is written to do and 2.42 extended to `gate_mode`. The
+optimizer applies 1.5. The settings panel reports 1.0.
+
+`app/main.py`'s own header describes this failure as fixed:
+
+> `app.settings` persists every dashboard change to models/settings.json
+> precisely so it survives a restart, but nothing outside `PUT /settings` ever
+> read it back. The panel therefore reported one configuration while the process
+> ran another, and not harmlessly [...]
+
+That was the version where the panel wrongly *won*. This is the same sentence
+with the arrow reversed: the calibration correctly wins, and nothing says so. A
+user reading the dashboard to find out what the safety gate is doing gets a
+number that has been overridden, with no indication that it has been.
+
+### The fix is to report three things, not two
+
+`GET /settings` returns `values` (what is stored), `in_force` (what the live
+optimizer holds), and `overridden` (the names where they differ), plus
+`gate_source`. The dashboard renders a line under any control whose value has
+been superseded:
+
+> **In force: 0.02** — the measured gate in `models/gate.json` is being applied
+> instead of this value. Changing this setting overrides the calibration.
+
+Warning-coloured rather than error-coloured, because the calibration winning is
+correct behaviour and only the silence about it was the bug.
+
+### Two things this found on the way
+
+The frontend has a test asserting every CSS class used by a component has a
+rule, and it caught `setting-overridden` immediately. That is the same species
+of check as the settings-reachability test in 2.53 and the gate-provenance
+checks in 2.43 and 2.50 -- cheap, mechanical, and aimed at *is this connected*
+rather than *is this correct*. This project keeps finding that the second
+question is well covered and the first is not.
+
+And the endpoint smoke test is what surfaced it at all. 1219 backend tests and
+142 frontend tests pass without noticing, because every one of them either
+constructs the optimizer directly or mocks the endpoint. Nothing asked the
+running server what it would tell a browser.

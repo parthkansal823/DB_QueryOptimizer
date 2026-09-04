@@ -16,9 +16,26 @@ class _Ensemble:
         return self.means[: len(X)]
 
 
+class _MeanRanker:
+    """A ranker that orders by the ensemble's own means.
+
+    `pairwise_rank` is the shipped default (2.43), so a fixture without a ranker
+    would exercise a policy nobody runs -- which is the bug these tests exist
+    alongside. Ordering by the ensemble keeps every assertion below about the
+    *gate* rather than about which candidate got chosen."""
+
+    def __init__(self, means):
+        self.means = means
+
+    def select(self, vectors, tie_break_costs=None):
+        n = len(vectors)
+        return min(range(n), key=lambda i: self.means[i])
+
+
 def _bundle(means, stds):
     return {
         "model": _Ensemble(means, stds),
+        "ranker": _MeanRanker(means),
         "feature_columns": [],
         "table_cardinalities": {},
         "target": "log_ratio_vs_native",

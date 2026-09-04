@@ -411,17 +411,33 @@ def _by_day(runs: list[dict]) -> list[dict]:
     ]
 
 
-def served_vs_native(cur, limit: int = 2000) -> dict:
+def served_vs_native(cur, limit: int = 2000, since: str | None = None) -> dict:
     """
     Paired native-vs-served history: overall, per day, and per query.
 
     Only runs that measured *both* a native plan and a served plan are
     included -- the offline collection sweep and any half-logged run are
     excluded rather than counted on one side of the comparison.
+
+    `since` restricts `decision_quality` to runs from that moment onward, for
+    callers asking whether a *particular* configuration kept its promise.
+    `app.diagnostics` passes the gate's `applied_at`: a gate's expected
+    regression rate says nothing about traffic served under a different gate,
+    and without this the drift check reported a freshly calibrated gate as
+    already broken on 1310 runs that predated it. The run series and the totals
+    are left unfiltered, because the dashboard's history is a history.
     """
     cur.execute(RUNS_SQL, (COLLECTION_SELECTOR, limit))
     columns = [c[0] for c in cur.description]
     runs = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
+
+    quality_runs = runs
+    if since:
+        cutoff = str(since)
+        quality_runs = [
+            r for r in runs
+            if r["created_at"] is not None and r["created_at"].isoformat() >= cutoff
+        ]
 
     cur.execute(COUNTS_SQL, (COLLECTION_SELECTOR,))
     n_rows, n_collection, n_queries = cur.fetchone()
@@ -431,7 +447,7 @@ def served_vs_native(cur, limit: int = 2000) -> dict:
 
     return {
         "overall": _summarize(runs),
-        "decision_quality": _decision_quality(runs, noise_fraction=noise_fraction),
+        "decision_quality": _decision_quality(quality_runs, noise_fraction=noise_fraction),
         # The resolution limit of every latency figure above. Absent until
         # `python -m app.noise --apply` has been run, because guessing at it
         # would be worse than admitting it is unmeasured.

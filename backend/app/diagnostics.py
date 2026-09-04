@@ -43,6 +43,8 @@ import math
 import os
 import pickle
 
+from app.retrain import served_policy
+
 DEFAULT_MODEL_PATH = "models/plan_selector.pkl"
 DEFAULT_GATE_PATH = "models/gate.json"
 DEFAULT_EVAL_PATH = "models/eval_results.json"
@@ -89,6 +91,8 @@ def gate_report(gate: dict | None, bundle: dict | None) -> dict:
             "uncertainty_scale": scale,
             "consults_uncertainty": None,
             "calibrated_on_n_queries": None,
+            "calibrated_with_policy": None,
+            "served_policy": served_policy(),
         }
 
     z = gate.get("confidence_z")
@@ -105,7 +109,36 @@ def gate_report(gate: dict | None, bundle: dict | None) -> dict:
         "expected_deviation_rate": gate.get("expected_deviation_rate"),
         "expected_regression_rate": gate.get("expected_regression_rate"),
         "expected_worst_regression_ratio": gate.get("expected_worst_regression_ratio"),
+        # A threshold is only valid for the selection process it was swept
+        # against. These two disagreed for the project's entire history and
+        # nothing looked (2.43), so they are reported side by side.
+        "calibrated_with_policy": gate.get("calibrated_with_policy"),
+        "served_policy": served_policy(),
+        # The action space is part of the configuration a threshold was chosen
+        # under, exactly as the policy is: it decides what there was to select
+        # from. `app.autotune` records it; this reads back what the deployment
+        # currently offers, so the two can be compared.
+        "calibrated_with_families": gate.get("calibrated_with_families"),
+        "served_families": sorted(_served_families()),
     }
+
+
+def _served_families() -> set[str]:
+    """The hint families a query is offered right now.
+
+    Mirrors `calibrate._servable`, which is the function the sweep uses. Kept in
+    step by `test_diagnostics`, because two lists of family names that drift
+    apart is how a mismatch check ends up reporting a mismatch that is not
+    there.
+    """
+    from app.optimizer import planner
+
+    families = {"join_order", "operator_toggle", "cardinality"}
+    if planner.INCLUDE_TUNING:
+        families.add("resource")
+    if planner.INCLUDE_JOIN_METHODS:
+        families.add("join_method")
+    return families
 
 
 def uncertainty_report(bundle: dict | None, evaluation: dict | None) -> dict:
@@ -185,7 +218,13 @@ def drift_report(cur, gate: dict | None) -> dict | None:
 
     from app import stats  # local: keeps `diagnose()` importable without a DB
 
-    quality = stats.served_vs_native(cur).get("decision_quality") or {}
+    # Only traffic served *under this gate*. See `apply_gate`'s `applied_at`.
+    # A gate file written before that field existed has no cutoff, so it falls
+    # back to the whole history and the warning says which it was.
+    applied_at = gate.get("applied_at")
+    quality = (
+        stats.served_vs_native(cur, since=applied_at).get("decision_quality") or {}
+    )
     deviations = (
         quality.get("deviated_win", 0)
         + quality.get("deviated_wash", 0)
@@ -205,6 +244,9 @@ def drift_report(cur, gate: dict | None) -> dict | None:
         "regression_ms": quality.get("regression_ms"),
         "saved_ms": quality.get("saved_ms"),
         "enough_runs_to_judge": runs >= MIN_RUNS_FOR_DRIFT,
+        # Whether the runs above are known to belong to this gate.
+        "scoped_to_gate": applied_at is not None,
+        "gate_applied_at": applied_at,
     }
 
 
@@ -226,6 +268,57 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
                 "confidence_z is 0, so the gate multiplies the model's uncertainty "
                 "by zero and deviates on the point estimate alone. The dashboard's "
                 "'pessimistically' figure will equal the prediction exactly."
+            ),
+        })
+
+    swept_under = gate.get("calibrated_with_policy")
+    serving = gate.get("served_policy")
+    if swept_under and serving and swept_under != serving:
+        found.append({
+            "severity": "high",
+            "code": "gate_calibrated_for_another_policy",
+            "detail": (
+                f"the gate was swept under `{swept_under}` and the server "
+                f"selects with `{serving}`. Thresholds are a property of the "
+                "selection process they were measured against: on 15 held-out "
+                "queries `greedy` landed at 104.1% of native and "
+                "`pairwise_rank` at 95.1%, so this is not a rounding "
+                "difference. Re-run `python -m app.calibrate --apply`."
+            ),
+        })
+    elif gate.get("source") != "built-in defaults" and swept_under is None:
+        found.append({
+            "severity": "low",
+            "code": "gate_does_not_record_its_policy",
+            "detail": (
+                "this gate file predates `calibrated_with_policy`, so there is "
+                "no way to tell which selection policy its thresholds were "
+                "chosen against. Re-run `python -m app.calibrate --apply` to "
+                "record it."
+            ),
+        })
+
+    swept_families = gate.get("calibrated_with_families")
+    served_families = gate.get("served_families")
+    if swept_families and served_families and set(swept_families) != set(served_families):
+        missing = sorted(set(swept_families) - set(served_families))
+        extra = sorted(set(served_families) - set(swept_families))
+        parts = []
+        if extra:
+            parts.append(f"the server also offers {', '.join(extra)}")
+        if missing:
+            parts.append(f"the server no longer offers {', '.join(missing)}")
+        found.append({
+            "severity": "medium",
+            "code": "gate_calibrated_for_another_action_space",
+            "detail": (
+                f"the gate was swept over {', '.join(sorted(swept_families))} but "
+                + " and ".join(parts)
+                + ". The action space decides what there is to select from, so a "
+                "threshold measured against a different one is measuring a "
+                "different system -- 2.48 found dropping the `resource` family "
+                "worth about 3 points. Re-run `python -m app.autotune` or export "
+                "the variables it prints."
             ),
         })
 
@@ -305,9 +398,18 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
                 "detail": (
                     f"the calibration promised {promised:.0%} of deviations would "
                     f"regress; {observed:.0%} of the last {drift['n_runs']} matched "
-                    "runs did. Either the workload has moved away from what the "
-                    "gate was chosen on, or it was chosen on too few queries. "
-                    "Re-run `python -m app.calibrate --apply`."
+                    "runs did"
+                    + (
+                        f" (all served under this gate, applied "
+                        f"{drift['gate_applied_at']})"
+                        if drift.get("scoped_to_gate")
+                        else " -- though this gate file records no `applied_at`, "
+                        "so some of those runs may predate it and belong to a "
+                        "different gate entirely"
+                    )
+                    + ". Either the workload has moved away from what the gate "
+                    "was chosen on, or it was chosen on too few queries. "
+                    "Re-run `python -m app.autotune --apply`."
                 ),
             })
 
@@ -420,6 +522,13 @@ def _format(report: dict) -> str:
     lines.append(f"  min_relative_gain   : {gate['min_relative_gain']}")
     lines.append(f"  consults uncertainty: {gate['consults_uncertainty']}")
     lines.append(f"  calibrated on       : {gate['calibrated_on_n_queries']} queries")
+    lines.append(f"  swept under policy  : {gate['calibrated_with_policy']}")
+    lines.append(f"  server selects with : {gate['served_policy']}")
+    swept_fam = gate.get("calibrated_with_families")
+    lines.append(
+        f"  swept over families : {', '.join(swept_fam) if swept_fam else None}"
+    )
+    lines.append(f"  server offers       : {', '.join(gate.get('served_families') or [])}")
 
     unc = report["uncertainty"]
     lines += ["", "=== uncertainty ==="]

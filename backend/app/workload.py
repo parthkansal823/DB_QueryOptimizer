@@ -51,6 +51,30 @@ three executions each, median. Two candidates were rejected -- a top-N showing
 39% headroom on a 1.7 ms query (a percentage of nothing) and a five-way join
 that linked `suppliers` to `users` on `country`, which ran 1.77 s at 0% headroom
 because it is a near-cartesian join with no key path rather than a hard query.
+
+## v4: count, because the *calibration set* was the binding constraint
+
+Shape coverage cut prediction error (2.35), and then 2.37 found the gate giving
+the gain straight back. Eleven benchmark runs reported held-out capture of
+**exactly 0.0%** every time, while five of the eight held-out queries had more
+than 20% headroom available -- up to 43.4%. The cause was not the model: the
+sweep that sets the safety threshold ran on **8 queries**, over a grid whose
+operating points differ by 0.4 percentage points, and a calibration asked to
+choose between options finer than its own resolution picks the one that does
+nothing, because doing nothing is the only option whose downside it can bound.
+
+Eight held-out queries cannot calibrate a threshold worth 43% on five of them.
+So the `gen_` group is about **count**: `workload_generator.generate_workload`
+produced 45 candidates by sampling real predicates from the live data, and each
+was vetted exactly as the `shape_` group was -- native against the best plan the
+served action space reaches, median of two executions.
+
+**27 of 45 survived.** The rejects are as informative as the keepers: queries
+whose native time was under 8 ms (a large percentage of nothing), over 900 ms
+(collection becomes unaffordable), or with under 8% headroom (nowhere to go).
+Generated queries are a starting point, not a claim that they are the queries
+anyone cares about -- which is why each one had to earn its slot on measurement
+rather than on having been generated.
 """
 
 from __future__ import annotations
@@ -507,5 +531,453 @@ WORKLOAD = [
         "description": "three correlated columns plus a range predicate on a naturally-ordered column",
         "join_width": 2,
         "trap": "city->country->language, plus a time range",
+    },
+
+    # -- v4: generated and vetted, for calibration-set size ---------------
+    {
+        "id": "gen_01_3w",
+        "sql": """
+            SELECT ps."id", p."id", s."id"
+            FROM "product_suppliers" ps
+            JOIN "products" p ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE ps."lead_days" < 23.0 AND p."name" = 'product_15723'
+        """,
+        "description": (
+            "generated, vetted: 14.2 ms native against 8.8 ms best available, "
+            "38.1% headroom"
+        ),
+        "join_width": 3,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_02_4w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."quantity" > 1.0 AND o."channel" = 'mobile'
+        """,
+        "description": (
+            "generated, vetted: 257.9 ms native against 163.1 ms best available, "
+            "36.8% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_03_3w",
+        "sql": """
+            SELECT oi."id", o."id", u."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."id" > 125000.0 AND o."status" = 'shipped'
+        """,
+        "description": (
+            "generated, vetted: 228.9 ms native against 147.6 ms best available, "
+            "35.5% headroom"
+        ),
+        "join_width": 3,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_04_4w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."quantity" > 1.0 AND o."channel" = 'partner'
+        """,
+        "description": (
+            "generated, vetted: 293.6 ms native against 191.0 ms best available, "
+            "34.9% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_05_3w",
+        "sql": """
+            SELECT oi."id", p."id", ps."id"
+            FROM "order_items" oi
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            WHERE oi."quantity" > 1.0 AND p."brand" = 'Voltix'
+        """,
+        "description": (
+            "generated, vetted: 132.8 ms native against 91.7 ms best available, "
+            "31.0% headroom"
+        ),
+        "join_width": 3,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_06_4w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            WHERE oi."quantity" < 3.0 AND o."status" = 'completed'
+        """,
+        "description": (
+            "generated, vetted: 318.6 ms native against 221.5 ms best available, "
+            "30.5% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_07_2w",
+        "sql": """
+            SELECT oi."id", p."id"
+            FROM "order_items" oi
+            JOIN "products" p ON oi."product_id" = p."id"
+            WHERE oi."quantity" < 3.0 AND p."name" = 'product_12860'
+        """,
+        "description": (
+            "generated, vetted: 80.4 ms native against 55.9 ms best available, "
+            "30.4% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_08_4w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."id" < 375000.0 AND o."channel" = 'web'
+        """,
+        "description": (
+            "generated, vetted: 297.1 ms native against 207.6 ms best available, "
+            "30.1% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_09_4w",
+        "sql": """
+            SELECT oi."id", p."id", ps."id"
+            FROM "order_items" oi
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE oi."id" > 125000.0 AND p."name" = 'product_15538'
+        """,
+        "description": (
+            "generated, vetted: 89.2 ms native against 63.6 ms best available, "
+            "28.7% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_10_2w",
+        "sql": """
+            SELECT ps."id", s."id"
+            FROM "product_suppliers" ps
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE ps."id" < 45000.0 AND s."country" = 'DE'
+        """,
+        "description": (
+            "generated, vetted: 14.8 ms native against 10.7 ms best available, "
+            "27.7% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_11_2w",
+        "sql": """
+            SELECT ps."id", s."id"
+            FROM "product_suppliers" ps
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE ps."id" < 45000.0 AND s."rating" < 4.0
+        """,
+        "description": (
+            "generated, vetted: 17.5 ms native against 12.9 ms best available, "
+            "26.4% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_12_2w",
+        "sql": """
+            SELECT ps."id", p."id"
+            FROM "product_suppliers" ps
+            JOIN "products" p ON ps."product_id" = p."id"
+            WHERE ps."lead_days" > 8.0 AND p."name" = 'product_15538'
+        """,
+        "description": (
+            "generated, vetted: 12.8 ms native against 9.5 ms best available, "
+            "25.9% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_13_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."quantity" > 1.0 AND o."status" = 'cancelled'
+        """,
+        "description": (
+            "generated, vetted: 204.2 ms native against 155.9 ms best available, "
+            "23.7% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_14_2w",
+        "sql": """
+            SELECT ps."id", p."id"
+            FROM "product_suppliers" ps
+            JOIN "products" p ON ps."product_id" = p."id"
+            WHERE ps."lead_days" < 23.0 AND p."price" < 261.67
+        """,
+        "description": (
+            "generated, vetted: 23.8 ms native against 18.7 ms best available, "
+            "21.4% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_15_4w",
+        "sql": """
+            SELECT oi."id", p."id", ps."id"
+            FROM "order_items" oi
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE oi."id" > 125000.0 AND p."category" = 'home'
+        """,
+        "description": (
+            "generated, vetted: 157.6 ms native against 124.2 ms best available, "
+            "21.2% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_16_3w",
+        "sql": """
+            SELECT oi."id", p."id", ps."id"
+            FROM "order_items" oi
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            WHERE oi."quantity" < 3.0 AND p."price" > 44.67
+        """,
+        "description": (
+            "generated, vetted: 254.6 ms native against 200.9 ms best available, "
+            "21.1% headroom"
+        ),
+        "join_width": 3,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_17_3w",
+        "sql": """
+            SELECT ps."id", p."id", s."id"
+            FROM "product_suppliers" ps
+            JOIN "products" p ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE ps."id" < 45000.0 AND p."price_band" = 'premium'
+        """,
+        "description": (
+            "generated, vetted: 22.0 ms native against 17.3 ms best available, "
+            "21.1% headroom"
+        ),
+        "join_width": 3,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_18_2w",
+        "sql": """
+            SELECT ps."id", s."id"
+            FROM "product_suppliers" ps
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE ps."id" > 15000.0 AND s."name" = 'supplier_314'
+        """,
+        "description": (
+            "generated, vetted: 12.0 ms native against 9.6 ms best available, "
+            "20.1% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_19_4w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            WHERE oi."id" < 375000.0 AND o."status" = 'completed'
+        """,
+        "description": (
+            "generated, vetted: 332.7 ms native against 267.8 ms best available, "
+            "19.5% headroom"
+        ),
+        "join_width": 4,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_20_2w",
+        "sql": """
+            SELECT oi."id", p."id"
+            FROM "order_items" oi
+            JOIN "products" p ON oi."product_id" = p."id"
+            WHERE oi."quantity" < 3.0 AND p."price_band" = 'budget'
+        """,
+        "description": (
+            "generated, vetted: 107.9 ms native against 88.6 ms best available, "
+            "17.9% headroom"
+        ),
+        "join_width": 2,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_21_3w",
+        "sql": """
+            SELECT oi."id", o."id", u."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."quantity" < 3.0 AND o."status" = 'cancelled'
+        """,
+        "description": (
+            "generated, vetted: 121.3 ms native against 100.9 ms best available, "
+            "16.9% headroom"
+        ),
+        "join_width": 3,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_22_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE oi."id" < 375000.0 AND o."status" = 'cancelled'
+        """,
+        "description": (
+            "generated, vetted: 169.1 ms native against 143.2 ms best available, "
+            "15.3% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_23_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE oi."id" < 375000.0 AND o."status" = 'refunded'
+        """,
+        "description": (
+            "generated, vetted: 175.4 ms native against 150.8 ms best available, "
+            "14.0% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_24_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."quantity" < 3.0 AND o."status" = 'cancelled'
+        """,
+        "description": (
+            "generated, vetted: 136.2 ms native against 117.7 ms best available, "
+            "13.6% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_25_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."quantity" < 3.0 AND o."status" = 'shipped'
+        """,
+        "description": (
+            "generated, vetted: 289.3 ms native against 251.5 ms best available, "
+            "13.1% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_26_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "suppliers" s ON ps."supplier_id" = s."id"
+            WHERE oi."quantity" < 3.0 AND o."status" = 'completed'
+        """,
+        "description": (
+            "generated, vetted: 244.2 ms native against 220.6 ms best available, "
+            "9.6% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
+    },
+    {
+        "id": "gen_27_5w",
+        "sql": """
+            SELECT oi."id", o."id", p."id"
+            FROM "order_items" oi
+            JOIN "orders" o ON oi."order_id" = o."id"
+            JOIN "products" p ON oi."product_id" = p."id"
+            JOIN "product_suppliers" ps ON ps."product_id" = p."id"
+            JOIN "users" u ON o."user_id" = u."id"
+            WHERE oi."id" < 375000.0 AND o."channel" = 'partner'
+        """,
+        "description": (
+            "generated, vetted: 298.0 ms native against 269.6 ms best available, "
+            "9.5% headroom"
+        ),
+        "join_width": 5,
+        "trap": "generated (predicates sampled from live data)",
     },
 ]

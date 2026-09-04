@@ -43,6 +43,7 @@ from app.db import get_cursor
 from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
+from app.optimizer.learned import DEFAULT_SELECTION_POLICY
 from app.train import _load_rows, _row_to_candidate, train
 
 # Enough new executions to be worth the retrain cost. Retraining on a
@@ -111,8 +112,21 @@ def served_policy() -> str:
     `docs/WRITEUP.md` 2.22 names the pattern: a constant that duplicates a
     decision made elsewhere will eventually disagree with it. This is the fourth
     instance.
+
+    Reading the environment fixed the *hardcoding* and not the disagreement.
+    `docker-compose.yml` set `SELECTION_POLICY` on the backend service, so the
+    variable existed only inside that container -- and `app.retrain` and
+    `app.calibrate` are run on the host, where it is unset. This function
+    returned `greedy` while the server served `pairwise_rank`, which is 2.22
+    again with an extra step: promotion and gate calibration both scored a
+    policy nobody runs (2.43).
+
+    The fix was to delete the duplicate rather than synchronise it. There is one
+    default now, `learned.DEFAULT_SELECTION_POLICY`, and the compose override is
+    gone, so host and container resolve the same value whether or not the
+    environment carries it.
     """
-    return os.getenv("SELECTION_POLICY", "greedy")
+    return os.getenv("SELECTION_POLICY", DEFAULT_SELECTION_POLICY)
 
 
 def _score_bundle(
@@ -156,10 +170,37 @@ def _score_bundle(
     feature_columns = bundle["feature_columns"]
     cardinalities = bundle["table_cardinalities"]
 
+    # Local import: `app.calibrate` imports `served_policy` from here, so a
+    # module-level import would close the cycle.
+    from app.calibrate import _servable
+
     picked: list[float] = []
     worst_ratio = 1.0
     for rows in rows_by_query.values():
-        candidates = [_row_to_candidate(r) for r in rows]
+        # Three filters, all of them making this match what a served query is
+        # actually offered. Without them promotion ranks two models on an action
+        # space neither of them will ever be given.
+        #
+        #   - `is_baseline`: native is not a candidate. Serving passes
+        #     `select_plan(candidates, baseline_plan=native)` -- the policy
+        #     chooses among candidates and the *gate* decides whether to use
+        #     the choice. Leaving native in the pool let a model score well by
+        #     "picking" the plan it never had the option to pick.
+        #   - `_servable`: the log records everything ever collected, and
+        #     collection explores wider than serving does. `calibrate._servable`
+        #     documents the cost of ignoring this: an all-candidates replay had
+        #     every gate losing 10-25% because it kept choosing forced
+        #     nested-loop plans the live path drops.
+        #   - `disabled_nodes`: `learned._is_unsafe` refuses these outright, so
+        #     scoring them credits a model for plans the server vetoes. This is
+        #     the divergence that had the replay reporting +5.38% where the
+        #     benchmark measured 0.0% (2.47).
+        candidates = [
+            c for c in _servable([_row_to_candidate(r) for r in rows if not r["is_baseline"]])
+            if not c.get("disabled_nodes")
+        ]
+        if not candidates:
+            continue
         latencies = [c["actual_total_time_ms"] for c in candidates]
         vectors = [to_vector(featurize(c, cardinalities), feature_columns) for c in candidates]
         try:
@@ -196,16 +237,96 @@ def _load_challenger_bundle(path: str) -> dict:
         return pickle.load(f)
 
 
-def _held_out_rows(fraction: float = 0.25) -> dict[str, list[dict]]:
-    """The most recent queries' rows, grouped -- a shared yardstick for both models."""
+def _held_out_rows(
+    fraction: float = 0.25,
+    bundles: "list[dict] | None" = None,
+) -> dict[str, list[dict]]:
+    """
+    A shared yardstick for comparing two models.
+
+    The docstring here used to read "the most recent queries' rows" and the code
+    read `sorted(by_query)[-n:]` -- which sorts query **ids alphabetically**.
+    Nothing about it was chronological, and `created_at` was sitting unused on
+    every row. On this workload the alphabetical tail is `gen_2*` and `shape_*`,
+    a group defined by naming rather than by recency or by anything a model had
+    or had not seen.
+
+    That mattered, and not subtly. The challenger being compared in 2.40 had
+    **trained on 10 of the 15** queries in that yardstick, so promotion was
+    largely reading how well it memorised them, and the newer model wins that
+    contest by construction.
+
+    Two changes:
+
+    **Recency is measured, not assumed.** Queries are ordered by their most
+    recent `created_at`, so "the most recent quarter" is what the name says.
+
+    **Contamination is preferred against, and reported when unavoidable.** Given
+    `bundles`, queries that none of them trained on are used if there are enough
+    of them. Here there are not: the champion held out 8 queries and the
+    challenger 15, and the two lists intersect in **two**
+    (`corr_6w_everything`, `shape_distinct_brands`), which cannot decide
+    anything. So the recency yardstick stands and `yardstick_provenance` states
+    how much of it each model had already seen -- the alternative being a verdict
+    that looks clean and is not.
+    """
     rows = _load_rows()
     by_query: dict[str, list[dict]] = {}
+    latest: dict[str, str] = {}
     for row in rows:
-        by_query.setdefault(row["query_id"], []).append(row)
+        qid = row["query_id"]
+        by_query.setdefault(qid, []).append(row)
+        stamp = str(row.get("created_at") or "")
+        if stamp > latest.get(qid, ""):
+            latest[qid] = stamp
 
-    query_ids = sorted(by_query)
+    # Ties (and rows with no timestamp) fall back to the id, so the order is
+    # total and the selection reproducible.
+    query_ids = sorted(by_query, key=lambda q: (latest.get(q, ""), q))
     n_test = max(1, round(len(query_ids) * fraction))
+
+    if bundles:
+        unseen = [
+            q for q in query_ids
+            if all(q in set(b.get("held_out_queries") or ()) for b in bundles)
+        ]
+        # Below MIN_UNCONTAMINATED_QUERIES the rates are too coarse to separate
+        # two models, and an honest contaminated sample beats a clean one too
+        # small to read.
+        if len(unseen) >= MIN_UNCONTAMINATED_QUERIES:
+            return {q: by_query[q] for q in unseen[-n_test:]}
+
     return {q: by_query[q] for q in query_ids[-n_test:]}
+
+
+# How many queries neither model trained on it takes before that set is
+# preferred over the recency window. Chosen to match `calibrate`'s own floor for
+# the same judgement: below a handful, a rate is not a measurement.
+MIN_UNCONTAMINATED_QUERIES = 5
+
+
+def yardstick_provenance(
+    held_out: dict[str, list[dict]], bundles: "dict[str, dict]"
+) -> dict:
+    """
+    How much of the yardstick each model had already seen.
+
+    A promotion verdict is only as good as the sample it was measured on, and a
+    sample the challenger trained on two-thirds of is measuring memorisation.
+    Recording it makes that visible in `app.retrain --status` instead of leaving
+    it to be rediscovered.
+    """
+    ids = set(held_out)
+    out: dict = {"n_queries": len(ids)}
+    for name, bundle in bundles.items():
+        recorded = set((bundle or {}).get("held_out_queries") or ())
+        if not recorded:
+            # A bundle that never recorded its split cannot be checked, which is
+            # not the same as a bundle that is clean.
+            out[f"{name}_trained_on"] = None
+            continue
+        out[f"{name}_trained_on"] = len(ids - recorded)
+    return out
 
 
 def retrain_if_needed(
@@ -242,7 +363,7 @@ def retrain_if_needed(
             "metrics": metrics,
         }
 
-    held_out = _held_out_rows()
+    held_out = _held_out_rows(bundles=[champion, challenger])
     champion_score = _score_bundle(champion, held_out)
     challenger_score = _score_bundle(challenger, held_out)
 
@@ -277,6 +398,13 @@ def retrain_if_needed(
         # Which policy the two models were compared under. Without it the
         # registry records a verdict with no way to tell what it measured.
         "scored_with_policy": served_policy(),
+        # How much of the comparison set each model had already trained on. A
+        # promotion decided on queries the challenger memorised is not a
+        # promotion decision, and this is what makes that legible rather than
+        # something to be rediscovered (see `_held_out_rows`).
+        "yardstick": yardstick_provenance(
+            held_out, {"champion": champion, "challenger": challenger}
+        ),
         "metrics": metrics,
     }
 

@@ -55,7 +55,7 @@ Read out loud: *"even if I am as wrong as I usually am, this still wins."*
 That sounds prudent and it throws away the best opportunities the system has.
 A real example from the dashboard:
 
-| | |
+| what the gate saw | value |
 |---|---|
 | model predicted | **0.20x** — five times faster |
 | what actually happened | 0.16x — it was right |

@@ -14,12 +14,16 @@
 // dictionary manipulation, where C gains almost nothing because it pays the
 // same PyDict lookups.
 //
-// The honest context, which `docs/WRITEUP.md` states and this file should not
-// hide: 0.82 ms sits inside a ~26 ms optimizer overhead on a ~110 ms query.
-// Even making this function free is about 3% of the overhead and under 1% of
-// end-to-end time. This is built because it was asked for and because it is the
-// one place where the answer is not obviously "no" -- not because the profile
-// demanded it.
+// MEASURED, on 400 real plans from the execution log, median of 25 passes:
+//
+//     python  0.0188 ms per plan      c++  0.0082 ms per plan      2.29x
+//     per query (18 candidates): 0.338 ms -> 0.148 ms, saving 0.191 ms
+//
+// The honest context, which this file should not hide: 0.191 ms sits inside a
+// ~26 ms optimizer overhead on a ~110 ms query -- **0.7% of the overhead and
+// under 0.2% end to end**. The profile was right that this is not where the
+// time goes. Built because it was asked for, and kept because it is correct and
+// costs nothing to leave optional; not because it was needed.
 //
 // Correctness is the whole risk. A feature vector that differs from Python's in
 // the sixth decimal is a silent divergence between what the model was trained on

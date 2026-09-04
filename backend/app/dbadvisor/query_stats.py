@@ -68,7 +68,10 @@ PostgreSQL 18, and three of the columns it describes do not exist here:
 `parallel_workers_to_launch` / `parallel_workers_launched` (PG18, which would
 have answered §15.2's worker-shortfall question directly -- `plan_extractor.
 parallel_shortfall` does it from the plan instead), and the `shared_blk_*_time`
-names, which are `blk_read_time` / `blk_write_time` in this version.
+names. They were `blk_read_time` / `blk_write_time` through PostgreSQL 16
+and are `shared_blk_read_time` / `shared_blk_write_time` from 17 on; this
+server now runs **1.12** on PostgreSQL 18, and the probe below picks
+whichever is present rather than assuming either.
 
 That is the third documentation-versus-installed mismatch in this project after
 `DisableIndex` and `pg_overexplain`. A column list is read from

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import os
 import re
 import pickle
@@ -36,6 +37,7 @@ from app.optimizer import calibration
 from app.optimizer.conformal import ConformalGate, sigma_scale
 from app.optimizer.features import build_feature_columns, featurize, to_vector
 from app.optimizer.ranker import PairwisePlanRanker
+from app.plan_extractor import count_disabled_nodes
 from app.plan_extractor import _extract_join_types, _extract_scan_relations, _extract_tables
 from app.schema_introspection import discover_table_cardinalities
 
@@ -128,8 +130,6 @@ def rows_without_disabled_plans(rows: list[dict]) -> tuple[list[dict], dict]:
 
     A PG16 row has no `Disabled` key anywhere and is kept untouched.
     """
-    from app.plan_extractor import count_disabled_nodes
-
     kept = []
     for row in rows:
         plan = row.get("raw_plan")
@@ -186,6 +186,31 @@ def rows_for_served_action_space(rows: list[dict]) -> tuple[list[dict], dict]:
 
 
 def _row_to_candidate(row: dict) -> dict:
+    """
+    Rebuild the candidate dict a served query would have held, from a log row.
+
+    `disabled_nodes` is on this list because leaving it off made the replay
+    blind to the one veto it could not model.
+
+    `plan_extractor.get_plan` sets it on every live plan; the log stores only
+    `raw_plan`, and this function reconstructed tables, scans and join types
+    from it but not the disabled count. `featurize` did not care -- it falls
+    back to counting the tree itself -- so the *feature* was always right and
+    nothing looked wrong. `learned._is_unsafe` reads the key directly, with no
+    fallback, so it saw `None` for every replayed candidate and the safety veto
+    could not fire in `app.calibrate` at all.
+
+    The gap that exposed it: on the deployed model's 8 held-out queries the
+    replay reported the deployed gate deviating twice for a net **+5.38%**,
+    while the benchmark measured **0.0%** captured, every run. Live, three of
+    those eight had the ranker's top pick vetoed for carrying `Disabled: true`
+    nodes -- a veto the replay had no way to apply, so it scored plans the
+    server would never serve.
+
+    On PG18 this matters more than it did on 16. 2.29 records that the version
+    removed `disable_cost`, so a forbidden plan no longer announces itself with
+    an astronomical cost and the flag is the only remaining signal.
+    """
     raw_plan = row["raw_plan"]
     return {
         "raw_plan": raw_plan,
@@ -195,6 +220,7 @@ def _row_to_candidate(row: dict) -> dict:
         "total_cost": row["total_cost"],
         "actual_total_time_ms": row["actual_total_time_ms"],
         "hint": row["hint"],
+        "disabled_nodes": count_disabled_nodes(raw_plan),
     }
 
 
@@ -301,10 +327,52 @@ def _relative_targets(rows: list[dict]) -> list[float]:
 
 
 def _discover_cardinalities() -> dict[str, float]:
-    """ANALYZE first so `pg_class.reltuples` reflects what was just loaded/collected,
-    then read it -- fast even on JOB-scale tables (see schema_introspection)."""
+    """
+    Row counts per table, refreshed before they are read.
+
+    `ANALYZE` first so `pg_class.reltuples` reflects what was just loaded or
+    collected, then read it -- fast even on JOB-scale tables (see
+    `schema_introspection`).
+
+    **The ANALYZE is best-effort, and that is a fix rather than sloppiness.** It
+    is a freshness improvement on a number that already exists: without it the
+    statistics are merely stale, and stale row counts move a feature slightly.
+    Losing the whole retrain is a far worse outcome than that, and it happened:
+
+        psycopg2.errors.InsufficientPrivilege:
+        could not open file "base/16384/16510": Permission denied
+
+    The cause is environmental rather than a database problem. This project
+    bind-mounts the PostgreSQL data directory onto a Windows filesystem so it
+    can be seen, copied and deleted like any other directory (README, "Where the
+    data lives"). Windows Defender's real-time scanner and the Search indexer
+    both open files under that directory, and a file open elsewhere is a file
+    PostgreSQL cannot open. It is intermittent, hits a different relation each
+    time, and clears on `wsl --shutdown`.
+
+    An hour of that failure taught the more expensive lesson: reaching for
+    `REINDEX` to route around a locked index file left the server unable to
+    start at all, because the commit went through, the unlink did not, and WAL
+    redo then replayed a commit referencing a file it could not open. Nothing
+    was lost, but a transient read error had been turned into an unbootable
+    database.
+
+    So: try to refresh, carry on without it if the filesystem says no, and say
+    so rather than failing silently. The durable fixes are a Defender exclusion
+    for the data directory or a Docker named volume, and both are the operator's
+    call rather than this function's.
+    """
     with get_cursor() as cur:
-        cur.execute("ANALYZE")
+        try:
+            cur.execute("ANALYZE")
+        except Exception as exc:  # noqa: BLE001 - freshness is not worth the run
+            print(
+                f"ANALYZE skipped ({type(exc).__name__}: {exc}). "
+                f"Row counts will come from existing statistics, which may be "
+                f"stale; training continues.",
+                file=sys.stderr,
+            )
+            cur.connection.rollback()
         return discover_table_cardinalities(cur)
 
 
@@ -399,7 +467,31 @@ def _evaluate_selection(
     model on a workload with little headroom from a bad model on a workload
     with lots. Reporting the gap between a policy and the oracle is the
     honest version of that claim.
+
+    ## The candidates are the ones a served query is offered
+
+    This scored `[_row_to_candidate(r) for r in rows]` -- every logged row,
+    the **baseline included**. Two problems, and they were the same two
+    `calibrate._servable` and `retrain._score_bundle` had (2.47), which makes
+    this the third place the log's action space was mistaken for the server's:
+
+    - Native is not a candidate. Serving calls
+      `select_plan(candidates, baseline_plan=native)`: the policy chooses among
+      candidates and the *gate* decides whether to use the choice. With native
+      in the pool a policy can score well by "picking" a plan it was never
+      offered, and the oracle -- the ceiling every headroom figure is divided by
+      -- silently becomes `min(candidates + [native])` instead of
+      `min(candidates)`.
+    - The log records everything ever collected, and collection explores wider
+      than serving does. `calibrate._servable` documents the cost: an
+      all-candidates replay had every gate losing 10-25% because it kept
+      choosing forced nested-loop plans the live path drops.
+
+    So `headroom_captured_vs_oracle`, which is the number `app.retrain` prints
+    and the dashboard shows, described an action space no query is given.
     """
+    from app.calibrate import _servable
+
     selectors = list(POLICIES) + (["pairwise_rank"] if ranker is not None else [])
     per_policy: dict[str, list[float]] = {p: [] for p in selectors}
     native_latencies, heuristic_latencies, oracle_latencies = [], [], []
@@ -411,7 +503,14 @@ def _evaluate_selection(
         if not baseline_rows:
             continue
 
-        candidates = [_row_to_candidate(r) for r in rows]
+        candidates = _servable([
+            _row_to_candidate(r) for r in rows if not r["is_baseline"]
+        ])
+        # `rows_without_disabled_plans` already ran upstream, but a bundle
+        # evaluated on rows from elsewhere should not quietly regain them.
+        candidates = [c for c in candidates if not c.get("disabled_nodes")]
+        if not candidates:
+            continue
         latencies = [c["actual_total_time_ms"] for c in candidates]
         costs = [c["total_cost"] or float("inf") for c in candidates]
 

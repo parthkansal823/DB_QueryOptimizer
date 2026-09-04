@@ -8,12 +8,18 @@ def _bundle(name):
 
 
 def _rows_by_query(latencies):
-    """One query, one candidate per latency."""
+    """One query, one candidate per latency.
+
+    The hints are real `Leading(...)` syntax rather than placeholders because
+    `_score_bundle` filters to the families a served query is actually offered
+    (`calibrate._servable`). A placeholder classifies as no family at all and is
+    dropped, which is the correct behaviour and would silently empty the
+    fixture."""
     return {
         "q1": [
             {
                 "query_id": "q1",
-                "hint": f"/*+ h{i} */",
+                "hint": f"/*+ Leading(a b{i}) */",
                 "is_baseline": False,
                 "raw_plan": {"Node Type": "Seq Scan", "Relation Name": "t", "Alias": "t", "Plan Rows": 1},
                 "total_cost": 10.0,
@@ -90,7 +96,9 @@ def test_scoring_picks_the_candidate_the_model_prefers(monkeypatch):
     monkeypatch.setattr(retrain, "featurize", lambda c, card: {"f": 0.0})
     monkeypatch.setattr(retrain, "to_vector", lambda f, cols: [0.0])
 
-    score = retrain._score_bundle(bundle, _rows_by_query([500.0, 20.0]))
+    score = retrain._score_bundle(
+        bundle, _rows_by_query([500.0, 20.0]), policy="greedy"
+    )
     assert score["mean_ms"] == 20.0
     # 20.0 is also the best candidate available, so the worst pick threw nothing
     # away. `worst_ratio_vs_best` is the number the old float score could not
@@ -114,7 +122,9 @@ def test_scoring_reports_how_bad_the_worst_pick_was(monkeypatch):
     monkeypatch.setattr(retrain, "featurize", lambda c, card: {"f": 0.0})
     monkeypatch.setattr(retrain, "to_vector", lambda f, cols: [0.0])
 
-    score = retrain._score_bundle(bundle, _rows_by_query([500.0, 20.0]))
+    score = retrain._score_bundle(
+        bundle, _rows_by_query([500.0, 20.0]), policy="greedy"
+    )
     assert score["mean_ms"] == 500.0
     assert score["worst_ratio_vs_best"] == pytest.approx(25.0)
 
@@ -231,3 +241,83 @@ def test_unscoreable_models_are_never_promoted(monkeypatch, patched_store):
     result = retrain.retrain_if_needed()
     assert result["action"] == "rejected"
     assert patched_store["current"] == "champ"
+
+
+# -- the served policy is one value, in one place ---------------------------
+
+
+def test_the_served_policy_is_the_shipped_default():
+    """
+    `served_policy()` reads `SELECTION_POLICY`, and for a long time nothing set
+    it where this function could see it.
+
+    `docker-compose.yml` set it on the backend service, so the variable existed
+    inside that container and nowhere else -- while `app.retrain` and
+    `app.calibrate` are run from the host. Promotion and gate calibration both
+    scored `greedy`; the server served `pairwise_rank`. Measured on 15 held-out
+    queries (docs/WRITEUP.md 2.43) those are not near-neighbours: `greedy` lands
+    at 104.1% of native and `pairwise_rank` at 95.1%, so the calibrated gate was
+    tuned against the one policy that loses.
+
+    The compose override is deleted and the default lives once. This asserts
+    the deletion stays deleted.
+    """
+    import os
+
+    from app.optimizer.learned import DEFAULT_SELECTION_POLICY
+
+    assert os.getenv("SELECTION_POLICY") is None, (
+        "this test describes the default; unset SELECTION_POLICY to run it"
+    )
+    assert retrain.served_policy() == DEFAULT_SELECTION_POLICY
+
+
+def test_the_dashboard_and_the_optimizer_name_the_same_default():
+    """`app.settings` restates the default as plain data for the settings UI,
+    which is exactly the shape of duplication 2.22 is about. It cannot import
+    the constant without a cycle, so the agreement is asserted instead."""
+    from app import settings
+    from app.optimizer.learned import DEFAULT_SELECTION_POLICY
+
+    assert settings.FIELDS["selection_policy"]["default"] == DEFAULT_SELECTION_POLICY
+
+
+def test_the_compose_file_does_not_reintroduce_the_override():
+    """The bug was not the value, it was naming it in a second place that only
+    half the system can read."""
+    import os
+    import re
+
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.yml")
+    text = open(path, encoding="utf-8").read()
+    uncommented = [
+        line for line in text.splitlines()
+        if re.match(r"\s*SELECTION_POLICY\s*:", line)
+    ]
+    assert uncommented == [], f"compose sets SELECTION_POLICY again: {uncommented}"
+
+
+def test_the_action_space_defaults_agree_between_settings_and_planner():
+    """
+    `app.settings.FIELDS` restates the planner's defaults as plain data for the
+    dashboard, which is exactly the duplication 2.22 is about: a constant that
+    duplicates a decision made elsewhere will eventually disagree with it.
+
+    It already had, twice. `selection_policy` said `greedy` while the container
+    served `pairwise_rank` (2.43), and `include_tuning` said True after the
+    planner had been measured better off without it (2.48). Neither disagreement
+    was detectable by running anything.
+    """
+    import os
+
+    from app.optimizer import planner
+    from app import settings
+
+    for env in ("INCLUDE_TUNING", "INCLUDE_JOIN_METHODS", "INCLUDE_PARALLEL"):
+        assert os.getenv(env) is None, f"unset {env} to run this test"
+
+    assert settings.FIELDS["include_tuning"]["default"] == planner.INCLUDE_TUNING
+    assert (
+        settings.FIELDS["include_join_methods"]["default"]
+        == planner.INCLUDE_JOIN_METHODS
+    )

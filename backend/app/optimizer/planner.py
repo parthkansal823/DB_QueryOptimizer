@@ -83,12 +83,33 @@ ENABLE_ROWS_CORRECTION = os.getenv("ENABLE_ROWS_CORRECTION", "1") != "0"
 INCLUDE_JOIN_METHODS = os.getenv("INCLUDE_JOIN_METHODS", "0") != "0"
 
 # Resource and cost-model candidates (`hints.TUNING_SETTINGS`): parallel worker
-# counts, work_mem, random_page_cost, join_collapse_limit. On by default,
-# unlike the join-method family, because it is five candidates rather than
-# twelve and because it reaches plans nothing else in the action space can --
-# no join order or operator toggle can give a hash join more memory or turn a
-# sequential scan parallel.
-INCLUDE_TUNING = os.getenv("INCLUDE_TUNING", "1") != "0"
+# counts, work_mem, random_page_cost, join_collapse_limit.
+#
+# **Off by default now, and the reason it was on is worth keeping.** The
+# argument was that it is five candidates rather than the join-method family's
+# twelve, and that it reaches plans nothing else in the action space can -- no
+# join order or operator toggle can give a hash join more memory or turn a
+# sequential scan parallel. Both halves are true and neither was ever measured
+# against the alternative.
+#
+# `app.autotune` measures it, because the action space is one axis of its sweep.
+# On the promoted model's 15 held-out queries, with `pairwise_rank` and the
+# gate swept freshly for each action space (2.48):
+#
+#     join_order + operator_toggle + cardinality             +10.51%
+#     ... + resource                                          +7.73%
+#     join_order + cardinality + resource        no gate qualified at all
+#
+# Roughly three points, and the third line is the sharper signal: with
+# `resource` in and `operator_toggle` out, *no* setting anywhere in the grid
+# cleared the safety bounds. A family that reaches plans nothing else can is
+# also a family that reaches plans nothing else can get wrong.
+#
+# The 41.3% / 45.7% held-out benchmark in 2.51 was run under this setting.
+# `INCLUDE_TUNING=1` restores the old behaviour, and `app.diagnostics` will then
+# report that the deployed action space no longer matches the one the gate in
+# models/gate.json was swept over.
+INCLUDE_TUNING = os.getenv("INCLUDE_TUNING", "0") != "0"
 
 # The families read off the pg_hint_plan reference and verified to bind against
 # this server (`Leading(((a b) (c d)))`, per-table scan methods and their

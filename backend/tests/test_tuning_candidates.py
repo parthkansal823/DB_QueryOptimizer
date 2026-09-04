@@ -159,11 +159,17 @@ def test_generate_candidates_keeps_it_opt_in():
 
 
 def test_the_setting_is_declared_for_the_dashboard():
+    """The declared default has to track the planner's, not a literal.
+
+    It asserted `is True` and the planner was measured better off at False
+    (2.48), so this test was pinning the stale half of a duplicated decision --
+    the 2.22 pattern the settings table keeps reproducing."""
     from app import settings as app_settings
+    from app.optimizer import planner
 
     field = app_settings.FIELDS["include_tuning"]
     assert field["type"] == "bool"
-    assert field["default"] is True
+    assert field["default"] == planner.INCLUDE_TUNING
 
 
 # -- putting confidence_z back into standard deviations ---------------------

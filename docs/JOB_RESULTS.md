@@ -136,3 +136,74 @@ Future work, not attempted here.
   evaluation would also want the with-and-without-indexes comparison that
   `data/schema.sql` suggests for the synthetic schema, since indexes directly
   affect how much headroom a learned optimizer has over the cost-based one.
+
+---
+
+## Re-run on PostgreSQL 18, 2026-09-04
+
+The `job` database did not survive the upgrade from PostgreSQL 16 and was
+reloaded from `data/job/csv` with `bash data/job/load_job.sh`: **8.7 GB, 73.0M
+live rows, 22 tables**, no errors. `app.collect_data_job` now runs from the host
+as well as from inside the backend container (`--query-dir`).
+
+Everything built since the result above -- shape coverage, the 59-query
+workload, the worst-case promotion metric, the PostgreSQL 18 features, and the
+six corrections in `WRITEUP.md` 2.42-2.50 -- had never been tested against real
+IMDB data.
+
+### The measurement
+
+30 smallest JOB queries requested, **14 collected** at the time of writing (the
+`17*` family times out repeatedly at 120 s per candidate and is still running):
+
+| | value |
+|---|---|
+| rows collected | 758 raw, 379 after median-aggregation |
+| queries | 14 |
+| held out | 4 |
+| features | 139 |
+| typical multiplicative error | **1.39x** |
+
+| selector | avg latency | headroom captured |
+|---|---|---|
+| native PostgreSQL | 185.3 ms | — |
+| heuristic (cost argmin) | 171.5 ms | — |
+| **oracle (best candidate)** | **151.0 ms** | 100% |
+| `learned_pairwise_rank` | 171.8 ms | **+39.3%** |
+| `learned_greedy` | 173.1 ms | +35.4% |
+| `learned_risk_averse` | 173.1 ms | +35.4% |
+| `learned_thompson` | 192.0 ms | **-19.5%** |
+
+**This is the first non-zero capture this project has recorded on real IMDB
+data.** The run above had every selector returning the native plan to the second
+decimal place.
+
+### What it does not establish, stated plainly
+
+**The two held-out sets are not comparable.** The earlier run's two held-out
+queries averaged **3703 ms** native; these four average **185 ms** -- a factor
+of twenty. Both runs asked for the "smallest" JOB queries by alias count, and
+which ones landed in the held-out quarter differs. So this is a *new*
+measurement on JOB, not a like-for-like re-run, and **the headline result above
+-- 75% of the headroom available on expensive queries, 0% of it captured -- has
+not been retested.**
+
+Retesting it needs the collection to finish, so that the held-out quarter
+includes the expensive queries. That is running; the `17*` family is slow enough
+that most of its candidates hit the 120 s statement timeout and are skipped,
+which is correct behaviour (a candidate twenty times slower than native is not a
+candidate) and expensive to discover.
+
+**Four held-out queries is still too few**, for the reason this file already
+gives about two: a rate over four queries moves in steps of 25%.
+
+**`thompson` losing 19.5% is consistent with the earlier finding** that on
+data-starved JOB every policy trusting its own point predictions collapses --
+and `pairwise_rank` leading here, rather than `risk_averse`, is a genuine
+difference from the 2.5 result worth re-checking once the collection completes.
+
+### Status
+
+Non-zero on real data, on the easy end of the benchmark, with a sample too small
+to lean on. Better than the previous result and not yet the answer to the
+question the previous result posed.

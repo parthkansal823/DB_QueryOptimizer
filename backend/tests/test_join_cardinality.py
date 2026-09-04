@@ -234,6 +234,7 @@ def test_without_a_corrector_the_action_space_adds_nothing():
     reason -- so every difference has to come with a proof, which is what
     `is_provable_noop` returns.
     """
+    from app.optimizer import planner as planner_module
     from app.optimizer.hints import generate_candidates
     from app.optimizer.planner import candidate_hints
     from app.optimizer.prefilter import is_provable_noop
@@ -241,7 +242,12 @@ def test_without_a_corrector_the_action_space_adds_nothing():
     plan = _join([_scan("a", 100), _scan("b", 100)], 10)
     baseline = _baseline(plan)
     served = candidate_hints(_Optimizer(), baseline, ["a", "b"])
-    generated = generate_candidates(["a", "b"], include_tuning=True)
+    # Generated under whatever the planner's own default is, so the comparison
+    # keeps testing "serving invents nothing and drops nothing unproven" rather
+    # than silently testing "the tuning family is on" (2.48 turned it off).
+    generated = generate_candidates(
+        ["a", "b"], include_tuning=planner_module.INCLUDE_TUNING
+    )
 
     assert set(served) <= set(generated), "serving must not invent candidates"
     for hint in set(generated) - set(served):

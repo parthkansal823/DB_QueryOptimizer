@@ -280,3 +280,134 @@ def test_applying_a_change_keeps_the_guard_s_measured_history(boot):
     assert main.guard.tolerance == 0.5
     assert main.guard.blocked == {"q1": {"regression_ratio": 1.4}}
     assert main.guard.observations == {"q1": 5}
+
+
+# -- every declared setting has to reach something --------------------------
+
+
+# Settings that legitimately do not appear in `_apply_settings`, with the reason.
+# Anything not here and not applied is a setting the dashboard shows and the
+# running system ignores.
+NOT_APPLIED_AT_SERVE_TIME = {
+    # Read by `app.train` when the conformal gate is fitted; changing it takes
+    # effect on the next training run, not on the next query.
+    "conformal_alpha",
+    # Forwarded through `_optimizer_from` rather than assigned to a module.
+    "selection_policy",
+    "risk_lambda",
+    "max_regression_ratio",
+    "confidence_z",
+    "min_relative_gain",
+    "gate_mode",
+}
+
+
+def test_every_declared_setting_is_actually_applied():
+    """
+    `group_by_template` was declared, given six lines of help text, shown in the
+    dashboard -- and inert. `logging_store` reads `GROUP_BY_TEMPLATE` from the
+    environment once at import; the settings panel writes models/settings.json,
+    which that module never consults. Toggling it did nothing at all.
+
+    This is the same shape as the conformal gate fitted on every training run
+    and consulted on none (WRITEUP 2.42) and the swept `gate_mode` the API
+    ignored (2.50): correct code that nothing reaches. The audit question that
+    keeps finding them is "is this reached", not "is this correct", so it is
+    worth having one test that asks it mechanically.
+    """
+    import inspect
+
+    from app import main, settings
+
+    applied = inspect.getsource(main._apply_settings)
+    constructed = inspect.getsource(main._optimizer_from)
+
+    missing = [
+        name
+        for name in settings.FIELDS
+        if name not in NOT_APPLIED_AT_SERVE_TIME
+        and f'values["{name}"]' not in applied
+        and f'"{name}"' not in constructed
+    ]
+
+    assert missing == [], (
+        f"declared in the settings panel but never applied: {missing}. Either "
+        f"wire them into `_apply_settings` or add them to "
+        f"NOT_APPLIED_AT_SERVE_TIME with a reason."
+    )
+
+
+def test_the_exemptions_all_name_real_settings():
+    """An exemption for a field that no longer exists would silently re-open the
+    hole it was carved for."""
+    from app import settings
+
+    assert NOT_APPLIED_AT_SERVE_TIME <= set(settings.FIELDS)
+
+
+def test_grouping_by_template_reaches_the_module_that_reads_it():
+    from app import logging_store, main, settings
+
+    values = dict(settings.defaults())
+    original = logging_store.GROUP_BY_TEMPLATE
+    try:
+        values["group_by_template"] = not original
+        main._apply_settings(values)
+        assert logging_store.GROUP_BY_TEMPLATE == (not original)
+    finally:
+        logging_store.GROUP_BY_TEMPLATE = original
+
+
+# -- the panel must not report a value the optimizer overrode ---------------
+
+
+def test_the_settings_endpoint_reports_what_is_actually_in_force(monkeypatch):
+    """
+    `confidence_z` and `min_relative_gain` default to 1.0 and 0.05 in
+    `app.settings`, and `LearnedOptimizer` overrides both with
+    `models/gate.json` unless someone explicitly chose them. So `GET /settings`
+    read **z = 1.0** while the running gate was **1.5**, with no way to tell.
+
+    This module's header describes that exact failure -- the panel reporting one
+    configuration while the process runs another -- as fixed. It was, in the
+    direction where the panel wrongly *won*. This is the same bug in the
+    direction where the calibration correctly wins and the panel does not say so.
+    """
+    from app import main
+
+    class _Optimizer:
+        confidence_z = 1.5
+        min_relative_gain = 0.02
+        gate_mode = "fixed_z"
+        policy = "pairwise_rank"
+        gate_calibration = {"confidence_z": 1.5}
+        model = None
+
+    monkeypatch.setattr(main, "optimizer", _Optimizer(), raising=False)
+
+    body = main.get_settings()
+
+    assert body["in_force"]["confidence_z"] == 1.5
+    assert "confidence_z" in body["overridden"]
+    assert body["gate_source"] == "models/gate.json"
+
+
+def test_nothing_is_reported_as_overridden_when_the_panel_agrees(monkeypatch):
+    from app import main, settings
+
+    values = settings.current()
+
+    class _Optimizer:
+        confidence_z = values["confidence_z"]
+        min_relative_gain = values["min_relative_gain"]
+        gate_mode = values["gate_mode"]
+        policy = values["selection_policy"]
+        gate_calibration = None
+        model = None
+
+    monkeypatch.setattr(main, "optimizer", _Optimizer(), raising=False)
+
+    body = main.get_settings()
+
+    assert body["overridden"] == []
+    assert body["gate_source"] is None

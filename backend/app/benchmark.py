@@ -24,7 +24,7 @@ from app.logging_store import log_execution
 from app.optimizer.bandit import POLICIES
 from app.optimizer.hints import apply_hint, plan_fingerprint
 from app.optimizer.planner import candidate_hints
-from app.optimizer.learned import LearnedOptimizer
+from app.optimizer.learned import DEFAULT_SELECTION_POLICY, LearnedOptimizer
 from app.optimizer.regression_guard import RegressionGuard
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
@@ -58,7 +58,7 @@ def _held_out_ids(optimizer) -> set[str]:
 
 
 def run(
-    policy: str = "greedy",
+    policy: str = DEFAULT_SELECTION_POLICY,
     risk_lambda: float = 1.0,
     use_guard: bool = True,
     quiet: bool = False,
@@ -105,6 +105,8 @@ def run(
     held_out = _held_out_ids(optimizer)
     held_native = held_served = held_oracle = 0.0
     n_held_out = 0
+    n_curated = 0
+    cur_native = cur_served = cur_oracle = 0.0
 
     with get_cursor() as cur:
         cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
@@ -186,6 +188,13 @@ def run(
                 held_served += served_plan["actual_total_time_ms"]
                 held_oracle += best
 
+            # The curated half, reported separately -- see `_CURATED_NOTE`.
+            if not query_id.startswith("gen_"):
+                n_curated += 1
+                cur_native += baseline["actual_total_time_ms"]
+                cur_served += served_plan["actual_total_time_ms"]
+                cur_oracle += best
+
             say(f"--- {query_id} ({len(candidates)} candidates) ---")
             say(f"baseline (native Postgres): {baseline['actual_total_time_ms']:.2f} ms")
             say(f"served   ({selector_mode} path):    {served_plan['actual_total_time_ms']:.2f} ms")
@@ -240,9 +249,41 @@ def run(
         say("this model does not record which queries it held out, so none of")
         say("the above can be separated into seen and unseen. Retrain to fix.")
 
+    # 27 of the 59 workload queries were generated and then kept *because* the
+    # best plan in the served action space beat native by at least 8%. That was
+    # the right rule for training coverage -- a query with nowhere to go teaches
+    # nothing -- but it means the headline percentage is measured partly on a
+    # benchmark selected for having something to capture.
+    #
+    # The 18 correlation traps and 6 controls were written by hand against a
+    # mechanism (PostgreSQL's independence assumption) and were never filtered
+    # on whether this optimizer could win them. That subset is the one to quote
+    # when the question is "does this work", and the difference between the two
+    # numbers is the size of the selection effect.
+    cur_headroom = cur_native - cur_oracle
+    cur_captured = (
+        (cur_native - cur_served) / cur_headroom * 100 if cur_headroom > 0 else None
+    )
+    if n_curated and n_curated != len(workload):
+        say("")
+        say(f"--- of those, {n_curated} written by hand, not generated ---")
+        say(f"native total:        {cur_native:.2f} ms")
+        say(f"served total:        {cur_served:.2f} ms")
+        if cur_captured is not None:
+            say(f"captured {cur_captured:.1f}% of the {cur_headroom:.0f} ms available headroom")
+        say("the generated queries were kept only if they had headroom to begin")
+        say("with, so this subset is the one free of that selection.")
+
     return {
         "policy": policy,
         "guard": use_guard,
+        # Curated = hand-written traps and controls, never filtered on whether
+        # the optimizer could win them.
+        "n_curated": n_curated,
+        "curated_native_ms": cur_native,
+        "curated_served_ms": cur_served,
+        "curated_oracle_ms": cur_oracle,
+        "curated_captured_pct": cur_captured,
         "native_ms": native_total,
         "served_ms": served_total,
         "oracle_ms": oracle_total,
@@ -330,6 +371,11 @@ def _summarise(results: list[dict], protocol: str, repeat: int) -> None:
 
     captured = [r["captured_pct"] for r in results]
     held = [r["held_out_captured_pct"] for r in results if r.get("n_held_out")]
+    curated = [
+        r["curated_captured_pct"]
+        for r in results
+        if r.get("n_curated") and r.get("curated_captured_pct") is not None
+    ]
 
     spec = PROTOCOLS[protocol]
     print(f"\n=== protocol: {protocol} ({repeat} run{'s' if repeat != 1 else ''}) ===")
@@ -351,6 +397,7 @@ def _summarise(results: list[dict], protocol: str, repeat: int) -> None:
 
     line("headroom captured", captured)
     line("held-out captured", held)
+    line("curated only", curated)
 
     if len(captured) > 1:
         spread = max(captured) - min(captured)
@@ -362,7 +409,14 @@ def _summarise(results: list[dict], protocol: str, repeat: int) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy", choices=list(POLICIES) + ["pairwise_rank"], default="greedy")
+    # Defaults to what the deployment serves. `greedy` was the default here
+    # while the container ran `pairwise_rank`, so every published benchmark
+    # number measured a policy nobody uses -- and the two differ in sign on
+    # held-out queries (2.43).
+    parser.add_argument(
+        "--policy", choices=list(POLICIES) + ["pairwise_rank"],
+        default=DEFAULT_SELECTION_POLICY,
+    )
     parser.add_argument("--risk-lambda", type=float, default=1.0)
     parser.add_argument(
         "--protocol",

@@ -22,8 +22,17 @@ import TrainingPanel from "./components/TrainingPanel";
  * `app/settings.py` makes it appear with no frontend change, and removing one
  * cannot leave a control here pointing at something that no longer exists.
  */
-function Field({ field, value, onChange, disabled }) {
+function Field({ field, value, onChange, disabled, inForce }) {
   const id = `setting-${field.name}`;
+  // What the running optimizer holds, when it differs from the value shown.
+  //
+  // `confidence_z` and `min_relative_gain` default to 1.0 and 0.05 here, and
+  // the optimizer overrides both with the measured gate in models/gate.json
+  // unless someone explicitly chose them. So this panel read z = 1.0 while the
+  // gate in force was 1.5, and nothing said so -- the panel reporting one
+  // configuration while the process runs another, which is the failure
+  // `app/main.py` documents at length.
+  const overridden = inForce !== undefined && inForce !== null && inForce !== value;
 
   return (
     <div className="setting-row">
@@ -65,6 +74,14 @@ function Field({ field, value, onChange, disabled }) {
           disabled={disabled}
           onChange={(e) => onChange(field.name, e.target.value)}
         />
+      )}
+
+      {overridden && (
+        <p className="setting-help setting-overridden">
+          <strong>In force: {String(inForce)}</strong> — the measured gate in{" "}
+          <code>models/gate.json</code> is being applied instead of this value.
+          Changing this setting overrides the calibration.
+        </p>
       )}
 
       <p className="setting-help">{field.help}</p>
@@ -349,6 +366,7 @@ export default function DashboardPage() {
                 key={field.name}
                 field={field}
                 value={settings.values[field.name]}
+                inForce={settings.in_force?.[field.name]}
                 onChange={handleChange}
                 disabled={busy}
               />

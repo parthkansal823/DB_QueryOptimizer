@@ -297,3 +297,51 @@ describe("training", () => {
     expect(await screen.findByText(/plan_execution_log is empty/)).toBeInTheDocument();
   });
 });
+
+describe("settings the optimizer overrode", () => {
+  // `confidence_z` and `min_relative_gain` default to 1.0 and 0.05 in
+  // app/settings.py, and LearnedOptimizer overrides both with the measured gate
+  // in models/gate.json unless someone explicitly chose them. The panel read
+  // 0.05 while the gate in force was 0.02, and said nothing -- the panel
+  // reporting one configuration while the process runs another, which is the
+  // failure app/main.py documents at length.
+  it("says which value is actually being applied", async () => {
+    api.fetchSettings.mockResolvedValue({
+      ...SETTINGS,
+      in_force: { min_relative_gain: 0.02, selection_policy: "greedy" },
+      overridden: ["min_relative_gain"],
+      gate_source: "models/gate.json",
+    });
+
+    render(<DashboardPage />);
+    await openSettingsGroup("Safety gate");
+
+    expect(await screen.findByText(/In force: 0.02/)).toBeInTheDocument();
+    expect(screen.getByText(/models\/gate\.json/)).toBeInTheDocument();
+  });
+
+  it("stays quiet when the panel and the optimizer agree", async () => {
+    api.fetchSettings.mockResolvedValue({
+      ...SETTINGS,
+      in_force: { min_relative_gain: 0.05, selection_policy: "greedy" },
+      overridden: [],
+      gate_source: null,
+    });
+
+    render(<DashboardPage />);
+    await openSettingsGroup("Safety gate");
+
+    await screen.findByLabelText("Minimum predicted speedup");
+    expect(screen.queryByText(/In force:/)).not.toBeInTheDocument();
+  });
+
+  it("does not break against a backend that predates the field", async () => {
+    api.fetchSettings.mockResolvedValue(SETTINGS);
+
+    render(<DashboardPage />);
+    await openSettingsGroup("Safety gate");
+
+    await screen.findByLabelText("Minimum predicted speedup");
+    expect(screen.queryByText(/In force:/)).not.toBeInTheDocument();
+  });
+});

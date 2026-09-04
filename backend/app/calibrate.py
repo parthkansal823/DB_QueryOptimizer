@@ -67,11 +67,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
+
+from datetime import datetime, timezone
 import os
 
 from app.optimizer.regression_guard import UNSEEN_QUERY_CAUTION
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
+from app.optimizer.learned import DEFAULT_SELECTION_POLICY
+from app.retrain import served_policy
 from app.train import _aggregate_repetitions, _load_rows, _row_to_candidate
 
 GATE_PATH = "models/gate.json"
@@ -86,6 +91,35 @@ MIN_RELATIVE_GAIN_GRID = [0.0, 0.02, 0.05, 0.10, 0.20]
 
 
 def _load_bundle(path: str = "models/plan_selector.pkl") -> dict:
+    """
+    Load a model bundle -- by default the deployed one, but not necessarily.
+
+    The path is a parameter because hardcoding the deployed model created a
+    deadlock, and it is worth naming because it took a while to see:
+
+    - the gate is calibrated on the queries the model held out
+      (`_held_out_queries`), because scoring a gate on queries the model fitted
+      makes any gate look safe;
+    - a model's held-out list lives inside its own bundle;
+    - so calibration always described whatever model was *deployed*.
+
+    That is correct while the deployed model is the only one. It stops being
+    correct the moment a challenger is trained and rejected. 2.37 found the
+    gate taking 0.0% of held-out headroom across eleven runs and traced it to a
+    sweep run over 8 queries -- a grid finer than its own resolution. The fix
+    was a larger workload, and a 59-query model was duly trained with 15 held
+    out. `app.retrain` then rejected it on worst-case regression (2.40), which
+    is the promotion rule working as designed. But rejecting the model also
+    withheld its held-out list, so the gate stayed calibrated on 8 queries: the
+    fix for the measurement problem was blocked by an unrelated verdict on the
+    model, and the two have no reason to be coupled.
+
+    A gate setting is a property of a model's error distribution, so a
+    challenger should be calibrated with its own held-out queries before being
+    judged -- and judging it under the incumbent's gate is its own small
+    train/serve skew. Passing `--bundle models/_challenger.pkl` makes that
+    possible without promoting anything.
+    """
     import pickle
 
     with open(path, "rb") as f:
@@ -181,7 +215,7 @@ def _grouped_rows(exclude_prefix: str | None = None) -> dict[str, list[dict]]:
     return grouped
 
 
-def _servable(candidates: list[dict]) -> list[dict]:
+def _servable(candidates: list[dict], allowed: "set[str] | None" = None) -> list[dict]:
     """
     Keep only the candidates a served query would actually be offered.
 
@@ -205,13 +239,51 @@ def _servable(candidates: list[dict]) -> list[dict]:
     from app.optimizer import planner
     from app.optimizer.regression_guard import hint_family
 
-    allowed = {"join_order", "operator_toggle", "cardinality"}
-    if planner.INCLUDE_TUNING:
-        allowed.add("resource")
-    if planner.INCLUDE_JOIN_METHODS:
-        allowed.add("join_method")
+    if allowed is None:
+        # The families the *current* deployment offers. `app.autotune` passes an
+        # explicit set instead, because "which action space is best" is a
+        # question you cannot ask by reading the answer off the configuration
+        # you are trying to choose.
+        allowed = {"join_order", "operator_toggle", "cardinality"}
+        if planner.INCLUDE_TUNING:
+            allowed.add("resource")
+        if planner.INCLUDE_JOIN_METHODS:
+            allowed.add("join_method")
 
     return [c for c in candidates if hint_family(c.get("hint")) in allowed]
+
+
+# A regression smaller than this many milliseconds does not count towards the
+# worst-case bound.
+#
+# `max_worst_regression` is a pure ratio, and a ratio is blind to magnitude in
+# both directions. Measured on the challenger's 15 held-out queries under the
+# served policy (2.44), the bound behaved like this:
+#
+#     ctl_supplier_rating       7.8 ->   13.2 ms   1.70x   REFUSED the whole gate
+#     shape_top_n_orders      514.4 ->  627.1 ms   1.22x   admitted
+#
+# The first is a **5.4 ms** regression on a query that runs in under ten
+# milliseconds, and it was vetoing a gate worth **+188 ms**. The second is a
+# **113 ms** regression and passes. The rule the bound is meant to encode --
+# "one user-facing query getting much slower outweighs a diffuse average win"
+# -- ranks these two exactly the wrong way round.
+#
+# 10 ms is a judgement, not a measurement, and it is stated as one: below it, a
+# regression is not something a person waiting on a query can perceive.
+#
+# What *is* measured is that the choice is not delicately poised. Sweeping the
+# floor from 0 to 200 ms, the recommendation changes at exactly one point --
+# 5.4 ms, the size of the `ctl_supplier_rating` regression -- and is identical
+# everywhere above it:
+#
+#     floor <= 5.4 ms   z=1.00 gain=0.20   net +0.89%   (declines almost everything)
+#     floor >= 5.5 ms   z=2.00 gain=0.02   net +3.29%   worst regression 5.4 ms
+#
+# So any value from ~6 ms to 200 ms gives the same gate, and that gate's worst
+# regression is the 5.4 ms one -- there is no second, larger regression waiting
+# behind the first. Setting the floor to 0 restores the old behaviour exactly.
+MIN_REGRESSION_MS = 10.0
 
 
 def evaluate_setting(
@@ -219,11 +291,34 @@ def evaluate_setting(
     bundle: dict,
     confidence_z: float,
     min_relative_gain: float,
-    policy: str = "greedy",
+    # Defaults to the served policy rather than to a literal -- 2.43. A
+    # measurement taken under a policy the deployment does not run is a
+    # measurement of something else, however carefully it is taken.
+    policy: str = DEFAULT_SELECTION_POLICY,
     max_regression_ratio: float = 1.25,
     caution: float = UNSEEN_QUERY_CAUTION,
+    gate_mode: str = "fixed_z",
+    min_regression_ms: float = MIN_REGRESSION_MS,
+    allowed_families: "set[str] | None" = None,
+    seed: int = 0,
 ) -> dict:
     model = bundle["model"]
+    conformal = bundle.get("conformal") if gate_mode == "conformal" else None
+    if gate_mode == "conformal" and not getattr(conformal, "fitted", False):
+        # A bundle from before the gate existed cannot be scored under it.
+        # Returning fixed_z numbers labelled "conformal" would be worse.
+        raise ValueError("this bundle has no fitted conformal gate to score")
+    if policy == "pairwise_rank" and bundle.get("ranker") is None:
+        # The loop below used to `continue` past every query in this case, which
+        # returns `n_queries=0` with a 0% deviation rate, a 0% regression rate
+        # and a 1.00x worst case -- a flawless gate, computed from nothing. That
+        # is the shape of bug this file has now been bitten by three times
+        # (apply_gate's null metrics, the conformal fallback above), so it is an
+        # error rather than an empty result.
+        raise ValueError(
+            "this bundle has no ranker, so it cannot be scored under "
+            "pairwise_rank; pass an explicit policy or retrain"
+        )
     feature_columns = bundle["feature_columns"]
     cardinalities = bundle["table_cardinalities"]
     ratio_target = bundle.get("target") == "log_ratio_vs_native"
@@ -234,6 +329,9 @@ def evaluate_setting(
     # says how often; this says whether "occasionally slower" means 5% or 6x,
     # and those are not the same risk.
     worst_regression_ratio = 1.0
+    # Reported alongside the ratio, because the two disagree about which
+    # regression is the bad one and a reader needs to see both.
+    worst_regression_ms = 0.0
 
     for rows in grouped.values():
         baselines = [r for r in rows if r["is_baseline"]]
@@ -243,7 +341,19 @@ def evaluate_setting(
 
         native_ms = baselines[0]["actual_total_time_ms"]
         candidates = [_row_to_candidate(r) for r in candidates_rows]
-        candidates = _servable(candidates)
+        candidates = _servable(candidates, allowed_families)
+        if not candidates:
+            continue
+        # The safety veto, which the replay could not previously apply because
+        # `_row_to_candidate` did not reconstruct `disabled_nodes` from the
+        # logged plan. Serving discards a chosen plan carrying `Disabled: true`
+        # nodes outright (`learned._is_unsafe`) -- on PG18 that flag is the only
+        # remaining signal, since 2.29 removed `disable_cost` -- so a replay
+        # that scores those candidates is scoring plans no query is ever
+        # served. Measured: the deployed gate replayed at +5.38% on 8 held-out
+        # queries while the benchmark captured 0.0%, because three of the eight
+        # had the ranker's top pick vetoed for exactly this.
+        candidates = [c for c in candidates if not c.get("disabled_nodes")]
         if not candidates:
             continue
         latencies = [c["actual_total_time_ms"] for c in candidates]
@@ -262,7 +372,18 @@ def evaluate_setting(
             costs = [c["total_cost"] or float("inf") for c in candidates]
             best_i = ranker.select(vectors, tie_break_costs=costs)
         else:
-            best_i, _ = select_index(model, vectors, policy=policy)
+            # Seeded, because `thompson` samples an ensemble member and an
+            # unseeded replay is one draw dressed up as a measurement. Measured
+            # on 15 held-out queries, three identical `thompson` sweeps
+            # returned +14.16%, +10.61% and +12.33% and recommended a different
+            # `confidence_z` each time -- while `pairwise_rank`, which is
+            # deterministic, returned +10.51% every time. Comparing a max over
+            # noise against an exact value hands the win to whichever policy is
+            # noisiest. `app.autotune` repeats the stochastic ones and reads the
+            # median; this makes each repeat reproducible.
+            best_i, _ = select_index(
+                model, vectors, policy=policy, rng=random.Random(seed)
+            )
 
         if ratio_target:
             # Raw spread, matching what the served gate now spends `z` on --
@@ -289,7 +410,17 @@ def evaluate_setting(
             required = 1.0 - min_relative_gain * caution
             ceiling = 1.0 + (max_regression_ratio - 1.0) / max(caution, 1e-9)
             expected = math.exp(means[best_i])
-            pessimistic = math.exp(means[best_i] + confidence_z * caution * stds[best_i])
+            if conformal is not None:
+                # `learned._upper_bound`'s shape exactly: caution scales the
+                # *margin*, not the spread, because an absolute bound ignores
+                # `std` and `std * caution` would quietly drop the extra
+                # protection an unseen query is meant to get.
+                bound = conformal.upper_bound(means[best_i], stds[best_i])
+                pessimistic = math.exp(means[best_i] + (bound - means[best_i]) * caution)
+            else:
+                pessimistic = math.exp(
+                    means[best_i] + confidence_z * caution * stds[best_i]
+                )
             deviate = expected < required and pessimistic < ceiling
         else:
             # Legacy absolute-latency bundles: compare against native's own
@@ -303,8 +434,13 @@ def evaluate_setting(
             served = latencies[best_i]
             if served > native_ms:
                 n_regressed += 1
-                if native_ms > 0:
+                # Counted in the *rate* whatever its size -- that question is
+                # "how often" -- but only in the worst-case *ratio* once it is
+                # large enough to matter in absolute terms. See
+                # MIN_REGRESSION_MS.
+                if native_ms > 0 and (served - native_ms) >= min_regression_ms:
                     worst_regression_ratio = max(worst_regression_ratio, served / native_ms)
+                worst_regression_ms = max(worst_regression_ms, served - native_ms)
         else:
             served = native_ms
         served_total += served
@@ -312,6 +448,7 @@ def evaluate_setting(
     return {
         "confidence_z": confidence_z,
         "min_relative_gain": min_relative_gain,
+        "gate_mode": gate_mode,
         "n_queries": n_queries,
         "deviation_rate": (n_deviated / n_queries) if n_queries else 0.0,
         # Share of *deviations* that turned out slower than native. The
@@ -324,6 +461,7 @@ def evaluate_setting(
         if native_total
         else 0.0,
         "worst_regression_ratio": worst_regression_ratio,
+        "worst_regression_ms": worst_regression_ms,
     }
 
 
@@ -375,11 +513,18 @@ def _dominates(candidate: dict, incumbent: dict | None) -> bool:
 
 
 def sweep(
-    policy: str = "greedy",
+    # Defaults to the served policy rather than to a literal -- 2.43. A
+    # measurement taken under a policy the deployment does not run is a
+    # measurement of something else, however carefully it is taken.
+    policy: str = DEFAULT_SELECTION_POLICY,
     max_regression_rate: float = 0.25,
     max_worst_regression: float = 1.25,
     caution: float = UNSEEN_QUERY_CAUTION,
     exclude_prefix: str | None = None,
+    bundle_path: str = "models/plan_selector.pkl",
+    min_regression_ms: float = MIN_REGRESSION_MS,
+    allowed_families: "set[str] | None" = None,
+    seed: int = 0,
 ) -> dict:
     """
     Grid-sweep the gate and recommend a setting.
@@ -404,18 +549,52 @@ def sweep(
     much looser sanity check on frequency. Together they say "a few small
     losses are an acceptable price for many wins; one large loss is not", which
     is what the project actually believes.
+
+    ## Why the bound's *form* is swept too, and not chosen
+
+    `conformal` has been implemented, fitted by `app.train` and reachable via
+    `GATE_MODE` for a long time, and in that whole time nothing measured it --
+    the default stayed `fixed_z` with a note saying a change of method should be
+    settled by measurement rather than by editing a default. That note was
+    right and nobody acted on it, so the method sat unmeasured behind an
+    environment variable, which is the same as not having it.
+
+    It is an axis of the grid now, and 2.42 records what fell out: on 15
+    held-out queries `fixed_z`'s net swung from -4.04% to +1.17% depending on
+    `min_relative_gain`, while `conformal` returned +1.10% at every value of it
+    with a worst case of 1.07x against `fixed_z`'s 1.73x. Given that 2.32 could
+    not resolve a 4-point difference by execution, a bound insensitive to a
+    knob nobody can tune is worth more than a slightly higher number that
+    depends on tuning it.
+
+    Bundles with no fitted conformal gate simply contribute no conformal rows,
+    so this stays backward-compatible with every pickle already on disk.
     """
     grouped = _grouped_rows(exclude_prefix=exclude_prefix)
-    bundle = _load_bundle()
+    bundle = _load_bundle(bundle_path)
 
     held_out = _held_out_queries(bundle, grouped)
     scored = {qid: rows for qid, rows in grouped.items() if qid in held_out} if held_out else grouped
 
-    results = [
-        evaluate_setting(scored, bundle, z, g, policy=policy, caution=caution)
-        for z in CONFIDENCE_Z_GRID
-        for g in MIN_RELATIVE_GAIN_GRID
-    ]
+    modes = ["fixed_z"]
+    if getattr(bundle.get("conformal"), "fitted", False):
+        modes.append("conformal")
+
+    results = []
+    for mode in modes:
+        # `confidence_z` does nothing under `conformal` -- the bound comes from
+        # the calibrated quantile. Sweeping it anyway would print 10 identical
+        # rows and make the table lie about which knobs matter.
+        z_grid = CONFIDENCE_Z_GRID if mode == "fixed_z" else (0.0,)
+        results.extend(
+            evaluate_setting(
+                scored, bundle, z, g, policy=policy, caution=caution,
+                gate_mode=mode, min_regression_ms=min_regression_ms,
+                allowed_families=allowed_families, seed=seed,
+            )
+            for z in z_grid
+            for g in MIN_RELATIVE_GAIN_GRID
+        )
 
     # Only consider settings that actually optimize something -- a gate that
     # never fires has a perfect (vacuous) regression rate.
@@ -432,6 +611,7 @@ def sweep(
         "max_worst_regression": max_worst_regression,
         "caution": caution,
         "excluded_prefix": exclude_prefix,
+        "allowed_families": sorted(allowed_families) if allowed_families else None,
         "n_settings_tested": len(results),
         # Which queries the gate was chosen on, and whether the model had
         # already seen them. A gate tuned on the queries the model trained on
@@ -604,7 +784,10 @@ MEASURED_GRID: tuple[dict, ...] = (
 
 
 def measure_settings(
-    policy: str = "greedy",
+    # Defaults to the served policy rather than to a literal -- 2.43. A
+    # measurement taken under a policy the deployment does not run is a
+    # measurement of something else, however carefully it is taken.
+    policy: str = DEFAULT_SELECTION_POLICY,
     grid: tuple[dict, ...] = MEASURED_GRID,
     limit: int | None = None,
 ) -> list[dict]:
@@ -708,8 +891,23 @@ def apply_gate(setting: dict, path: str = GATE_PATH, provenance: dict | None = N
     must not look the same to whoever reads this next.
     """
     payload = {
+        # When this gate started applying.
+        #
+        # `expected_regression_rate` is a prediction, and `app.diagnostics`
+        # checks it against what the system has since done. Without a timestamp
+        # that check has no idea *which* gate produced the history it is
+        # reading: immediately after a recalibration it compared a brand-new
+        # gate's promise of 20% against 31% observed over 1310 runs served under
+        # the previous gate, the previous model and the previous policy, and
+        # reported the new gate as already broken.
+        "applied_at": datetime.now(timezone.utc).isoformat(),
         "confidence_z": setting["confidence_z"],
         "min_relative_gain": setting["min_relative_gain"],
+        # Without this, `--apply` writes thresholds swept under one bound
+        # and the server applies them under another -- the calibration
+        # would describe a gate nobody runs, which is exactly the failure
+        # 2.28 already had once with the selection policy.
+        "gate_mode": setting.get("gate_mode", "fixed_z"),
         "calibrated_on_n_queries": setting.get("n_queries"),
         "expected_deviation_rate": setting.get("deviation_rate"),
         "expected_regression_rate": setting.get("regression_rate"),
@@ -730,12 +928,28 @@ def load_gate(path: str = GATE_PATH) -> dict | None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy", default="greedy",
-                        choices=["greedy", "thompson", "risk_averse", "pairwise_rank"])
+    parser.add_argument(
+        # Defaults to what the server serves, not to a literal. Sweeping
+        # `greedy` while the deployment runs `pairwise_rank` produced a gate
+        # calibrated for a selection process nobody runs -- and the two
+        # policies do not merely differ, they differ in sign (2.43).
+        "--policy", default=served_policy(),
+        choices=["greedy", "thompson", "risk_averse", "pairwise_rank"],
+        help="selection policy to sweep the gate under (default: the served one)",
+    )
     parser.add_argument("--max-regression-rate", type=float, default=0.25)
     parser.add_argument(
         "--max-worst-regression", type=float, default=1.25,
         help="no single query may end up more than this much slower than native",
+    )
+    parser.add_argument(
+        "--min-regression-ms", type=float, default=MIN_REGRESSION_MS,
+        help=(
+            "regressions smaller than this many ms do not count towards "
+            f"--max-worst-regression (default {MIN_REGRESSION_MS:g}); a ratio "
+            "alone refuses a 5 ms loss on an 8 ms query and admits a 113 ms "
+            "loss on a 514 ms one"
+        ),
     )
     parser.add_argument(
         "--exclude-prefix", default=DEFAULT_EXCLUDE_PREFIX,
@@ -743,6 +957,15 @@ if __name__ == "__main__":
             "skip query ids starting with this when choosing the gate "
             f"(default {DEFAULT_EXCLUDE_PREFIX!r}, the prefix app.onboard gives "
             "generated queries; pass '' to calibrate on everything)"
+        ),
+    )
+    parser.add_argument(
+        "--bundle", default="models/plan_selector.pkl",
+        help=(
+            "model to calibrate against (default: the deployed one). The gate "
+            "is scored on the queries that model held out, so calibrating a "
+            "challenger -- models/_challenger.pkl, or any models/versions/* "
+            "bundle -- needs its own file rather than the incumbent's"
         ),
     )
     parser.add_argument("--apply", action="store_true", help="write the recommendation to models/gate.json")
@@ -766,6 +989,8 @@ if __name__ == "__main__":
             max_regression_rate=args.max_regression_rate,
             max_worst_regression=args.max_worst_regression,
             exclude_prefix=args.exclude_prefix,
+            bundle_path=args.bundle,
+            min_regression_ms=args.min_regression_ms,
         )["recommended"]
         grid = tuple(grid_with_recommendation(MEASURED_GRID, offline))
         if offline is not None:
@@ -801,6 +1026,8 @@ if __name__ == "__main__":
                         "chosen_by": "measured",
                         "held_out_captured_pct": best.get("held_out_captured_pct"),
                         "excluded_query_prefix": args.exclude_prefix or None,
+                        "calibrated_against_bundle": args.bundle,
+                        "calibrated_with_policy": args.policy,
                     },
                 )
                 print(f"Written to {GATE_PATH} -- restart the backend to pick it up.")
@@ -811,18 +1038,25 @@ if __name__ == "__main__":
         max_regression_rate=args.max_regression_rate,
         max_worst_regression=args.max_worst_regression,
         exclude_prefix=args.exclude_prefix,
+        bundle_path=args.bundle,
+        min_regression_ms=args.min_regression_ms,
     )
 
     print(
         f"scored on {report['n_queries_scored']} queries ({report['evaluated_on']})\n"
     )
     print(
-        f"{'z':>5} {'min_gain':>9} {'deviate%':>9} {'regress%':>9} "
+        f"{'mode':>9} {'z':>5} {'min_gain':>9} {'deviate%':>9} {'regress%':>9} "
         f"{'worst':>7} {'net_ms':>10} {'net%':>7}"
     )
     for r in report["all_settings"][:14]:
+        mode = r.get("gate_mode", "fixed_z")
+        # `z` is inert under a conformal bound -- the quantile does that work.
+        # Printing a swept-looking number in this column would invite tuning a
+        # knob that is not connected to anything.
+        z = f"{r['confidence_z']:>5.2f}" if mode == "fixed_z" else f"{'--':>5}"
         print(
-            f"{r['confidence_z']:>5.2f} {r['min_relative_gain']:>9.2f} "
+            f"{mode:>9} {z} {r['min_relative_gain']:>9.2f} "
             f"{r['deviation_rate'] * 100:>8.0f}% {r['regression_rate'] * 100:>8.0f}% "
             f"{r['worst_regression_ratio']:>6.2f}x "
             f"{r['net_improvement_ms']:>10.1f} {r['net_improvement_pct']:>6.1f}%"
@@ -833,8 +1067,12 @@ if __name__ == "__main__":
         for line in refusal_lines(report):
             print(line)
     else:
+        mode = best.get("gate_mode", "fixed_z")
+        # `z` is not part of a conformal gate, so naming it in the
+        # recommendation would invite someone to tune a knob that is inert.
+        knobs = f"confidence_z={best['confidence_z']}, " if mode == "fixed_z" else ""
         print(
-            f"\nRecommended: confidence_z={best['confidence_z']}, "
+            f"\nRecommended: gate_mode={mode}, {knobs}"
             f"min_relative_gain={best['min_relative_gain']} "
             f"(deviates on {best['deviation_rate']:.0%} of queries, "
             f"{best['regression_rate']:.0%} of those regress, "
@@ -847,6 +1085,16 @@ if __name__ == "__main__":
                     "chosen_by": "replay",
                     "evaluated_on": report["evaluated_on"],
                     "excluded_query_prefix": report["excluded_prefix"] or None,
+                    # A gate threshold is only valid for the selection process
+                    # it was swept against. `app.diagnostics` compares this to
+                    # `served_policy()` and complains when they part company --
+                    # the check that would have caught 2.43 far earlier.
+                    "calibrated_with_policy": report["policy"],
+                    # A gate setting describes one model's error distribution.
+                    # Without this field, a gate calibrated against a challenger
+                    # and one calibrated against the deployed model are
+                    # indistinguishable on disk.
+                    "calibrated_against_bundle": args.bundle,
                 },
             )
             print(f"Written to {GATE_PATH} -- restart the backend to pick it up.")

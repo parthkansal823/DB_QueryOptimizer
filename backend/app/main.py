@@ -22,6 +22,7 @@ from app.index_advice import (
     database_is_c_locale,
 )
 from app.db import get_cursor
+from app import logging_store
 from app.logging_store import log_execution, query_fingerprint
 from app.optimizer.decision_cache import DecisionCache
 from app.optimizer.hints import apply_hint, plan_fingerprint, split_hints
@@ -75,17 +76,29 @@ def _optimizer_from(values: dict) -> LearnedOptimizer:
     overrides are forwarded. See `app.settings.overrides`.
     """
     chosen = app_settings.overrides()
+    # `gate_mode` joined this list when `app.calibrate` learned to sweep the
+    # bound's *form* alongside its thresholds (2.42) and to write the winner
+    # into models/gate.json.
+    #
+    # Until then the comment here read "which bound to apply is a plain choice
+    # with no calibrated-file default to defer to, unlike the thresholds", and
+    # it passed `values["gate_mode"]` unconditionally. That was correct while
+    # nothing measured the bound. The moment something did, passing it every
+    # time meant the constructor argument always won and the swept value in the
+    # gate file was never read -- a calibration the server ignores, which is
+    # the same shape as 2.43's policy and 2.42's unused conformal gate.
+    #
+    # Thresholds and the bound they were swept under have to travel together
+    # anyway: a `min_relative_gain` chosen against a conformal bound is not the
+    # right threshold for a fixed-z one.
     gate = {
         name: values[name]
-        for name in ("confidence_z", "min_relative_gain")
+        for name in ("confidence_z", "min_relative_gain", "gate_mode")
         if name in chosen
     }
     return LearnedOptimizer(
         policy=values["selection_policy"],
         risk_lambda=values["risk_lambda"],
-        # Not part of `gate` above: which bound to apply is a plain choice with
-        # no calibrated-file default to defer to, unlike the thresholds.
-        gate_mode=values["gate_mode"],
         max_regression_ratio=values["max_regression_ratio"],
         **gate,
     )
@@ -123,6 +136,18 @@ def _apply_settings(values: dict) -> None:
     planner.ADAPTIVE_CANDIDATE_BUDGET = values["adaptive_candidate_budget"]
     planner.RUNTIME_TIMEOUT_FACTOR = values["runtime_timeout_factor"]
     planner.SHADOW_SAMPLE_RATE = values["shadow_sample_rate"]
+
+    # Missing from this list until now, which made it a setting that was
+    # declared, documented at length, shown in the dashboard and inert.
+    # `logging_store` reads `GROUP_BY_TEMPLATE` from the environment once at
+    # import; the settings panel writes to models/settings.json, which that
+    # module never consults. Toggling "Treat parameters as the same query" did
+    # nothing at all.
+    #
+    # `test_settings_are_applied` now asserts every declared field is either
+    # applied here, consumed when the optimizer is constructed, or explicitly
+    # listed as train-time-only -- so the next one cannot be silent.
+    logging_store.GROUP_BY_TEMPLATE = values["group_by_template"]
 
     # The cache is rebuilt rather than resized: every entry in it was decided
     # by the policy and thresholds that just changed, so keeping any of them
@@ -897,10 +922,41 @@ def stats_trend():
 
 @app.get("/settings")
 def get_settings():
-    """Current values plus the metadata the settings UI renders itself from."""
+    """
+    Current values plus the metadata the settings UI renders itself from.
+
+    `in_force` is the third thing, and it exists because two of these values are
+    not what the optimizer applies. `confidence_z` and `min_relative_gain`
+    default to 1.0 and 0.05 in `app.settings`, and `LearnedOptimizer` overrides
+    both with `models/gate.json` unless someone explicitly chose them
+    (`_optimizer_from`). So the panel read **z = 1.0** while the running gate was
+    **1.5**, and there was no way to tell from the endpoint.
+
+    That is the same failure this module's own header describes as fixed -- the
+    panel reporting one configuration while the process runs another -- in the
+    opposite direction. Deferring to the calibration is right; showing the value
+    that was overridden as though it were in force is not.
+
+    `in_force` reports what the live optimizer actually holds, and `overridden`
+    names the fields where the two differ, so the UI can say *"1.0 (calibrated
+    gate is using 1.5)"* rather than silently lying.
+    """
+    values = app_settings.current()
+    live = {
+        "confidence_z": getattr(optimizer, "confidence_z", None),
+        "min_relative_gain": getattr(optimizer, "min_relative_gain", None),
+        "gate_mode": getattr(optimizer, "gate_mode", None),
+        "selection_policy": getattr(optimizer, "policy", None),
+    }
     return {
         "fields": app_settings.describe(),
-        "values": app_settings.current(),
+        "values": values,
+        "in_force": live,
+        "overridden": sorted(
+            name for name, actual in live.items()
+            if actual is not None and values.get(name) != actual
+        ),
+        "gate_source": getattr(optimizer, "gate_calibration", None) and "models/gate.json",
         "groups": list(dict.fromkeys(f["group"] for f in app_settings.FIELDS.values())),
     }
 

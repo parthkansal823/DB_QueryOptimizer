@@ -50,6 +50,28 @@ from app.optimizer.features import featurize, to_vector
 # How much worse than native Postgres's own plan a learned pick is allowed
 # to be (predicted) before we discard it and keep the native plan. 0.15 =
 # "never knowingly accept a >15% predicted regression."
+# The policy this project serves, named once.
+#
+# It was named four times: `greedy` here, `greedy` in `app.settings`, `greedy`
+# in `retrain.served_policy()`, and `pairwise_rank` in `docker-compose.yml`.
+# Three of those are unreachable in production and the fourth is invisible to
+# every tool run on the host, because compose sets it inside the backend
+# container only. So `app.calibrate` swept the gate under `greedy` while the
+# container served `pairwise_rank`, and the thresholds in `models/gate.json`
+# were chosen for a selection process nobody runs.
+#
+# That is not a small discrepancy. Measured on 15 held-out queries
+# (docs/WRITEUP.md 2.43): `greedy` lands at 104.1% of native, `risk_averse`
+# 103.7%, `thompson` 109.9% -- all worse than leaving PostgreSQL alone --
+# while `pairwise_rank` lands at **95.1%**, against an oracle of 83.6%. The
+# policy the container serves is the only one that wins, and it was the only
+# one never calibrated.
+#
+# 2.22's lesson is that a constant duplicating a decision made elsewhere will
+# eventually disagree with it, and the fix is to delete the duplicate rather
+# than to synchronise it. The compose override is gone; this is the decision.
+DEFAULT_SELECTION_POLICY = "pairwise_rank"
+
 DEFAULT_SAFETY_MARGIN = 0.15
 
 # How many standard deviations of predicted gain are required before the
@@ -94,14 +116,14 @@ class LearnedOptimizer:
     def __init__(
         self,
         model_path: str = "models/plan_selector.pkl",
-        policy: str = os.getenv("SELECTION_POLICY", "greedy"),
+        policy: str = os.getenv("SELECTION_POLICY", DEFAULT_SELECTION_POLICY),
         risk_lambda: float = float(os.getenv("RISK_LAMBDA", "1.0")),
         safety_margin: float = DEFAULT_SAFETY_MARGIN,
         confidence_z: float = _UNSET,
         min_gain_ms: float = float(os.getenv("MIN_GAIN_MS", DEFAULT_MIN_GAIN_MS)),
         min_relative_gain: float = _UNSET,
         max_regression_ratio: float = DEFAULT_MAX_REGRESSION_RATIO,
-        gate_mode: str = os.getenv("GATE_MODE", "fixed_z"),
+        gate_mode: str = _UNSET,
         seed: int | None = None,
     ):
         self.model = None
@@ -123,11 +145,26 @@ class LearnedOptimizer:
         self.max_regression_ratio = max_regression_ratio
         self.gate_calibration: dict | None = None
         # "fixed_z" keeps the historical bound (mean + z*sigma); "conformal"
-        # uses the calibrated one from the bundle when there is one. Default is
-        # the former so every number already published stays reproducible --
-        # this is a change of method, and the project settles those by
-        # measuring them (`app.experiment`), not by switching the default.
-        self.gate_mode = gate_mode
+        # uses the calibrated one from the bundle when there is one.
+        #
+        # The original note here said a change of method should be settled by
+        # measurement rather than by editing a default -- correct, and then
+        # nothing measured it for as long as the note stood. A method reachable
+        # only through an environment variable nobody sets is not deployed, it
+        # is shelved.
+        #
+        # `app.calibrate` sweeps the two bounds as one grid now (2.42), so the
+        # form of the bound is chosen the same way its thresholds are: by
+        # replaying the log for the bundle in hand. Precedence is explicit
+        # argument, then `GATE_MODE`, then the calibrated gate file, then
+        # `fixed_z` -- the env var deliberately outranks `models/gate.json`
+        # here, because an operator exporting `GATE_MODE` is overriding the
+        # method itself and should not be quietly undone by a stale sweep.
+        env_mode = os.getenv("GATE_MODE")
+        self.gate_mode = (
+            gate_mode if gate_mode is not _UNSET else (env_mode or "fixed_z")
+        )
+        self._gate_mode_pinned = gate_mode is not _UNSET or env_mode is not None
         self.conformal = None
         # Multiplier that turns the ensemble's raw spread into something
         # denominated in standard deviations; 1.0 for bundles that predate the
@@ -154,6 +191,11 @@ class LearnedOptimizer:
                 self.min_relative_gain = calibrated.get(
                     "min_relative_gain", self.min_relative_gain
                 )
+            # Thresholds and the bound they were swept under travel together: a
+            # `min_relative_gain` chosen against a conformal bound is not the
+            # right threshold for a fixed-z one, and vice versa.
+            if not self._gate_mode_pinned:
+                self.gate_mode = calibrated.get("gate_mode", self.gate_mode)
             self.gate_calibration = calibrated
         self._rng = random.Random(seed)
         self.last_decision: dict = {}

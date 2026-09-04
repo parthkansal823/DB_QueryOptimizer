@@ -269,8 +269,20 @@ raw milliseconds. Two reasons:
 
 Which one wins depends on how much data you have. On the small synthetic schema
 `pairwise_rank` leads; on data-starved JOB every policy that trusts its own
-point predictions collapses and only `risk_averse` survives. Set with
-`SELECTION_POLICY`.
+point predictions collapses and only `risk_averse` survives.
+
+**The default is `pairwise_rank` and it is named in exactly one place**,
+`learned.DEFAULT_SELECTION_POLICY`. That is not tidiness. It was previously
+named in eight, defaulting to `greedy` in seven of them and to `pairwise_rank`
+only in `docker-compose.yml`'s backend service -- which is invisible to
+`app.calibrate`, `app.retrain` and `app.benchmark`, all of which run from the
+host. Every published benchmark figure, every gate calibration and every
+promotion decision therefore measured a policy the server does not use, and the
+gap is not small: on 15 held-out queries `greedy` lands at 104.1% of native and
+`pairwise_rank` at 95.1%, against an oracle of 83.6% (`docs/WRITEUP.md` 2.43).
+
+`SELECTION_POLICY` still overrides it, and now does so for host and container
+alike.
 
 ---
 
@@ -333,10 +345,45 @@ swung from +40% to −149%. Taking the median of three removed every regression
 with no change to the model at all. Same architecture, better labels.
 
 **Promotion requires a margin.** A challenger must beat the deployed model by
-more than 2% on the same held-out queries. Offline scores here are noisy enough
-that promoting on any improvement would send the model on a random walk rather
-than improving it. Every version is timestamped and `--rollback` restores the
-previous one.
+more than 2% on the same held-out queries, *or* materially improve the worst
+pick — a model that turns one catastrophic prediction into a correct one may
+barely move the mean while being the difference between serving a bad plan and
+declining to. Offline scores here are noisy enough that promoting on any
+improvement would send the model on a random walk. Every version is timestamped
+and `--rollback` restores the previous one.
+
+**The yardstick has to be one both models can be judged on.** It is the most
+recent quarter of queries by `created_at`, preferring ones neither model trained
+on when at least five such exist, and the promotion record states how many each
+had already seen. It previously read `sorted(query_ids)[-n:]` — the alphabetical
+tail — while its docstring claimed recency, and the challenger had trained on 10
+of its 15 queries (`WRITEUP.md` 2.45).
+
+### Choosing the configuration: `app.autotune`
+
+The gate thresholds, the selection policy and the action space are not
+independent — a threshold is a property of the policy it was measured against,
+and the action space decides what there is to select from. They were tuned by
+three different tools, each holding the others at whatever the environment
+happened to say, and for the project's whole history the gate was calibrated
+under `greedy` while the server selected with `pairwise_rank` (2.43).
+
+`app.autotune` sweeps all three together on the queries the model held out,
+prints one configuration and the variables to export, and writes the gate. Three
+things it does deliberately:
+
+- **stochastic policies are drawn five times and scored on the median**, with
+  the range shown, because `thompson`'s best draw beat a deterministic policy's
+  exact value and a max over noise finds whichever option is noisiest (2.48);
+- **a challenger must beat the *running* policy by two percentage points**, not
+  merely tie it, because switching costs a recalibration and a window where the
+  gate and the server disagree — and the tool recommended exactly such a switch
+  on a 0.8-point difference it had just called unresolvable (2.52);
+- **`--apply` writes the gate and only prints the rest**, because what a running
+  server selects with is not something a tuning run should change behind you.
+
+`models/gate.json` records the policy, the action space, the bundle and the
+moment it was applied, and `app.diagnostics` compares each against reality.
 
 ---
 
@@ -377,7 +424,7 @@ backend/app/
 ├── advisor.py              suggests CREATE INDEX / CREATE STATISTICS
 ├── index_advice.py         index shape per predicate: trigram, covering, BRIN
 ├── hypothetical.py         HypoPG: what an index *would* do, without building it
-├── workload.py             the 24-query benchmark
+├── workload.py             the 32-query benchmark (traps, shapes, controls)
 ├── workload_generator.py   writes a workload for an unknown database
 ├── schema_introspection.py reads an unfamiliar schema
 ├── schema_graph.py         join graph from foreign keys

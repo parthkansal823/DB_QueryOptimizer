@@ -18,6 +18,7 @@ import pickle
 import pytest
 
 from app import diagnostics
+from app.optimizer.learned import DEFAULT_SELECTION_POLICY
 
 
 class _Conformal:
@@ -51,6 +52,10 @@ HEALTHY_GATE = {
     "min_relative_gain": 0.05,
     "calibrated_on_n_queries": 40,
     "expected_regression_rate": 0.0,
+    # A healthy gate records the selection policy its thresholds were swept
+    # against. For the project's whole history it did not, and the two silently
+    # disagreed -- `greedy` calibrated, `pairwise_rank` served (2.43).
+    "calibrated_with_policy": DEFAULT_SELECTION_POLICY,
 }
 HEALTHY_BUNDLE = {
     "target": "log_ratio_vs_native",
@@ -478,3 +483,190 @@ class TestServedEvaluation:
         monkeypatch.setattr("app.model_store.list_versions", _Store.list_versions)
         evaluation, _ = diagnostics._served_evaluation(str(path))
         assert evaluation == {"n_rows_train": 11}
+
+
+# -- the gate and the server must agree about the policy --------------------
+
+
+def test_a_gate_swept_under_another_policy_is_flagged(tmp_path):
+    """
+    The check that would have caught docs/WRITEUP.md 2.43.
+
+    `app.calibrate` swept `greedy` because `SELECTION_POLICY` was set on the
+    backend service in compose and therefore invisible to anything run from the
+    host; the container served `pairwise_rank`. Nothing compared the two, and on
+    15 held-out queries they land at 104.1% and 95.1% of native -- opposite
+    sides of "is this system worth running".
+    """
+    gate = {**HEALTHY_GATE, "calibrated_with_policy": "greedy"}
+    paths = _write(tmp_path, gate=gate, bundle=HEALTHY_BUNDLE, evaluation=HEALTHY_EVAL)
+
+    report = diagnostics.diagnose(paths["model"], paths["gate"], paths["eval"])
+    codes = {w["code"] for w in report["warnings"]}
+
+    assert "gate_calibrated_for_another_policy" in codes
+    assert any(
+        w["severity"] == "high"
+        for w in report["warnings"]
+        if w["code"] == "gate_calibrated_for_another_policy"
+    )
+
+
+def test_a_gate_predating_the_field_is_flagged_more_quietly(tmp_path):
+    """"Cannot tell" is a smaller problem than "they disagree", but it is not
+    nothing -- every gate written before this existed is in that state."""
+    gate = {k: v for k, v in HEALTHY_GATE.items() if k != "calibrated_with_policy"}
+    paths = _write(tmp_path, gate=gate, bundle=HEALTHY_BUNDLE, evaluation=HEALTHY_EVAL)
+
+    report = diagnostics.diagnose(paths["model"], paths["gate"], paths["eval"])
+    hits = [w for w in report["warnings"] if w["code"] == "gate_does_not_record_its_policy"]
+
+    assert len(hits) == 1
+    assert hits[0]["severity"] == "low"
+
+
+def test_the_report_names_both_policies_whether_or_not_they_agree(tmp_path):
+    """Side by side, so a reader can check without knowing the failure exists."""
+    paths = _write(tmp_path, gate=HEALTHY_GATE, bundle=HEALTHY_BUNDLE, evaluation=HEALTHY_EVAL)
+
+    gate = diagnostics.diagnose(paths["model"], paths["gate"], paths["eval"])["gate"]
+
+    assert gate["calibrated_with_policy"] == DEFAULT_SELECTION_POLICY
+    assert gate["served_policy"] == DEFAULT_SELECTION_POLICY
+
+
+# -- drift has to know which gate produced the history ----------------------
+
+
+def test_the_drift_check_is_scoped_to_the_gate_that_was_applied(monkeypatch):
+    """
+    `expected_regression_rate` is a prediction about what *this* gate will do.
+    Checked against the whole log it is a prediction about traffic served by
+    whatever gate, model and policy were deployed at the time.
+
+    Measured: immediately after recalibrating, the drift check compared a
+    brand-new gate's promise of 20% against 31% observed over 1310 runs served
+    under the previous gate, the previous model and the previous policy, and
+    reported the new gate as already broken.
+    """
+    from app import stats
+
+    seen = {}
+
+    def _fake(cur, limit=2000, since=None):
+        seen["since"] = since
+        return {"decision_quality": {"deviated_win": 1, "deviated_loss": 0,
+                                     "held_correct": 1}}
+
+    monkeypatch.setattr(stats, "served_vs_native", _fake)
+    gate = {**HEALTHY_GATE, "applied_at": "2026-09-04T12:00:00+00:00"}
+
+    drift = diagnostics.drift_report(cur=None, gate=gate)
+
+    assert seen["since"] == "2026-09-04T12:00:00+00:00"
+    assert drift["scoped_to_gate"] is True
+
+
+def test_a_gate_with_no_applied_at_says_its_history_may_not_be_its_own():
+    """"Cannot tell which gate these runs belong to" has to be visible, or the
+    number reads as a measurement of the current gate."""
+    drift = {
+        "enough_runs_to_judge": True,
+        "n_runs": 1310,
+        "observed_regression_rate": 0.31,
+        "promised_regression_rate": 0.20,
+        "observed_deviation_rate": 0.3,
+        "scoped_to_gate": False,
+        "gate_applied_at": None,
+    }
+
+    found = diagnostics.warnings_for(HEALTHY_GATE, {}, {}, drift)
+    detail = next(w["detail"] for w in found if w["code"] == "gate_promise_not_met")
+
+    assert "may predate it" in detail
+
+
+def test_a_scoped_drift_warning_names_the_moment_the_gate_started():
+    drift = {
+        "enough_runs_to_judge": True,
+        "n_runs": 40,
+        "observed_regression_rate": 0.31,
+        "promised_regression_rate": 0.20,
+        "observed_deviation_rate": 0.3,
+        "scoped_to_gate": True,
+        "gate_applied_at": "2026-09-04T12:00:00+00:00",
+    }
+
+    found = diagnostics.warnings_for(HEALTHY_GATE, {}, {}, drift)
+    detail = next(w["detail"] for w in found if w["code"] == "gate_promise_not_met")
+
+    assert "2026-09-04T12:00:00+00:00" in detail
+    assert "all served under this gate" in detail
+
+
+# -- the action space is part of the configuration a gate was swept under ---
+
+
+def test_a_gate_swept_over_a_different_action_space_is_flagged():
+    """
+    The action space decides what there is to select from, so a threshold
+    measured against a different one is measuring a different system. 2.48
+    measured dropping the `resource` family as worth about 3 points, and with
+    only `join_order` + `cardinality` + `resource` no gate qualified at all.
+    """
+    gate = {
+        **HEALTHY_GATE,
+        "calibrated_with_families": ["cardinality", "join_order", "operator_toggle"],
+        "served_families": [
+            "cardinality", "join_order", "operator_toggle", "resource",
+        ],
+    }
+
+    found = diagnostics.warnings_for(gate, {}, {})
+    hits = [w for w in found if w["code"] == "gate_calibrated_for_another_action_space"]
+
+    assert len(hits) == 1
+    assert "also offers resource" in hits[0]["detail"]
+
+
+def test_a_matching_action_space_raises_nothing():
+    families = ["cardinality", "join_order", "operator_toggle"]
+    gate = {
+        **HEALTHY_GATE,
+        "calibrated_with_families": families,
+        "served_families": list(reversed(families)),  # order must not matter
+    }
+
+    codes = {w["code"] for w in diagnostics.warnings_for(gate, {}, {})}
+
+    assert "gate_calibrated_for_another_action_space" not in codes
+
+
+def test_a_gate_predating_the_field_is_not_flagged():
+    """Every gate written before `app.autotune` existed lacks it; that is
+    'cannot tell', and the policy check already covers the loud version."""
+    gate = {**HEALTHY_GATE, "served_families": ["join_order"]}
+
+    codes = {w["code"] for w in diagnostics.warnings_for(gate, {}, {})}
+
+    assert "gate_calibrated_for_another_action_space" not in codes
+
+
+def test_the_served_families_match_the_ones_the_sweep_filters_on():
+    """Two lists of family names that drift apart is how a mismatch check ends
+    up reporting a mismatch that is not there."""
+    from app.calibrate import _servable
+
+    served = diagnostics._served_families()
+    probe = [{"hint": h} for h in (
+        "/*+ Leading(a b) */",              # join_order
+        "/*+ Set(enable_seqscan off) */",   # operator_toggle
+        "/*+ Rows(a b #100) */",            # cardinality
+        "/*+ Set(work_mem '64MB') */",      # resource
+        "/*+ NestLoop(a b) */",             # join_method
+    )]
+
+    kept = {c["hint"] for c in _servable(probe)}
+    kept_by_declared = {c["hint"] for c in _servable(probe, allowed=served)}
+
+    assert kept == kept_by_declared

@@ -1,11 +1,20 @@
 {
-  "confidence_z": 1.0,
-  "min_relative_gain": 0.1,
-  "chosen_by": "measured",
+  "applied_at": "2026-09-04T14:23:11.023221+00:00",
+  "confidence_z": 1.5,
+  "min_relative_gain": 0.02,
+  "gate_mode": "fixed_z",
+  "calibrated_on_n_queries": 15,
+  "expected_deviation_rate": 0.3333333333333333,
+  "expected_regression_rate": 0.2,
+  "expected_worst_regression_ratio": 1.0,
+  "chosen_by": "autotune",
   "evaluated_on": "held_out_queries",
-  "calibrated_on_n_queries": 11,
-  "measured_headroom_captured": 0.403,
-  "measured_headroom_captured_held_out": 0.176,
-  "measured_vetoed_queries": 3,
-  "measured_note": "chosen by app.calibrate --measure on 2026-09-02 against model 20260902T173559Z. The replay-recommended setting (z=2.0, min_gain=0.2) measured -3.9% on held-out queries -- worse than not deviating at all."
+  "excluded_query_prefix": "auto_",
+  "calibrated_with_policy": "pairwise_rank",
+  "calibrated_against_bundle": "models/plan_selector.pkl",
+  "calibrated_with_families": [
+    "cardinality",
+    "join_order",
+    "operator_toggle"
+  ]
 }
