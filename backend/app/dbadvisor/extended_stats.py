@@ -185,6 +185,27 @@ def correlated_pairs(cur, schema: str = "public", max_pairs: int = 24) -> list[d
     column it knows nothing about is not one it is mis-estimating. Pairs that
     already have an extended statistics object are skipped -- the point is to
     find what is missing, not to re-recommend what is there.
+
+    ## The budget is spread across tables, not spent alphabetically
+
+    This iterated `sorted(by_table.items())` and returned the moment it hit
+    `max_pairs`. On this schema that is 24 of **58** candidate pairs, and the
+    ones kept were whatever came first in the alphabet:
+
+        order_items 6, orders 10, product_suppliers 6, products 2, and then
+        nothing -- suppliers and users were never looked at
+
+    `users(city, country)` is one of the two correlations `data/schema.sql`
+    exists to contain, measured at **63.1%** available headroom in 2.9, and the
+    advisor could not see it. Evaluated directly it passes easily: q-error 1.89
+    falling to 1.00, an improvement of 0.47 against a 0.25 threshold. It was
+    excluded for beginning with a letter near the end of the alphabet.
+
+    So: round-robin across tables, largest first. Every table contributes its
+    best candidate before any table contributes a second, and the budget goes
+    to the big tables first, because a dependency on a 500k-row table costs more
+    than the same dependency on a twelve-row lookup. Still deterministic and
+    still bounded -- each pair costs a probe query and an ANALYZE.
     """
     cur.execute(EXISTING_STATS_SQL)
     covered = {table for _, table in cur.fetchall()}
@@ -196,14 +217,27 @@ def correlated_pairs(cur, schema: str = "public", max_pairs: int = 24) -> list[d
             continue
         by_table.setdefault(table, []).append(column)
 
+    cur.execute(TABLE_ROWS_SQL, (schema,))
+    rows_by_table = dict(cur.fetchall())
+
+    # Biggest tables first, ties broken by name so the result is deterministic.
+    order = sorted(
+        by_table, key=lambda t: (-rows_by_table.get(t, 0), t)
+    )
+    queues = {
+        table: list(itertools.combinations(sorted(by_table[table]), 2))
+        for table in order
+    }
+
     pairs: list[dict] = []
-    for table, columns in sorted(by_table.items()):
-        # Deterministic and bounded: a wide table has hundreds of pairs and
-        # measuring each one costs an ANALYZE.
-        for left, right in itertools.combinations(sorted(columns), 2):
+    while len(pairs) < max_pairs and any(queues[t] for t in order):
+        for table in order:
+            if not queues[table]:
+                continue
+            left, right = queues[table].pop(0)
             pairs.append({"table": table, "columns": [left, right]})
             if len(pairs) >= max_pairs:
-                return pairs
+                break
     return pairs
 
 

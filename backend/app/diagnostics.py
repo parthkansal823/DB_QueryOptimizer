@@ -138,6 +138,16 @@ def _served_families() -> set[str]:
         families.add("resource")
     if planner.INCLUDE_JOIN_METHODS:
         families.add("join_method")
+    if (
+        planner.INCLUDE_SCAN_METHODS
+        or planner.INCLUDE_NEGATIVE_SCANS
+        or planner.INCLUDE_INDEX_PINNING
+    ):
+        families.add("scan_method")
+    if planner.INCLUDE_MEMOIZE:
+        families.add("memoize")
+    if planner.INCLUDE_PARALLEL:
+        families.add("parallel")
     return families
 
 

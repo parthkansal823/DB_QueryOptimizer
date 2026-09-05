@@ -221,6 +221,10 @@ def _row_to_candidate(row: dict) -> dict:
         "actual_total_time_ms": row["actual_total_time_ms"],
         "hint": row["hint"],
         "disabled_nodes": count_disabled_nodes(raw_plan),
+        # The query text, for the features that read what was *asked* rather
+        # than what the planner decided (`features.predicate_shape`). The
+        # serving path attaches the same key in `planner.plan_query`.
+        "sql_text": row.get("sql_text"),
     }
 
 

@@ -55,10 +55,13 @@ def _samplable(means, stds):
 
 
 def test_every_subset_of_the_optional_families_is_offered():
+    from app.autotune import OPTIONAL_FAMILIES
+
     spaces = action_spaces()
 
-    assert len(spaces) == 4
+    assert len(spaces) == 2 ** len(OPTIONAL_FAMILIES)
     assert all(ALWAYS_ON <= s for s in spaces)
+    assert len({frozenset(s) for s in spaces}) == len(spaces)
 
 
 def test_the_narrowest_space_comes_first():
@@ -70,14 +73,18 @@ def test_the_narrowest_space_comes_first():
 
 def test_the_families_map_back_to_the_environment_that_produces_them():
     """The winner is only actionable if it names the variables to export."""
-    assert families_env(sorted(ALWAYS_ON)) == [
-        "INCLUDE_TUNING=0",
-        "INCLUDE_JOIN_METHODS=0",
-    ]
-    assert families_env(sorted(ALWAYS_ON | {"resource", "join_method"})) == [
-        "INCLUDE_TUNING=1",
-        "INCLUDE_JOIN_METHODS=1",
-    ]
+    from app.autotune import OPTIONAL_FAMILIES
+
+    off = families_env(sorted(ALWAYS_ON))
+    on = families_env(sorted(ALWAYS_ON | set(OPTIONAL_FAMILIES)))
+
+    # One variable per optional family, and nothing left unexpressed: a family
+    # the sweep can recommend but the reader cannot enable is worse than not
+    # sweeping it.
+    assert len(off) == len(OPTIONAL_FAMILIES)
+    assert all(line.endswith("=0") for line in off)
+    assert all(line.endswith("=1") for line in on)
+    assert "INCLUDE_SCAN_METHODS=1" in on
 
 
 # -- not fooling yourself ---------------------------------------------------

@@ -980,4 +980,173 @@ WORKLOAD = [
         "join_width": 5,
         "trap": "generated (predicates sampled from live data)",
     },
+    # -- more six-table joins -------------------------------------------
+    #
+    # 2.40 measured one 6-table query carrying 664 ms of a 682 ms promotion
+    # gap, on a workload where only 3 of 59 queries were 6-table. The roadmap
+    # proposed per-width models; measured, width 6 had 96 rows across 3
+    # queries, which is far below what 2.3 established as usable.
+    #
+    # The model already has width and does not use it: `num_joins` gets **0**
+    # splits across the eight ensemble members and `num_tables` 0.42%. That is
+    # a missing sample, not a missing feature, and six tables is the widest
+    # this schema goes -- so the fix is more *variety* at that width rather
+    # than more width.
+    #
+    # These differ from the three that existed in where the filter sits, how
+    # selective it is, and what shape comes out, because three near-identical
+    # shapes teach one shape. Values are sampled from live data, as
+    # `workload_generator` does.
+    #
+    # **None of them was filtered on having headroom**, and that is the point.
+    # The 27 `gen_*` queries were generated and then *kept* only if the best
+    # plan in the served action space beat native by 8%, which is why
+    # `app.benchmark` reports them separately (2.51: 41.3% over everything
+    # against 33.0% over the unfiltered group). Measured after the fact, two of
+    # these six have real headroom, three have none, and the control correctly
+    # has none -- and all six stay. A query PostgreSQL already gets right is
+    # what teaches the model not to deviate, which is most of what a safety gate
+    # has to know.
+    {
+        "id": "corr_6w_supplier_country",
+        "sql": """
+            SELECT s.country, count(DISTINCT o.id) AS orders
+            FROM suppliers s
+            JOIN product_suppliers ps ON ps.supplier_id = s.id
+            JOIN products p ON p.id = ps.product_id
+            JOIN order_items oi ON oi.product_id = p.id
+            JOIN orders o ON o.id = oi.order_id
+            JOIN users u ON u.id = o.user_id
+            WHERE s.country = 'DE' AND u.country = 'IN'
+            GROUP BY s.country
+        """,
+        "description": (
+            "six tables, filters at both *ends* of the join chain rather than "
+            "the middle -- the shape that decides whether the planner starts "
+            "from suppliers or from users"
+        
+            ". Measured: 342.3 ms native against 237.0 ms best available, 30.8% headroom."
+        ),
+        "join_width": 6,
+        "trap": "filter placement at both ends",
+    },
+    {
+        "id": "corr_6w_band_category",
+        "sql": """
+            SELECT p.brand, count(*) AS n
+            FROM products p
+            JOIN product_suppliers ps ON ps.product_id = p.id
+            JOIN suppliers s ON s.id = ps.supplier_id
+            JOIN order_items oi ON oi.product_id = p.id
+            JOIN orders o ON o.id = oi.order_id
+            JOIN users u ON u.id = o.user_id
+            WHERE p.price_band = 'premium' AND p.category = 'clothing'
+              AND o.status = 'completed'
+            GROUP BY p.brand
+            ORDER BY n DESC
+        """,
+        "description": (
+            "six tables with the price_band->category correlation and an "
+            "ordinary status filter, so two of the three predicates are "
+            "independent and one is not"
+        
+            ". Measured: 157.0 ms native against 114.2 ms best available, 27.2% headroom."
+        ),
+        "join_width": 6,
+        "trap": "price_band->category",
+    },
+    {
+        "id": "shape_6w_top_suppliers",
+        "sql": """
+            SELECT s.name, sum(oi.quantity) AS units
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            JOIN product_suppliers ps ON ps.product_id = p.id
+            JOIN suppliers s ON s.id = ps.supplier_id
+            JOIN orders o ON o.id = oi.order_id
+            JOIN users u ON u.id = o.user_id
+            WHERE u.city = 'Mumbai' AND u.country = 'IN'
+              AND s.rating >= 4
+            GROUP BY s.name
+            ORDER BY units DESC
+            LIMIT 20
+        """,
+        "description": (
+            "six tables, aggregate + top-N: the sort and limit sit above the "
+            "whole join, which is the shape a wide join makes expensive"
+        
+            ". Measured: 179.9 ms native, nothing better found -- kept anyway."
+        ),
+        "join_width": 6,
+        "trap": "city->country, with a top-N above the join",
+    },
+    {
+        "id": "shape_6w_distinct_pairs",
+        "sql": """
+            SELECT DISTINCT u.city, s.country
+            FROM users u
+            JOIN orders o ON o.user_id = u.id
+            JOIN order_items oi ON oi.order_id = o.id
+            JOIN products p ON p.id = oi.product_id
+            JOIN product_suppliers ps ON ps.product_id = p.id
+            JOIN suppliers s ON s.id = ps.supplier_id
+            WHERE o.channel = 'partner' AND p.category = 'books'
+        """,
+        "description": (
+            "six tables under a DISTINCT -- de-duplication over a wide join, "
+            "where the join order decides how many rows reach the hash"
+        
+            ". Measured: 153.2 ms native, nothing better found -- kept anyway."
+        ),
+        "join_width": 6,
+        "trap": "generated cardinality through a wide join",
+    },
+    {
+        "id": "ctl_6w_uncorrelated",
+        "sql": """
+            SELECT count(*)
+            FROM orders o
+            JOIN users u ON u.id = o.user_id
+            JOIN order_items oi ON oi.order_id = o.id
+            JOIN products p ON p.id = oi.product_id
+            JOIN product_suppliers ps ON ps.product_id = p.id
+            JOIN suppliers s ON s.id = ps.supplier_id
+            WHERE u.signup_year = 2021 AND ps.lead_days <= 7
+        """,
+        "description": (
+            "the six-table control: two genuinely independent predicates, so "
+            "PostgreSQL's independence assumption is *correct* here and there "
+            "should be little to win. A wide join with no trap in it"
+        
+            ". Measured: 119.8 ms native, nothing better found -- which is the correct answer for a control."
+        ),
+        "join_width": 6,
+        "trap": "none -- control",
+    },
+    {
+        "id": "shape_6w_anti_join",
+        "sql": """
+            SELECT p.name
+            FROM products p
+            JOIN product_suppliers ps ON ps.product_id = p.id
+            JOIN suppliers s ON s.id = ps.supplier_id
+            WHERE s.country = 'CN'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM order_items oi
+                  JOIN orders o ON o.id = oi.order_id
+                  JOIN users u ON u.id = o.user_id
+                  WHERE oi.product_id = p.id AND u.country = 'US'
+              )
+        """,
+        "description": (
+            "six tables across an anti-join: three in the outer query and "
+            "three inside a NOT EXISTS, so the planner chooses an order for "
+            "each half and a strategy for joining them"
+        
+            ". Measured: 155.6 ms native, nothing better found -- kept anyway."
+        ),
+        "join_width": 6,
+        "trap": "anti-join over a wide subquery",
+    },
 ]

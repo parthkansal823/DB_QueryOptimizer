@@ -67,10 +67,21 @@ HINT_FAMILY_SQL = """
             WHEN hint LIKE '%%Rows(%%'                THEN 'cardinality'
             WHEN hint LIKE '%%HashJoin(%%'
               OR hint LIKE '%%NestLoop(%%'
-              OR hint LIKE '%%MergeJoin(%%'           THEN 'join_method'
+              OR hint LIKE '%%MergeJoin(%%'
+              OR hint LIKE '%%NoHashJoin(%%'
+              OR hint LIKE '%%NoNestLoop(%%'
+              OR hint LIKE '%%NoMergeJoin(%%'         THEN 'join_method'
             WHEN hint LIKE '%%Set(enable_%%'          THEN 'operator_toggle'
             WHEN hint LIKE '%%Set(%%'                 THEN 'resource'
             WHEN hint LIKE '%%Leading(%%'             THEN 'join_order'
+            WHEN hint LIKE '%%SeqScan(%%'
+              OR hint LIKE '%%IndexScan(%%'
+              OR hint LIKE '%%IndexOnlyScan(%%'
+              OR hint LIKE '%%BitmapScan(%%'
+              OR hint LIKE '%%TidScan(%%'
+              OR hint LIKE '%%DisableIndex(%%'        THEN 'scan_method'
+            WHEN hint LIKE '%%Memoize(%%'             THEN 'memoize'
+            WHEN hint LIKE '%%Parallel(%%'            THEN 'parallel'
             ELSE 'other'
         END
 """
@@ -135,12 +146,33 @@ def hint_family(hint: str | None) -> str | None:
         return "cardinality"
     if "HashJoin(" in hint or "NestLoop(" in hint or "MergeJoin(" in hint:
         return "join_method"
+    # Negative join methods are the same family as the positive ones: both say
+    # "use this join algorithm here", one by naming it and one by excluding the
+    # alternatives.
+    if "NoHashJoin(" in hint or "NoNestLoop(" in hint or "NoMergeJoin(" in hint:
+        return "join_method"
     if "Set(enable_" in hint:
         return "operator_toggle"
     if "Set(" in hint:
         return "resource"
     if "Leading(" in hint:
         return "join_order"
+    # Per-table scan choices, positive and negative. `DisableIndex` belongs
+    # here too: it forbids one index, which is a statement about how a table is
+    # scanned rather than about join structure.
+    if (
+        "SeqScan(" in hint
+        or "IndexScan(" in hint
+        or "IndexOnlyScan(" in hint
+        or "BitmapScan(" in hint
+        or "TidScan(" in hint
+        or "DisableIndex(" in hint
+    ):
+        return "scan_method"
+    if "Memoize(" in hint:
+        return "memoize"
+    if "Parallel(" in hint:
+        return "parallel"
     return "other"
 
 
@@ -196,13 +228,30 @@ OBSERVATION_COUNT_SQL = """
     GROUP BY query_id
 """
 
-REGRESSION_SQL = """
+# Rows logged by shadow execution: the learned plan was run and measured, but
+# the user was served native.
+#
+# The guard needs these and the served/native statistics must not. A blocked
+# query never runs the learned path again, so it accumulates no evidence about
+# it -- the block then lifts purely because the old evidence ages out of
+# `evidence_since()`, and the query is retried with whatever model happens to be
+# deployed, having learned nothing in between. Shadowing turns that into real
+# evidence at the cost of one extra execution on a sampled fraction of blocked
+# requests, without ever exposing a user to the plan.
+SHADOW_SELECTOR = "shadow"
+
+REGRESSION_SQL = f"""
     SELECT
         query_id,
         AVG(actual_total_time_ms) FILTER (WHERE is_baseline)  AS native_avg_ms,
-        AVG(actual_total_time_ms) FILTER (WHERE is_chosen AND hint IS NOT NULL)
-                                                              AS chosen_avg_ms,
-        COUNT(*) FILTER (WHERE is_chosen AND hint IS NOT NULL) AS n_chosen
+        AVG(actual_total_time_ms) FILTER (
+            WHERE (is_chosen OR selector_used = '{SHADOW_SELECTOR}')
+              AND hint IS NOT NULL
+        )                                                     AS chosen_avg_ms,
+        COUNT(*) FILTER (
+            WHERE (is_chosen OR selector_used = '{SHADOW_SELECTOR}')
+              AND hint IS NOT NULL
+        )                                                     AS n_chosen
     FROM plan_execution_log
     WHERE query_id IS NOT NULL AND actual_total_time_ms IS NOT NULL
       AND created_at >= %s

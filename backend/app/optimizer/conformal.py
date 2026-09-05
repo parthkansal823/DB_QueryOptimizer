@@ -106,6 +106,24 @@ import math
 # over the quantile.
 MIN_SIGMA = 1e-6
 
+# Percentile of the observed spread used as the *statistical* floor when a gate
+# is fitted normalised.
+#
+# `MIN_SIGMA` is a numerical guard against dividing by zero, and it is the wrong
+# tool for this. A calibration row where the eight ensemble members happen to
+# agree to six decimal places gets `std = 1e-6`, so a perfectly ordinary
+# residual of 0.1 scores **100,000** and single-handedly decides the quantile.
+# That is why the normalised bound was measured as unusable and the absolute one
+# became the default (see the module docstring).
+#
+# The degenerate denominators are the problem, not the normalisation. Flooring
+# sigma at a low percentile of the sigmas actually observed keeps the
+# per-candidate scaling -- the thing the absolute bound throws away -- while
+# stopping near-zero rows from dominating. 25% is deliberately generous: it
+# discards the quarter of rows where the ensemble is least informative rather
+# than trying to find the exact point where the division stops being meaningful.
+SIGMA_FLOOR_PERCENTILE = 0.25
+
 
 class ConformalGate:
     """
@@ -115,7 +133,12 @@ class ConformalGate:
     serving time as `upper_bound(mean, std)`.
     """
 
-    def __init__(self, alpha: float = 0.1, normalize: bool = False):
+    def __init__(
+        self,
+        alpha: float = 0.1,
+        normalize: bool = False,
+        sigma_floor_percentile: float = SIGMA_FLOOR_PERCENTILE,
+    ):
         if not 0.0 < alpha < 1.0:
             raise ValueError(f"alpha must be in (0, 1), got {alpha}")
         self.alpha = alpha
@@ -124,6 +147,11 @@ class ConformalGate:
         # option because on a model whose spread *is* informative it is the
         # better interval, and because it is what older bundles were fitted with.
         self.normalize = normalize
+        self.sigma_floor_percentile = sigma_floor_percentile
+        # Learned at fit time from the calibration sigmas; `None` until then and
+        # on every bundle pickled before this existed, where `upper_bound` falls
+        # back to MIN_SIGMA and behaves exactly as it used to.
+        self.sigma_floor: float | None = None
         self.q: float | None = None
         self.n_calibration = 0
 
@@ -146,8 +174,12 @@ class ConformalGate:
             )
 
         if self.normalize:
+            self.sigma_floor = _percentile(
+                [abs(s) for s in stds], self.sigma_floor_percentile
+            )
+            floor = max(self.sigma_floor, MIN_SIGMA)
             scores = [
-                (actual - mean) / max(std, MIN_SIGMA)
+                (actual - mean) / max(std, floor)
                 for mean, std, actual in zip(means, stds, y, strict=True)
             ]
         else:
@@ -177,7 +209,12 @@ class ConformalGate:
         # `getattr` for bundles pickled before the mode existed: those were all
         # fitted normalised, which is what the attribute defaults to for them.
         if getattr(self, "normalize", True):
-            return mean + self.q * max(std, MIN_SIGMA)
+            # The same floor the quantile was fitted under, or MIN_SIGMA for a
+            # bundle pickled before the floor existed -- which reproduces the
+            # old behaviour exactly rather than silently changing a served
+            # bound.
+            floor = max(getattr(self, "sigma_floor", None) or 0.0, MIN_SIGMA)
+            return mean + self.q * max(std, floor)
         return mean + self.q
 
     def coverage(self, means: list[float], stds: list[float], y: list[float]) -> float:
@@ -254,6 +291,16 @@ def sigma_scale(means: list[float], stds: list[float], y: list[float]) -> float:
     if mean_sigma <= MIN_SIGMA:
         return 1.0
     return max(1.0, mean_residual / mean_sigma)
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile. Empty input floors at zero, which `fit` then
+    raises to MIN_SIGMA -- the old behaviour."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(fraction * len(ordered))))
+    return ordered[idx]
 
 
 def _conformal_quantile(scores: list[float], alpha: float) -> float:

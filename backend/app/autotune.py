@@ -62,7 +62,14 @@ POLICY_CHOICES = tuple(POLICIES) + ("pairwise_rank",)
 # 59 and the PostgreSQL 18 upgrade, and a switched-off family that nobody
 # re-measures is a decision that has stopped being evidence.
 ALWAYS_ON = frozenset({"join_order", "operator_toggle", "cardinality"})
-OPTIONAL_FAMILIES = ("resource", "join_method")
+# `scan_method` joined this list on measured evidence, not for completeness.
+# Probing JOB's held-out queries with a wider action space, two of the four
+# best plans found were scan-method hints -- `SeqScan(mc)` taking `2d` from
+# 586 ms to 464 ms and `SeqScan(cn)` taking `2b` from 464 ms to 311 ms. Both
+# are queries the 30-query evaluation recorded as having "almost nothing to
+# win" (14.4 ms and 2.7 ms of headroom), which was true of the action space and
+# not of the query.
+OPTIONAL_FAMILIES = ("resource", "join_method", "scan_method")
 
 # Policies whose answer is a draw rather than a value.
 #
@@ -263,6 +270,7 @@ def families_env(families: list[str]) -> list[str]:
     return [
         f"INCLUDE_TUNING={'1' if 'resource' in families else '0'}",
         f"INCLUDE_JOIN_METHODS={'1' if 'join_method' in families else '0'}",
+        f"INCLUDE_SCAN_METHODS={'1' if 'scan_method' in families else '0'}",
     ]
 
 

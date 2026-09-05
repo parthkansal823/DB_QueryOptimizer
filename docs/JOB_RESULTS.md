@@ -208,11 +208,85 @@ two very expensive ones, and the trade is 26 seconds saved for 0.2 seconds lost.
 That is the right trade for this benchmark and it is not "the model is right
 about every query".
 
+> **Superseded in part.** Re-collecting under the widened action space (§2.56)
+> lowers the oracle on most of these queries, so the headroom column below is
+> the *narrow* space's. `5b` in particular is described here as a query where no
+> candidate beats native; with scan methods collected it has **9.4%** available
+> (oracle 68.2 ms against 75.3 ms native). `2b` goes 0.6% → 34.0% and `2d`
+> 2.5% → 40.0%. The 99.2% figure is against a ceiling now known to be too high.
+
 **These are ungated numbers.** `_evaluate_selection` reports what each policy
 picks, with no confidence gate applied. The gate exists precisely for queries
 like `2b` and `2d` -- a predicted win smaller than the model's own error -- and
 would decline most of them. The 99.2% is the ceiling the gate is choosing from,
 not what a deployment serves.
+
+### Correction: "almost nothing to win" was true of the action space, not the query
+
+The four regressions above are explained as queries with nearly no headroom --
+`2b` with 2.7 ms available, `2d` with 14.4 ms, `5b` with an oracle *slower* than
+native. That is what the recorded oracle says, and the recorded oracle is the
+best plan **in the action space that was collected**.
+
+Probing the same queries with a wider action space says otherwise. Every one of
+the four expensive held-out queries has a plan below the oracle on record:
+
+| query | native | oracle on record | found with a wider search | winning hint |
+|---|---|---|---|---|
+| `17c` | 21603.7 | 1963.3 | **1043.4** | `Leading(n ci mk mc t cn k)` |
+| `17d` | 8822.2 | 2447.9 | **2232.9** | `Set(enable_nestloop off)` |
+| `2d` | 586.1 | 571.7 | **463.6** | `SeqScan(mc)` |
+| `2b` | 463.6 | 460.9 | **311.0** | `SeqScan(cn)` |
+
+`17c` drops a further **47%**, to 20.7x faster than native rather than 11x. And
+`2b`, recorded as having 2.7 ms of headroom, actually has **153 ms** -- a third
+of its runtime -- reachable by a single `SeqScan` hint.
+
+Two separate causes, both in the action space rather than the model:
+
+**The join-order sample was 8.** `generate_candidates` defaults to
+`max_order_candidates=8`, and a 7-table query has 5040 possible orders, so the
+search covered 0.16% of the space. The winning hint for `17c` is a pure
+`Leading(...)`, so it was the order count that bound and not a missing family.
+Worse, the budget scaled only with PostgreSQL's *cost estimate*: `17c` is priced
+at 4409 -- a middling query -- and runs for 21.6 seconds, so the search was
+starved on exactly the query whose estimate was most wrong.
+`planner.budget_for` scales with join width now as well as cost.
+
+**Scan-method hints were not collected at all.** `INCLUDE_SCAN_METHODS`
+defaults off, so `SeqScan(...)` never entered the JOB action space -- and it is
+what wins on `2b` and `2d`. `app.autotune` sweeps that family now, so whether it
+earns its place is measured per database rather than assumed.
+
+**A third cause, found while fixing the first two**: `app.collect_data` took
+`generate_candidates`' bare defaults, so training gathered 8 join orders and no
+scan methods while serving planned up to 96 and whatever the flags enabled.
+Collection forwards the same flags and the same budget function now, with a test
+asserting collection is never narrower than serving.
+
+### Confirmed by execution
+
+Re-collecting `2b` and `2d` under the widened space, reading the oracle back out
+of the log:
+
+| query | native | oracle before | oracle after | headroom |
+|---|---|---|---|---|
+| `2b` | 463.6 | 460.9 | **293.6** | **0.6% -> 36.7%** |
+| `2d` | 586.1 | 571.7 | **386.3** | **2.5% -> 34.1%** |
+
+Both won by a single `SeqScan(...)`. A third of each query's runtime was
+available the whole time, in a family that was never collected.
+
+So the honest reading of the 99.2% is narrower than it looked: it is 99.2% of a
+ceiling that was itself too low, and the real remaining headroom is roughly
+**another 900 ms on `17c` alone** plus a third of the runtime of the two queries
+that were recorded as unwinnable. The model was doing well against the choices
+it was offered; the choices were the constraint.
+
+**The headline numbers above have not been re-measured under the wider space.**
+Doing so needs a full re-collection of all 30 queries -- the `17*` family alone
+takes twenty minutes each -- and until that runs, 99.2% remains the correct
+figure against the old ceiling and an overstatement against the new one.
 
 ### What this settles and what it does not
 

@@ -38,7 +38,51 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import re
+
 from app.optimizer.plan_tree import TREE_FEATURES, encode_plan_tree
+
+# `alias.column = literal`. Join keys (`a.id = b.user_id`) are deliberately not
+# matched: a join predicate is not a selectivity estimate on one table.
+_EQUALITY = re.compile(
+    r"\b(\w+)\.(\w+)\s*=\s*'[^']*'"
+    r"|\b(\w+)\.(\w+)\s*=\s*-?\d+(?:\.\d+)?(?!\s*\.\s*\w)"
+)
+_RANGE = re.compile(r"\b\w+\.\w+\s*(?:<=|>=|<|>|BETWEEN\b)", re.IGNORECASE)
+
+
+def predicate_shape(sql: str | None) -> dict[str, float]:
+    """
+    What the query *asks*, as opposed to what the planner decided.
+
+    Returns zeros for a missing or WHERE-less query, which is the honest value:
+    a query with no filters has no same-table conjunction to mis-estimate.
+    """
+    empty = {
+        "max_same_table_equalities": 0.0,
+        "n_equality_predicates": 0.0,
+        "n_range_predicates": 0.0,
+    }
+    if not sql:
+        return empty
+    where = sql.upper().find(" WHERE ")
+    if where < 0:
+        return empty
+    body = sql[where:]
+
+    per_alias: dict[str, int] = {}
+    total = 0
+    for match in _EQUALITY.finditer(body):
+        alias = match.group(1) or match.group(3)
+        if not alias:
+            continue
+        per_alias[alias] = per_alias.get(alias, 0) + 1
+        total += 1
+    return {
+        "max_same_table_equalities": float(max(per_alias.values(), default=0)),
+        "n_equality_predicates": float(total),
+        "n_range_predicates": float(len(_RANGE.findall(body))),
+    }
 
 BASE_FEATURES = [
     "num_tables",
@@ -63,6 +107,32 @@ BASE_FEATURES = [
     # means nothing on a plan carrying one -- see docs/WRITEUP.md 2.29, where a
     # disconnected order came back 340x cheaper than the correct plan.
     "n_disabled_nodes",
+    # Read off the *query*, not the plan, and that is the whole point.
+    #
+    # Every other feature here describes what PostgreSQL decided. This one
+    # describes what it was asked, and it is the one thing the plan cannot
+    # carry: the plan is what the planner believed *after* applying the
+    # independence assumption, which is the assumption being questioned.
+    #
+    # `max_same_table_equalities` is the largest number of equality filters
+    # landing on any one table. Two on the same table is where the assumption
+    # starts costing -- PostgreSQL multiplies their selectivities as though they
+    # were unrelated (2.9) -- while two on *different* tables is not, because
+    # they are never multiplied together.
+    #
+    # Measured across 59 workload queries, median available headroom:
+    #
+    #     0 same-table equalities   30 queries   16.9%
+    #     1                          3 queries   25.3%
+    #     2 or more                 26 queries   31.4%
+    #
+    # Monotone, and nearly double at the top. `n_equality_predicates` and
+    # `n_range_predicates` come along because they are free once the WHERE
+    # clause is being read and they separate "many filters" from "many filters
+    # on one table", which is the distinction that matters.
+    "max_same_table_equalities",
+    "n_equality_predicates",
+    "n_range_predicates",
 ]
 PER_TABLE_SUFFIXES = ("present", "join_position", "selectivity", "index_scan", "occurrences")
 
@@ -178,6 +248,11 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
     features["n_disabled_nodes"] = float(
         candidate_plan.get("disabled_nodes") or _count_disabled(raw_plan)
     )
+    # Both the training and the serving paths attach `sql_text` to the candidate
+    # dict; `test_features` asserts they agree, because a feature populated on
+    # one side and absent on the other is train/serve skew and this project has
+    # a long list of those (docs/WRITEUP.md 2.43, 2.47, 2.50, 2.56).
+    features.update(predicate_shape(candidate_plan.get("sql_text")))
 
     features.update(encode_plan_tree(raw_plan))
 

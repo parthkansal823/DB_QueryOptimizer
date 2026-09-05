@@ -16,7 +16,9 @@ import time
 
 from app.db import get_cursor
 from app.logging_store import log_execution
+from app.optimizer import planner
 from app.optimizer.hints import apply_hint, generate_candidates
+from app.optimizer.planner import budget_for
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 from app.measurement import make_deterministic
@@ -62,6 +64,20 @@ def _recover(cur, statement_timeout_ms: int) -> None:
         print(f"  [reset] could not recover the connection: {exc}", file=sys.stderr)
 
 
+def _median_latency(runs: list[dict]) -> float | None:
+    """Median measured latency across a query's baseline repetitions.
+
+    Median rather than the first run for the reason `_aggregate_repetitions`
+    gives: latency has a heavy right tail, and one execution colliding with
+    autovacuum should not decide how wide the search gets.
+    """
+    times = [r.get("actual_total_time_ms") for r in runs]
+    times = sorted(t for t in times if t is not None)
+    if not times:
+        return None
+    return times[len(times) // 2]
+
+
 def collect(
     reps: int = DEFAULT_REPS,
     include_join_methods: bool | None = None,
@@ -100,8 +116,11 @@ def collect(
     # Passing the flag explicitly still works, which is what a run meant to
     # answer "would join methods earn their place?" should do.
     if include_join_methods is None:
-        from app.optimizer import planner
-
+        # Imported at module scope. It used to be imported here, inside the
+        # `if`, which makes `planner` a *local* name for the whole function --
+        # so every other `planner.X` below would raise UnboundLocalError on any
+        # call that passed `include_join_methods` explicitly, which is what
+        # `app.collect_data_job` does.
         include_join_methods = planner.INCLUDE_JOIN_METHODS
 
     workload = workload if workload is not None else WORKLOAD
@@ -189,11 +208,58 @@ def collect(
             # about. Without it, roughly half the collected candidates are
             # cartesian products that no served query will ever consider, so
             # the capacity spent learning them is wasted.
+            #
+            # The same applies to the *width* of the search and to which
+            # families are on, and only the join-graph half of that was fixed.
+            # This call took `generate_candidates`' defaults for everything
+            # else: `max_order_candidates=8`, and every opt-in family off.
+            # Serving takes them from `planner`, and since `budget_for` learned
+            # to scale with join width (2.56) it will plan up to 96 order
+            # candidates on a wide expensive query.
+            #
+            # So collection was training the model on 8 join orders and serving
+            # was asking it to score up to 96, plus any scan-method or memoize
+            # candidate the flags enabled -- a strictly *narrower* training
+            # action space than the served one, which is the direction that
+            # hurts. README's warning about widening the action space without
+            # re-collecting is this bug, arrived at from the other side.
+            #
+            # Collection may legitimately be *wider* than serving -- it gathers
+            # the forced join-method family that `budget_for` often truncates
+            # away, and `calibrate._servable` narrows the replay back down. What
+            # it must never be is narrower.
             hints = generate_candidates(
                 tables,
+                max_order_candidates=budget_for(
+                    baseline.get("total_cost"),
+                    len(tables),
+                    # Collection has just *executed* the baseline, so it knows
+                    # what serving has to look up from the guard's history.
+                    # Passing it keeps the two sizing the same query the same
+                    # way: `budget_for` declines to widen anything measured
+                    # under half a second, and a query collected at the wide
+                    # budget but served at the narrow one is the same
+                    # train/serve gap in reverse.
+                    observed_native_ms=_median_latency(baseline_runs),
+                ),
                 include_join_methods=include_join_methods,
                 include_tuning=include_tuning,
                 join_graph=baseline.get("join_graph"),
+                include_bushy=planner.INCLUDE_BUSHY,
+                include_scan_methods=planner.INCLUDE_SCAN_METHODS,
+                include_negative_scans=planner.INCLUDE_NEGATIVE_SCANS,
+                include_negative_joins=planner.INCLUDE_NEGATIVE_JOINS,
+                include_memoize=planner.INCLUDE_MEMOIZE,
+                include_parallel=planner.INCLUDE_PARALLEL,
+                include_enable_settings=planner.INCLUDE_ENABLE_SETTINGS,
+                include_extended_toggles=planner.INCLUDE_EXTENDED_TOGGLES,
+                include_cost_model=planner.INCLUDE_COST_MODEL,
+                # Needs the catalog, exactly as serving does. Reusing the
+                # planner's own helper keeps the two from drifting: it returns
+                # None when the family is off or the cursor is missing, and the
+                # family then generates nothing.
+                include_disable_index=planner.INCLUDE_DISABLE_INDEX,
+                table_indexes=planner._index_candidates_for(cur, baseline),
             )
 
             for hint in hints:

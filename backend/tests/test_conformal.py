@@ -125,12 +125,58 @@ def test_coverage_holds_when_the_residuals_are_heavy_tailed():
 
 def test_the_normalised_bound_scales_with_the_ensemble_s_spread():
     """When the spread is informative, normalising widens the interval exactly
-    where the model is unsure. That is the case this mode is for."""
+    where the model is unsure. That is the case this mode is for.
+
+    The spreads here span 0.1 to 1.0, so the fitted floor sits near the bottom
+    of that range and the bound scales across the rest of it. Comparing 1.0
+    against 0.1 would compare two points that both land on the floor."""
+    stds = [0.1 + 0.9 * i / 99 for i in range(100)]
     gate = ConformalGate(alpha=0.1, normalize=True).fit(
-        [0.0] * 100, [1.0] * 100, [float(i) / 100 for i in range(100)]
+        [0.0] * 100, stds, [float(i) / 100 for i in range(100)]
     )
 
-    assert gate.upper_bound(0.0, 1.0) > gate.upper_bound(0.0, 0.1)
+    assert gate.upper_bound(0.0, 1.0) > gate.upper_bound(0.0, 0.5)
+
+
+def test_the_floor_is_fitted_from_the_spreads_that_were_seen():
+    """`MIN_SIGMA` is a numerical guard against dividing by zero, not a
+    statistical one. A calibration row where the eight members agree to six
+    decimal places gets `std = 1e-6`, so an ordinary residual of 0.1 scores
+    100,000 and decides the quantile by itself -- which is why the normalised
+    bound was measured as unusable and the absolute one became the default."""
+    stds = [1e-9] * 25 + [0.2] * 75
+    gate = ConformalGate(alpha=0.1, normalize=True).fit(
+        [0.0] * 100, stds, [0.1] * 100
+    )
+
+    assert gate.sigma_floor is not None
+    assert gate.sigma_floor > 1e-6, "a near-zero row still sets the scale"
+    # Without the floor, 0.1 / 1e-9 = 1e8 dominates every other score.
+    assert gate.q < 10.0, f"quantile still exploded: {gate.q}"
+
+
+def test_the_score_function_is_the_same_at_fit_and_at_serving():
+    """Conformal coverage requires it. Flooring at fit and not at serving would
+    apply a quantile fitted under one scaling to scores computed under
+    another."""
+    stds = [0.05] * 50 + [0.5] * 50
+    gate = ConformalGate(alpha=0.1, normalize=True).fit(
+        [0.0] * 100, stds, [0.1] * 100
+    )
+
+    floor = gate.sigma_floor
+    # Anything at or below the floor gets the floor's bound, not a smaller one.
+    assert gate.upper_bound(0.0, floor / 10) == gate.upper_bound(0.0, floor)
+
+
+def test_an_absolute_gate_is_unaffected_by_the_floor():
+    """It never divides, so there is nothing to floor."""
+    gate = ConformalGate(alpha=0.1, normalize=False).fit(
+        [0.0] * 100, [1e-9] * 100, [0.1] * 100
+    )
+
+    assert gate.sigma_floor is None
+    assert gate.upper_bound(0.0, 1e-9) == gate.upper_bound(0.0, 100.0)
 
 
 def test_the_absolute_bound_ignores_the_spread():

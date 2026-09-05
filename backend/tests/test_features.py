@@ -219,3 +219,96 @@ def test_a_zero_row_table_does_not_divide_by_zero():
 
     assert features["orders_present"] == 1.0
     assert features["orders_selectivity"] >= 0.0  # finite, not a crash
+
+
+# -- features read off the query, not the plan ------------------------------
+
+
+from app.optimizer.features import predicate_shape  # noqa: E402
+
+
+def test_two_equalities_on_one_table_are_counted_together():
+    """
+    PostgreSQL multiplies the selectivities of `a = x AND b = y` as though the
+    columns were unrelated. That is the assumption `data/schema.sql` was rebuilt
+    to violate (WRITEUP 2.9), and it is invisible in the plan -- the plan is
+    what the planner believed *after* applying it.
+
+    Measured across 59 workload queries, median available headroom rises
+    monotonically with this count: 16.9% at zero, 25.3% at one, 31.4% at two or
+    more.
+    """
+    shape = predicate_shape(
+        "SELECT * FROM users u WHERE u.city = 'Mumbai' AND u.country = 'IN'"
+    )
+
+    assert shape["max_same_table_equalities"] == 2
+    assert shape["n_equality_predicates"] == 2
+
+
+def test_equalities_on_different_tables_are_not_the_same_risk():
+    """Two filters on two tables are never multiplied together, so they do not
+    exercise the independence assumption."""
+    shape = predicate_shape(
+        "SELECT * FROM users u JOIN orders o ON o.user_id = u.id "
+        "WHERE u.city = 'Mumbai' AND o.status = 'completed'"
+    )
+
+    assert shape["max_same_table_equalities"] == 1
+    assert shape["n_equality_predicates"] == 2
+
+
+def test_join_keys_are_not_selectivity_predicates():
+    """`o.user_id = u.id` estimates a join, not a filter on one table."""
+    shape = predicate_shape(
+        "SELECT * FROM users u JOIN orders o ON o.user_id = u.id WHERE o.id = 5"
+    )
+
+    assert shape["n_equality_predicates"] == 1
+
+
+def test_ranges_are_counted_separately():
+    shape = predicate_shape(
+        "SELECT * FROM orders o WHERE o.created_at >= '2024-01-01' AND o.id < 500"
+    )
+
+    assert shape["n_range_predicates"] >= 1
+
+
+def test_a_query_with_no_filters_scores_zero_not_missing():
+    """Zero is the honest value: no filters means no conjunction to
+    mis-estimate."""
+    for sql in (None, "", "SELECT * FROM users u JOIN orders o ON o.user_id = u.id"):
+        shape = predicate_shape(sql)
+        assert shape["max_same_table_equalities"] == 0
+        assert shape["n_equality_predicates"] == 0
+
+
+def test_both_paths_attach_the_query_text():
+    """
+    A feature populated in training and absent at serving is train/serve skew by
+    construction -- the model fits a signal guaranteed missing when it matters.
+    This project has WRITEUP 2.43, 2.47, 2.50 and 2.56 to show for that shape,
+    so the two sides are asserted to agree rather than assumed to.
+    """
+    import inspect
+
+    from app import benchmark, train
+    from app.optimizer import planner
+
+    assert '"sql_text"' in inspect.getsource(train._row_to_candidate)
+    assert 'plan["sql_text"]' in inspect.getsource(planner.plan_query)
+    assert 'plan["sql_text"]' in inspect.getsource(benchmark.run)
+
+
+def test_the_feature_is_in_the_declared_column_list():
+    from app.optimizer.features import build_feature_columns
+
+    columns = build_feature_columns(["users", "orders"])
+
+    for name in (
+        "max_same_table_equalities",
+        "n_equality_predicates",
+        "n_range_predicates",
+    ):
+        assert name in columns

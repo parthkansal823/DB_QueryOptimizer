@@ -29,7 +29,7 @@ from app.optimizer.hints import apply_hint, plan_fingerprint, split_hints
 from app.optimizer.learned import LearnedOptimizer
 from app.optimizer import planner
 from app.optimizer.planner import candidate_hints, optimize_and_execute
-from app.optimizer.regression_guard import RegressionGuard
+from app.optimizer.regression_guard import SHADOW_SELECTOR, RegressionGuard
 from app.optimizer.regret import regret_curve
 from app.plan_extractor import get_plan
 from app.schema_graph import discover_with_inference
@@ -660,6 +660,21 @@ def _optimize_query(req: QueryRequest):
                 plan=result["shadow_native_plan"],
                 is_baseline=True, selector_used="native", is_chosen=False,
             )
+        # The learned plan for a *blocked* query: measured, never served.
+        #
+        # `is_chosen=False` because nobody received it, and
+        # `selector_used=SHADOW_SELECTOR` because the regression guard needs it
+        # and `app.stats` must not. Without this a blocked query accumulates no
+        # evidence about the learned path at all, so its block lifts when the
+        # old evidence ages out rather than when the model improves -- a timer,
+        # not a decision.
+        if result.get("shadow_learned_plan") is not None:
+            log_execution(
+                cur, query_id=query_id, sql_text=req.sql,
+                plan=result["shadow_learned_plan"],
+                hint=result.get("shadow_learned_hint"),
+                is_baseline=False, selector_used=SHADOW_SELECTOR, is_chosen=False,
+            )
 
     return {
         "hint": result["hint"],
@@ -718,7 +733,13 @@ def database_advisor(include_statistics: bool = False):
     Nothing is changed. Each finding carries the statement that would apply it.
     """
     with get_cursor() as cur:
-        findings = dbadvisor.report(cur, include_statistics=include_statistics)
+        # The workload is passed so the index findings can answer "what would
+        # dropping this do to my plans" rather than only "has it been scanned"
+        # -- a counter that resets on `pg_stat_reset()` and starts at zero on a
+        # replica promoted yesterday. See `dbadvisor.index_simulation`.
+        findings = dbadvisor.report(
+            cur, include_statistics=include_statistics, queries=list(workload.WORKLOAD)
+        )
     return {"n_findings": dbadvisor.count_findings(findings), **findings}
 
 

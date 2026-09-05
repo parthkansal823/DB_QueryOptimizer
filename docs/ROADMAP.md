@@ -230,6 +230,34 @@ for exactly those near-ties.
 queries &mdash; JOB goes to 17 tables &mdash; have never been touched, and eight
 held-out queries is more than two and still few.
 
+### 1b. Re-collect under the widened action space
+
+2.56 raised the ceiling and nothing has been re-measured against it. Three fixes
+landed: `budget_for` scales with join width as well as cost (`17c` goes from 20
+candidates to 90), `hint_family` names the 39% of the action space that
+classified as `other` and was therefore dropped from every replay, and
+`app.collect_data` forwards the same flags and budget as serving instead of
+`generate_candidates`' bare defaults.
+
+Confirmed on two queries: `2b`'s available headroom went from **0.6% to 36.7%**
+and `2d`'s from **2.5% to 34.1%**, both on a single `SeqScan(...)` hint.
+
+What is left is arithmetic, and it is slow rather than hard:
+
+1. re-collect all 30 JOB queries with `INCLUDE_SCAN_METHODS=1` (the `17*` family
+   is twenty minutes each, so budget two to three hours);
+2. re-train and compare against the 99.2% recorded above, which is a figure
+   against the *old* ceiling;
+3. run `app.autotune`, which sweeps `scan_method` as a fourth optional family
+   now, to settle whether it earns its planning cost per database;
+4. do the same on the synthetic workload and re-run the headline benchmark --
+   `17c` measured 80 candidates at 352 ms of planning, 1.63% of its runtime, but
+   the synthetic queries are milliseconds and the ratio there is unmeasured.
+
+Step 4 is the one with a real risk attached: widening the search costs planning
+time on every query, and the synthetic workload is where that cost is largest
+relative to the query.
+
 ### 2. Fix the ranking on unseen queries
 
 **This replaced "replace the uncertainty estimate", and the reason is worth
@@ -386,9 +414,17 @@ Train on `lqo`, serve on JOB. The features are schema-agnostic by construction
 (`scan_relations`, `schema_introspection`) and that claim has never been tested
 in the direction that would falsify it.
 
-### 15. Teach the regression guard *what* to block
+### 15. Teach the regression guard *what* to block &mdash; **done**
 
-It blocks a whole query after three bad observations. It could block the hint
-*family* that regressed and leave the rest of the action space available —
-2.19's measured point, that a rate says how often and not how badly, applies to
-the guard as much as to the gate.
+The entry described the guard blocking a whole query after three bad
+observations, and proposed blocking the hint *family* instead. That was built:
+`blocked_families`, `is_family_blocked` and `allowed_hints` exist, are wired into
+`planner.plan_query`, and are tested. The entry had gone stale.
+
+What the re-check *did* find is that `app.benchmark` built its candidate list
+straight from `candidate_hints` and never applied the filter, so with the guard
+on it scored a wider action space than production serves. `--protocol compare`
+runs guardless and is unaffected; `--protocol deploy` was overstating. Fixed,
+with a test that the filter stays conditional on `use_guard` &mdash; applying it
+under `compare` would reintroduce the guard's state into a protocol built to
+exclude it (2.30).

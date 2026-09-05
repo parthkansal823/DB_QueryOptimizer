@@ -244,11 +244,30 @@ def _servable(candidates: list[dict], allowed: "set[str] | None" = None) -> list
         # explicit set instead, because "which action space is best" is a
         # question you cannot ask by reading the answer off the configuration
         # you are trying to choose.
+        #
+        # `scan_method`, `memoize` and `parallel` joined this list once
+        # `hint_family` learned to name them. Before that they classified as
+        # `other`, which is in no allowed set, so every scan-method candidate
+        # the server generated was silently dropped from every replay -- 37 of
+        # 96 hints with the full action space on, 39% of it. Latent, because
+        # those families are all off by default; it would have bitten the first
+        # person who turned one on, as a gate calibrated over a smaller action
+        # space than the one being served.
         allowed = {"join_order", "operator_toggle", "cardinality"}
         if planner.INCLUDE_TUNING:
             allowed.add("resource")
         if planner.INCLUDE_JOIN_METHODS:
             allowed.add("join_method")
+        if (
+            planner.INCLUDE_SCAN_METHODS
+            or planner.INCLUDE_NEGATIVE_SCANS
+            or planner.INCLUDE_INDEX_PINNING
+        ):
+            allowed.add("scan_method")
+        if planner.INCLUDE_MEMOIZE:
+            allowed.add("memoize")
+        if planner.INCLUDE_PARALLEL:
+            allowed.add("parallel")
 
     return [c for c in candidates if hint_family(c.get("hint")) in allowed]
 

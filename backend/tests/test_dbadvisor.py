@@ -410,3 +410,94 @@ def test_the_report_always_contains_its_catalogue_sections(section, monkeypatch)
     cur = _Cursor({})
 
     assert section in dbadvisor.report(cur, include_statistics=False)
+
+
+# -- the pair budget is spread, not spent alphabetically --------------------
+
+
+class _PairCursor:
+    """Enough of a cursor for `correlated_pairs`: no extended stats, some
+    columns per table, and row counts that put `zzz` first by size."""
+
+    def __init__(self, columns_by_table, rows_by_table):
+        self.columns_by_table = columns_by_table
+        self.rows_by_table = rows_by_table
+        self._result = []
+
+    def execute(self, sql, params=None):
+        if "pg_statistic_ext" in sql:
+            self._result = []
+        elif "pg_stats" in sql:
+            self._result = [
+                (table, column, 10, 0.0)
+                for table, cols in self.columns_by_table.items()
+                for column in cols
+            ]
+        else:  # TABLE_ROWS_SQL
+            self._result = list(self.rows_by_table.items())
+
+    def fetchall(self):
+        return self._result
+
+
+def test_the_pair_budget_reaches_every_table():
+    """
+    `correlated_pairs` iterated `sorted(by_table.items())` and returned the
+    moment it hit `max_pairs`. On the project's own schema that took 24 of 58
+    pairs and stopped inside `products`, so `suppliers` and `users` were never
+    looked at at all.
+
+    `users(city, country)` is one of the two correlations `data/schema.sql`
+    exists to contain -- 63.1% available headroom in WRITEUP 2.9 -- and it was
+    excluded for starting with a letter near the end of the alphabet. Evaluated
+    directly it passes easily: q-error 1.89 -> 1.00 against a 0.25 threshold.
+    """
+    from app.dbadvisor.extended_stats import correlated_pairs
+
+    cur = _PairCursor(
+        columns_by_table={
+            "aaa": ["c1", "c2", "c3", "c4"],
+            "mmm": ["c1", "c2", "c3", "c4"],
+            "zzz": ["c1", "c2", "c3", "c4"],
+        },
+        rows_by_table={"aaa": 100, "mmm": 100, "zzz": 100},
+    )
+
+    tables = {p["table"] for p in correlated_pairs(cur, max_pairs=6)}
+
+    assert tables == {"aaa", "mmm", "zzz"}, (
+        f"budget did not reach every table: {tables}"
+    )
+
+
+def test_the_largest_table_is_served_first():
+    """A dependency on a 500k-row table costs more than the same dependency on
+    a twelve-row lookup, so the budget goes to the big tables first."""
+    from app.dbadvisor.extended_stats import correlated_pairs
+
+    cur = _PairCursor(
+        columns_by_table={"small": ["a", "b"], "huge": ["a", "b"]},
+        rows_by_table={"small": 12, "huge": 500_000},
+    )
+
+    pairs = correlated_pairs(cur, max_pairs=1)
+
+    assert [p["table"] for p in pairs] == ["huge"]
+
+
+def test_the_pair_list_stays_bounded_and_deterministic():
+    """Each pair costs a probe query and an ANALYZE, so the cap has to hold --
+    and two runs must agree, or the advisor's output churns."""
+    from app.dbadvisor.extended_stats import correlated_pairs
+
+    def _cur():
+        return _PairCursor(
+            columns_by_table={f"t{i}": ["a", "b", "c"] for i in range(5)},
+            rows_by_table={f"t{i}": 1000 - i for i in range(5)},
+        )
+
+    first = correlated_pairs(_cur(), max_pairs=7)
+    second = correlated_pairs(_cur(), max_pairs=7)
+
+    assert len(first) == 7
+    assert first == second

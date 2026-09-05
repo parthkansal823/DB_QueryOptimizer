@@ -5251,6 +5251,15 @@ saved. Three of those are queries with almost nothing to win: `2b` had 2.7 ms of
 headroom, `2d` had 14.4 ms, and `5b`'s oracle is *slower than native*, so no
 candidate beats PostgreSQL and any deviation loses by construction.
 
+> **That last sentence is wrong, and 2.56 is why.** It is true of the action
+> space these numbers were collected under and false of the query. Re-collected
+> with scan methods, `5b` has **9.4%** available (oracle 68.2 ms against 75.3 ms
+> native), `2b` goes 0.6% -> **34.0%**, and `2d` 2.5% -> **40.0%**. The excuse
+> offered here for three of the four regressions -- that there was nothing to
+> win -- does not survive widening the search. What survives is that the model
+> picked badly on queries where the margin was small, which is a different and
+> less comfortable claim.
+
 So the honest description is: **half the held-out queries get slightly worse,
 two very expensive ones carry the aggregate, and the trade is 26 seconds saved
 against 0.2 seconds lost.** That is the right trade for a benchmark about
@@ -5291,3 +5300,734 @@ candidate sampler has never been pointed at them. `17c` was the expensive end of
 what was tested and took twenty minutes to collect, because most of its
 candidates hit the 120 s statement timeout. Eight held-out queries is more than
 two and still few.
+
+## 2.56 The ceiling was the problem, not the aim
+
+2.55 reports the model capturing **99.2%** of the available headroom on JOB, and
+that framing invites the wrong conclusion: that selection is finished and the
+remaining work is elsewhere. The oracle is the best plan **in the action space
+that was collected**, so 99.2% of it says nothing about how good that space was.
+
+Probing the four expensive held-out queries with a wider search -- more join
+orders, and every opt-in family switched on -- found something better than the
+recorded oracle on **all four**:
+
+| query | native | oracle on record | wider search | winning hint |
+|---|---|---|---|---|
+| `17c` | 21603.7 | 1963.3 | **1043.4** | `Leading(n ci mk mc t cn k)` |
+| `17d` | 8822.2 | 2447.9 | **2232.9** | `Set(enable_nestloop off)` |
+| `2d` | 586.1 | 571.7 | **463.6** | `SeqScan(mc)` |
+| `2b` | 463.6 | 460.9 | **311.0** | `SeqScan(cn)` |
+
+`17c` drops another **47%** -- 20.7x faster than native rather than 11x. And
+`2b`, which 2.55 describes as having "2.7 ms of headroom", has **153 ms**: a
+third of its runtime, reachable by one `SeqScan` hint. That sentence was true of
+the action space and false of the query, which is a distinction this project has
+been careless about.
+
+### Cause one: the join-order sample was eight
+
+`generate_candidates(max_order_candidates=8)`. A 7-table query has 5040 join
+orders, so the search covered **0.16%** of the space:
+
+| tables | orders | 8 candidates covers |
+|---|---|---|
+| 2 | 2 | exhaustive |
+| 4 | 24 | 33% |
+| 7 | 5040 | **0.16%** |
+
+A fixed sample covers exponentially less as the query widens, and it runs out
+exactly where join order starts to matter. The winning hint for `17c` is a pure
+`Leading(...)`, so this was the binding constraint and not a missing family.
+
+**And the budget made it worse by trusting the cost model.** `budget_for` scaled
+the candidate count by PostgreSQL's estimate alone. `17c` is priced at **4409**
+-- the same tier as a query costing 3900 and finishing in 400 ms -- and takes
+**21.6 seconds**. So the search was starved on precisely the queries whose
+estimates are most wrong, which are precisely the queries with the most
+headroom. A system built because cost estimates are unreliable was using them to
+decide how hard to look.
+
+`budget_for` takes join width now. `17c` goes from 20 candidates to 80, and
+80 candidates measured **352 ms of planning -- 1.63%** of that query's runtime.
+The multiplier is bounded at both ends: it does not apply below 200 cost units,
+where a wide join has nothing to win anyway, and the total is capped at 96,
+because 108 hints on `17c` already collapse to 25 distinct plans and the plan
+space becomes the constraint before the sample does.
+
+### Cause two: 39% of the action space had no name
+
+`SeqScan(...)` wins on `2b` and `2d`, and `hint_family` classified it as
+`other`. So did `IndexScan`, `BitmapScan`, `IndexOnlyScan`, their negative
+forms, `Memoize`, `NoMemoize`, `Parallel` and `DisableIndex` -- **37 of 96
+hints** with the full action space enabled.
+
+`other` is in no `_servable` allowed set. Every one of those candidates would
+have been generated and served while being silently dropped from every replay:
+`app.calibrate`, `app.autotune`, `retrain._score_bundle`. A gate calibrated over
+a strictly smaller action space than the one being served, which is 2.47's bug
+in a new place.
+
+It was latent because those families all default to off, so it would have bitten
+the first person to turn one on. And `tests/test_family_guard.py` did not catch
+it: it asserts the Python and SQL classifiers agree, and they did -- **both said
+`other`**. Agreement on a wrong answer is still agreement.
+
+Three families named (`scan_method`, `memoize`, `parallel`), `_servable` and
+`diagnostics._served_families` updated to admit them under their flags, and a
+test that no hint `generate_candidates` can produce classifies as `other`.
+`app.autotune` sweeps `scan_method` as a fourth optional family, so whether it
+earns its planning cost is measured per database rather than assumed off.
+
+### Cause three: collection was narrower than serving
+
+Fixing the first two exposed a third, and the comment three lines above it in
+`app.collect_data` is about exactly this class of bug:
+
+> The join graph must match what serving uses, or training data is gathered over
+> a different action space than the one the model is later asked to score -- the
+> train/serve skew README.md warns about.
+
+Only the join-graph half had been done. The call took `generate_candidates`'
+bare defaults for everything else -- `max_order_candidates=8`, every opt-in
+family off -- while `planner.candidate_hints` forwards the module flags and a
+width-scaled budget. After the budget fix, serving plans **90 candidates** for
+`17c` where collection gathered 20, and the model would have been asked to score
+join orders it had never seen.
+
+Collection may legitimately be *wider* than serving: it gathers the forced
+join-method family that `budget_for` often truncates, and `calibrate._servable`
+narrows the replay back down. Narrower is the direction that hurts, and it is
+the failure 2.9 measured -- 17 of 25 queries into the safety veto. Collection
+forwards the same flags and the same `budget_for` now, and a test asserts the
+invariant by comparing the two functions' source.
+
+That fix also surfaced a latent `UnboundLocalError`: `planner` was imported
+inside an `if` in `collect()`, which makes it a local name for the whole
+function, so every new `planner.X` reference would have failed on any call
+passing `include_join_methods` explicitly -- which is what `collect_data_job`
+does.
+
+### And the width fix had the same bug in it
+
+Widening the search costs planning time on every query it touches, so the first
+version gated the multiplier on estimated cost -- `WIDTH_MULTIPLIER_MIN_COST`.
+Measured on the synthetic workload, that gate does not work, and the two numbers
+that break it sit on opposite sides of every possible threshold:
+
+| query | estimated cost | measured runtime |
+|---|---|---|
+| JOB `17c` | 4409 | **21603 ms** |
+| synthetic `corr_6w_everything` | 12954 | **144 ms** |
+
+The cheaper-costed query takes **150x longer**. Widening `17c` cost 352 ms of
+planning against 21.6 seconds -- 1.63% -- and found a plan 47% faster. Widening
+`corr_6w_everything` moved its planning from 48 ms to 63 ms against a 144 ms
+query, taking overhead from **33% to 44%**. Same multiplier, opposite verdicts,
+and cost is *anti-correlated* with runtime across the pair, so no threshold on
+it separates them.
+
+Which is the bug this section is about, one level up: I fixed a budget that
+trusted the cost model by adding a gate that trusted the cost model.
+
+`budget_for` takes `observed_native_ms` now, read from the latency table the
+regression guard already keeps, and declines to widen anything measured under
+500 ms whatever its shape or estimate. No history still widens -- first sight of
+a query is when exploration is worth most, and one over-wide search is cheap
+against never finding the plan.
+
+| scenario | budget |
+|---|---|
+| JOB `17c`, cost 4409, 7 tables, measured 21603 ms | **80** |
+| synthetic 6-way, cost 12954, 6 tables, measured 144 ms | **20** |
+| synthetic 6-way, no history | 60 |
+| 3-table, cost 500, measured 27 ms | 10 |
+
+The synthetic workload is back to its old budget on every query it has measured,
+and JOB gets the wider search. That is the separation cost could not make.
+
+### Confirmed by execution
+
+Re-collecting `2b` and `2d` under the widened space, and reading the oracle back
+out of the log:
+
+| query | native | oracle before | oracle after | headroom |
+|---|---|---|---|---|
+| `2b` | 463.6 | 460.9 | **293.6** | **0.6% -> 36.7%** |
+| `2d` | 586.1 | 571.7 | **386.3** | **2.5% -> 34.1%** |
+
+Both won by a single `SeqScan(...)`. These are the two queries 2.55 describes as
+having "almost nothing to win", and which *regressed* in that evaluation. A
+third of their runtime was available the whole time, in a family that was never
+collected.
+
+### What this does to the earlier numbers
+
+It does not invalidate them; it reframes what they measure. 99.2% of headroom
+captured is still 99.2% of headroom captured -- against a ceiling now known to
+be roughly 900 ms too high on `17c` alone. The model was choosing well among the
+options it had, and the options were the constraint.
+
+That is a more encouraging position than it sounds, because action-space work is
+cheap and bounded, while model work is neither. It is also the third time this
+session that the binding constraint turned out to be something other than the
+model: the policy (2.43), the measurement (2.47), and now the candidates.
+
+## 2.57 Three CREATE STATISTICS statements remove 98% of the opportunity
+
+`dbadvisor/extended_stats.py` finds correlated columns and reports them. The
+roadmap's argument for acting on them rather than reporting them was that
+`CREATE STATISTICS ... (dependencies)` fixes the estimate at its source, which
+helps every query against those columns forever -- including ones this optimizer
+never sees -- and *shrinks the headroom the optimizer is chasing*.
+
+That last clause was a hypothesis. It is now measured, and it is larger than
+expected.
+
+### The advisor could not see one of the two designed traps
+
+`recommend()` returned two objects and `users(city, country)` was not among
+them -- one of the two correlations `data/schema.sql` exists to contain,
+measured at **63.1%** available headroom in 2.9.
+
+Evaluated directly it passes easily: q-error **1.89 falling to 1.00**, an
+improvement of 0.47 against a 0.25 threshold. It was never evaluated.
+`correlated_pairs` iterated `sorted(by_table.items())` and returned the moment
+it hit `max_pairs=24`, so of 58 candidate pairs it took the first 24
+alphabetically:
+
+```
+order_items 6, orders 10, product_suppliers 6, products 2, then nothing
+```
+
+`suppliers` and `users` were never looked at. The advisor was systematically
+blind to the end of the alphabet.
+
+Round-robin across tables now, largest first: every table contributes its best
+candidate before any table contributes a second, and the budget goes to big
+tables first because a dependency on 500k rows costs more than the same
+dependency on a twelve-row lookup. Still bounded -- each pair costs a probe
+query and an `ANALYZE`. Recommendations went from 2 to 3, and both designed
+traps are now among them.
+
+### The measurement, alternated because one run of this settles nothing
+
+Two identical "before" runs gave **14.9%** and **19.3%** headroom, which is
+2.18's 18.6% run-to-run variation landing directly on the quantity being
+compared. So: three rounds, alternating stats on and off, on the eight workload
+queries whose filters touch the correlated columns.
+
+| arm | native (median, range) | oracle | headroom |
+|---|---|---|---|
+| statistics **ON** | 595.9 [546.0, 635.3] | 567.4 [544.1, 634.1] | **0.4%** [0.2, 4.8] |
+| statistics **OFF** | 602.0 [520.6, 651.7] | 481.4 [446.6, 530.6] | **18.6%** [14.2, 20.0] |
+
+The headroom ranges are **disjoint**, which is this project's own standard for a
+difference worth believing (2.32). Native is unchanged between the arms -- the
+ranges overlap almost entirely -- so the mechanism is not "queries got faster".
+It is that **PostgreSQL's own plan is now already the good one**, and the oracle
+rises to meet it. There is nothing left for a plan-picker to find.
+
+Three `CREATE STATISTICS` statements, one `ANALYZE`, and **98% of the
+opportunity is gone**.
+
+### What that means for this project, stated plainly
+
+The queries in this measurement are the ones `data/schema.sql` was rebuilt to
+contain (2.9): correlated columns that PostgreSQL mis-estimates because it
+assumes independence. They are the project's best case, deliberately
+constructed, and they are also precisely the case a `dependencies` statistics
+object fixes outright.
+
+So the honest ordering for anyone deploying this:
+
+1. **Run the advisor and create the statistics.** It is three statements, it
+   costs one `ANALYZE`, it helps every query against those columns whether or
+   not this optimizer ever sees them, and on this workload it removes almost all
+   of the headroom.
+2. **Then run the optimizer on what remains.**
+
+Doing it the other way round means a learned model spending its capacity
+rediscovering, per query, an estimate the planner could have been told once.
+
+### Why this does not make the project pointless
+
+Three reasons, and the first is the one that matters.
+
+**It does not generalise past the case it fixes.** Extended statistics correct
+*single-table* multi-column selectivity. They do nothing for join-order errors,
+which is the entire content of the Join Order Benchmark and where 2.55 measured
+`17c` going from 21.6 s to 2.0 s. Nothing in `CREATE STATISTICS` reaches that.
+
+**Someone has to know which columns.** The advisor is the thing that found them,
+and it found them by measuring q-error against real probe queries rather than by
+being told. That machinery is part of this project.
+
+**The oracle ceiling is the honest metric, and it just moved.** A system whose
+reported win shrinks when the database is fixed is a system whose metric is
+measuring the right thing. If the headline had *not* moved, that would have been
+evidence the oracle was measuring something other than real opportunity.
+
+The uncomfortable version is still worth writing down: on the synthetic
+workload, this project's central claim competes with three lines of SQL, and the
+three lines win.
+
+## 2.58 Buffers are a perfectly stable label for the wrong quantity
+
+The roadmap's case for training on buffer counts instead of wall-clock latency:
+latency varies **18.6%** between identical executions of the same plan (2.18),
+and that noise goes straight into the label the model fits. Buffer counts are a
+property of the plan and the data, not of what else the machine was doing.
+
+Two things have to hold for the swap to be worth making, and only the first
+does. Measured over 27,001 logged rows, every one of which already carries
+`Shared Hit Blocks` because `get_plan` asks for `BUFFERS`:
+
+### Buffers are stable. Enormously so.
+
+Across 1,721 `(query, hint)` pairs executed three or more times:
+
+| | median spread | mean spread |
+|---|---|---|
+| wall-clock latency | **96.4%** | 99.8% |
+| buffer count | **0.0%** | 1.6% |
+
+Buffers are **identical across every repetition** on 1,136 of 1,721 pairs. The
+latency figure is larger than 2.18's 18.6% because this spans every run ever
+logged rather than one sitting, which is the right comparison for a training
+label: the model fits all of it.
+
+So the premise holds completely. A label with zero variance where the current
+one has ~96%.
+
+### And they rank the candidates differently
+
+| | value |
+|---|---|
+| queries with 4+ distinct candidates | 59 |
+| Spearman(latency, buffers) within a query, median | **+0.341** |
+| positive | 53 / 59 |
+| **above +0.8** | **0 / 59** |
+
+Right sign, nowhere near strong enough. Not one query in fifty-nine has buffers
+ordering its candidates the way latency does.
+
+That is not surprising once stated: two plans touching the same pages can differ
+by a sort that spills, a hash that fits in `work_mem` or does not, a nested loop
+re-reading cached pages cheaply. Buffers count *pages touched*; latency measures
+*work done*. They are correlated because both grow with data volume, and they
+diverge precisely on the operator choices this system exists to make.
+
+### The verdict, and the useful thing underneath it
+
+**Rejected as a replacement label.** A model trained on buffers would learn to
+pick the plan that touches fewest pages, which is the right answer 34% as often
+as the question is asked. That trades the current label's *noise* for *bias*, and
+bias does not average out with more data.
+
+**Worth keeping for two other jobs**, both of which follow from the stability
+number rather than the correlation:
+
+- **As a noise floor.** Two candidates with identical buffer counts did the same
+  page work, so any latency difference between them is measurement noise. That
+  is a per-pair noise estimate the project currently gets only from repeated
+  execution, and it is free -- it is already in the log. 2.18 measures noise
+  globally; this would measure it per comparison.
+- ~~**As a feature.**~~ Checked before writing it down, and it does not work.
+  Buffer counts come from `EXPLAIN ANALYZE`, and the production path plans every
+  candidate with `analyze=False`, executing only the winner (2.6). Verified
+  against a live planner: `get_plan(..., analyze=False)["buffers"]` is `None`.
+  A feature populated in training and absent at serving is train/serve skew by
+  construction -- the model would fit a signal guaranteed missing at the moment
+  it matters. This is the same constraint that shapes the whole feature set, and
+  it is worth noticing *before* adding the feature rather than after the
+  deviation rate collapses.
+
+The noise-floor use is open. What is closed is the version in the roadmap: the label stays
+wall-clock, and the reason is measured rather than assumed.
+
+## 2.59 The normalised bound was blamed for the wrong thing
+
+`optimizer/conformal.py` defaults to an **absolute** bound -- `mean + q` rather
+than `mean + q·sigma` -- and its docstring gives the reason: over 2,483
+calibration rows the normalised version was unusable at every risk level worth
+having, because rows where the eight ensemble members agree almost exactly give
+a near-zero denominator that dominates the quantile.
+
+2.46 took that at face value and proposed the obvious repair: the degenerate
+denominators are the problem, not the normalisation, so floor sigma at a
+percentile of the sigmas actually observed and the normalised bound should
+become usable while keeping the per-candidate scaling the absolute one throws
+away.
+
+The floor is built -- `sigma_floor_percentile`, fitted at calibration time and
+applied identically at serving, because conformal coverage requires the score
+function to be the same in both places. Then it was measured, on 1,525 rows
+across 59 queries with a query-level split:
+
+| variant | q | held-out coverage | target |
+|---|---|---|---|
+| **absolute (current default)** | 0.2876 | **90.6%** | 90% |
+| normalised, `MIN_SIGMA` only | 5.6073 | 83.8% | 90% |
+| normalised, p25 sigma floor | 5.2700 | 83.8% | 90% |
+| normalised, p50 sigma floor | 4.0825 | 85.8% | 90% |
+
+The floor narrows the bound by 6% and moves coverage not at all. And the line
+that explains why is the one above the table:
+
+```
+sigma: min 5.00e-03  p25 0.0186  median 0.0381  max 0.7512
+rows with sigma < 1e-4: 0 (0.0%)
+```
+
+**There are no near-zero denominators.** The smallest sigma in the whole
+calibration sample is 5e-3, five thousand times `MIN_SIGMA`. The failure the
+docstring describes cannot be happening on this model, and flooring something
+that never approaches the floor changes nothing.
+
+### So why is normalised worse?
+
+Because sigma is not proportional to error. 2.4.5 measured `uncertainty_scale`
+at **3.75** -- the ensemble's spread understates its own error by nearly four
+times -- and that mis-scaling is not uniform across rows. Dividing a residual by
+a quantity that tracks error badly does not standardise the score, it adds a
+second source of variation to it. The absolute bound never divides, so it never
+inherits that.
+
+Which makes the absolute default correct for a reason its own docstring does not
+give. The stated reason -- degenerate denominators -- was true of whatever model
+it was written against and is not true of this one; the real reason is the one in
+2.4.5, and it does not go away with more data or a better floor.
+
+### What was kept anyway
+
+The floor stays, defaulted on for normalised gates and inert for absolute ones.
+It costs nothing, it is the right guard for a model that *does* produce
+degenerate sigmas, and a future ensemble with tighter agreement would hit
+exactly the failure the docstring describes. Keeping a cheap guard against a
+failure that has been observed once is not the same as acting on a diagnosis
+that turned out to be wrong here.
+
+`P6` is closed as measured-and-rejected. The conformal gate stays absolute, and
+the reason recorded next to it is now the one the numbers support.
+
+## 2.60 A feature that reads the question instead of the answer
+
+Every feature in the vector is read off PostgreSQL's chosen plan: node types,
+estimated rows, costs, tree shape. All of it describes what the planner
+*decided* -- and the premise of this project is that what it decided is wrong in
+exactly the cases with headroom. The plan is the answer; nothing described the
+question.
+
+The specific gap is 2.9's mechanism. PostgreSQL estimates `WHERE a = x AND b =
+y` as sel(a) x sel(b), which is right only when the columns are unrelated, and
+`data/schema.sql` was rebuilt to contain exactly that violation. A plan built on
+that assumption cannot reveal it: the row estimate it carries is the assumption's
+output.
+
+### Measured before building it
+
+The hypothesis is testable without writing a feature: if same-table equality
+conjunctions are where the estimate goes wrong, they should be where the
+headroom is. Across 59 workload queries, median available headroom:
+
+| same-table equalities | queries | median headroom | mean |
+|---|---|---|---|
+| 0 | 30 | 16.9% | 19.2% |
+| 1 | 3 | 25.3% | 30.5% |
+| **2 or more** | 26 | **31.4%** | 35.2% |
+
+Monotone, nearly double at the top, and it agrees with the hand-written `trap`
+labels without having been shown them.
+
+### What was added
+
+`features.predicate_shape()` reads the WHERE clause for three numbers:
+`max_same_table_equalities`, `n_equality_predicates`, `n_range_predicates`.
+
+Join keys are deliberately excluded. `o.user_id = u.id` is an equality, and it
+estimates a *join*, not a selectivity on one table -- counting it would put the
+largest number on the widest query rather than the most mis-estimated one. The
+largest count on any single table is the feature, not the total, because two
+filters on two tables are never multiplied together and do not exercise the
+assumption at all.
+
+### The part that had to be got right
+
+`sql_text` now travels on the candidate dict, attached in **three** places:
+`train._row_to_candidate`, `planner.plan_query` and `benchmark.run`. A test
+asserts all three.
+
+That is not defensive habit. A feature populated during training and absent at
+serving is train/serve skew by construction -- the model fits a signal that is
+guaranteed missing at the moment it is used -- and this session alone found that
+shape four times: the policy (2.43), the candidate pool (2.47), the swept
+`gate_mode` (2.50), and 39% of the action space classified as `other` (2.56). It
+is also why buffer counts were *rejected* as features two sections ago: they come
+from `EXPLAIN ANALYZE`, and the serving path plans with `analyze=False`.
+
+Query text is the opposite case. It is available before anything executes, on
+every path, which is what makes it usable at all.
+
+### Not yet worth anything
+
+The feature exists and no model has been trained with it. Availability is not
+usefulness, and this project has a measurement to prove it: `num_joins` has been
+in the vector the whole time and gets **zero** splits across all eight ensemble
+members. The honest status is that the signal is in the data and the model has
+not yet been given a chance to use it.
+
+## 2.61 pg_overexplain is nearly free and has nothing to sell
+
+PostgreSQL 18 ships `pg_overexplain`, which exposes planner internals the plan
+JSON does not. The roadmap listed it as a feature source. Two measurements
+settled it, in the order that costs least.
+
+**It is nearly free.** Over 320 EXPLAINs on the wide workload queries:
+
+| option | median | vs plain |
+|---|---|---|
+| `FORMAT JSON` | 0.620 ms | — |
+| `+ DEBUG` | 0.625 ms | **+0.8%** |
+| `+ RANGE_TABLE` | 0.621 ms | +0.1% |
+
+Which removes the obvious objection -- that a serving path planning up to 96
+candidates cannot afford a richer EXPLAIN. It can.
+
+**And three of its four candidate fields do not vary.** A field constant across
+the candidates for one query cannot separate them, whatever it correlates with
+across queries. That is the `has_hint` lesson from the feature audit: always
+1.0, and in the vector for months.
+
+| field | varies within a query |
+|---|---|
+| `Parallel Safe` | **56 / 59** |
+| `Subplans Needing Rewind` | 0 / 59 |
+| `Disabled Nodes` | 0 / 59 |
+| `Lateral` | 0 / 59 |
+
+`Disabled Nodes` reads zero because `plan_query` already filters those
+candidates out (2.29); `Lateral` because this workload has none. Both are
+correct zeros rather than missing data.
+
+**The one that varies does not predict.** Spearman between the parallel-safe
+node count and measured latency, within each query:
+
+| | value |
+|---|---|
+| median | **+0.040** |
+| positive | 32 / 56 |
+| \|rho\| > 0.5 | 15 / 56 |
+
+A median of +0.04 on 56 queries is a coin flip, and the strong cases point both
+ways -- `shape_window_rank` at **+0.925** and `gen_15_4w` at **-0.732**. It is
+picking up something query-specific rather than a general property of a faster
+plan.
+
+Rejected. Not because it is expensive -- it costs 0.8% -- but because the
+measurement says there is nothing there. Worth recording precisely so the next
+reading of the PG18 release notes does not spend the same afternoon.
+
+The contrast with 2.60 is the useful part. Both are "add features"; one was
+tested by asking whether the quantity tracks headroom **before** any code was
+written and came back monotone at 16.9% / 25.3% / 31.4%, and the other came back
+at +0.04. The cost of asking first was one script each.
+
+## 2.62 One plan for a whole template: already done, and checked for safety
+
+The roadmap asked for parameterised queries to share a plan decision:
+`GROUP_BY_TEMPLATE` groups them for *identity*, and nothing was said to exploit
+the fact that one plan may serve them all.
+
+It already does. `query_fingerprint` applies `query_template()`, so
+`city = 'Mumbai'` and `city = 'Singapore'` hash to the same id, and
+`decision_cache` is keyed on that id. Choose once, serve the template. Verified
+directly: the two produce `adhoc:e0e00d23...` identically.
+
+Which leaves the question the entry did not ask, and it is the more interesting
+one. **Should** they share? Two literals with different selectivity can want
+different plans, and a cache handing the Mumbai decision to a Singapore query is
+serving a plan chosen for a filter seven times larger.
+
+### Measured, on a template where hints actually win
+
+`corr_4w_full_correlated`'s shape -- 63.2% headroom, so "which hint wins" is a
+real question. Every servable candidate executed, per literal:
+
+| literal | matching rows | native | best | headroom | winning hint |
+|---|---|---|---|---|---|
+| Mumbai | 15,151 | 140.0 | 93.7 | 33.1% | `Set(enable_nestloop off)` |
+| Delhi | 6,267 | 121.8 | 80.7 | 33.7% | `Set(enable_nestloop off)` |
+| Bangalore | 4,873 | 128.7 | 85.5 | 33.6% | **`Leading(o u oi p)`** |
+| Singapore | 2,245 | 120.6 | 74.2 | 38.5% | `Set(enable_nestloop off)` |
+
+Two distinct winners across a 7x selectivity span, which looks like an argument
+against sharing. Then the cost of actually sharing the first literal's plan with
+all four:
+
+| literal | own best | served the shared plan | penalty |
+|---|---|---|---|
+| Mumbai | 93.7 | 96.7 | +3.2% |
+| Delhi | 80.7 | 86.9 | +7.6% |
+| Bangalore | 85.5 | 74.0 | **-13.5%** |
+| Singapore | 74.2 | 79.3 | +6.8% |
+
+Median +5.0%, worst +7.6% -- and Bangalore, the literal with a *different*
+winning hint, comes out **13.5% faster** on the shared plan than on its own
+supposed best.
+
+That last number is the answer. A plan measured as worse cannot be 13.5% faster
+than the winner; what it means is that the difference between these plans is
+below the measurement floor. 2.18 measured 18.6% variation between identical
+executions, and every figure in that second table is inside it.
+
+### So: safe here, and the caveat is specific
+
+Sharing one decision across this template costs nothing measurable. The two
+"different winners" are two hints landing on indistinguishable plans, which is
+what 56 of 83 candidates collapsing to duplicates (`plan_query`'s budget
+comment) would predict.
+
+What this does *not* establish is safety at wider selectivity spans. Seven times
+is the whole range this schema offers on `city`; a production workload where one
+literal matches 10 rows and another matches 10 million is a different question,
+and the honest answer there is that nothing here has tested it. The mechanism
+that would break -- a plan chosen for a large filter being served to a tiny one
+-- is real even though it does not fire at this scale.
+
+## 2.63 The wider action space raises the ceiling and the risk together
+
+2.56 widened the search: the join-order sample scales with width, scan methods
+are a swept family, and collection mirrors serving. Re-collecting the synthetic
+workload under it produced 4,499 rows across 65 queries, and training on them
+gave the best train-time numbers this project has recorded:
+
+| | champion | challenger |
+|---|---|---|
+| typical multiplicative error | 1.31x | **1.27x** |
+| `pairwise_rank` headroom captured | 62.7% | **78.8%** |
+| features | 64 | 67 |
+| held-out queries | 15 | 16 |
+
+And `app.retrain` **rejected** it:
+
+```
+challenger's worst pick is 3.09x the best available plan against the
+champion's 1.59x -- a better mean does not buy a worse worst case
+```
+
+### The yardstick was clean, which makes the verdict worth reading
+
+2.45's fix earned its keep here. The comparison ran on six queries **neither
+model trained on** -- `yardstick_provenance` reports `champion_trained_on: 0,
+challenger_trained_on: 0` -- which is the first genuinely uncontaminated
+promotion comparison in the project's history.
+
+On it, the challenger is better on two of the three worst cases (1.39x against
+1.59x, 1.22x against 1.40x) and catastrophic on one.
+
+### What happened on that one query
+
+`shape_group_by_category`, 293 candidates in the widened space, native 141.4 ms,
+best available **55.0 ms**:
+
+| | picks | ran at | predicted |
+|---|---|---|---|
+| champion | `SeqScan(o)` | **57.3 ms** | 0.832x |
+| challenger | `Set(enable_nestloop off)` | **170.1 ms** | **0.610x** |
+| best available | `SeqScan(o)` | 55.0 ms | — |
+
+The champion, which never trained on a single scan-method candidate, picks the
+scan-method winner. The challenger, which trained on thousands of them, picks an
+operator toggle that runs slower than native.
+
+**And the safety gate cannot catch it.** The challenger predicted **0.610x** for
+a plan that ran at 1.20x native. The gate reads the prediction; a confident
+wrong prediction is exactly the input it has no defence against. This is
+2.4.5's finding arriving where it hurts: the ensemble's spread understates its
+error, so a badly wrong point estimate does not come with a wide enough interval
+to be declined.
+
+### The general shape
+
+A wider action space is not a free improvement. On this query it raised the
+ceiling from native's 141.4 ms to 55.0 ms -- **61% available**, far more than the
+narrow space offered -- and simultaneously introduced a 170 ms plan that the
+model rates better than the 55 ms one.
+
+More options means more upside and more ways to be wrong, and which dominates is
+a property of the model's accuracy rather than of the action space. At 1.27x
+typical multiplicative error the model can exploit part of the new ceiling and
+not all of it, and the promotion rule is what stops the difference being served.
+
+The rejection is the system working. It is also a bill: the ceiling moved and
+the model cannot yet reach it safely, which is a better problem than the one in
+2.51 (nothing to reach) and is still a problem.
+
+## 2.64 A model trained on six tables ranks plans on twenty-one
+
+`README` claims this works on any PostgreSQL database, and the evidence has
+always been that the *pipeline* runs anywhere -- schema discovery, workload
+generation, training. Whether a trained model carries across schemas was never
+tested.
+
+The feature vector is half schema-specific: one `present` / `join_position` /
+`selectivity` / `index_scan` / `occurrences` slot per table. Carried to a
+different database those slots read **zero**, because the table names do not
+match. So this measures exactly one thing: is there enough in the
+schema-agnostic half -- costs, tree shape, join-method counts, and 2.60's
+predicate shape -- to rank plans on a database the model has never seen?
+
+Both directions, with **zero** overlapping tables in each:
+
+### Synthetic model (6 tables, 755k rows) carried to JOB/IMDB (21 tables, 73M rows)
+
+| selector | total | of native | headroom captured |
+|---|---|---|---|
+| native | 116,436 ms | 100.0% | — |
+| cost argmin | 105,389 ms | 90.5% | 12.8% |
+| random pick | 146,958 ms | 126.2% | **-35.4%** |
+| **carried synthetic model** | **32,732 ms** | **28.1%** | **97.0%** |
+| locally-trained JOB model | 31,508 ms | 27.1% | 98.4% |
+
+**Within 1.4 points of the model trained on that database.**
+
+### JOB model carried to the synthetic schema
+
+| selector | total | of native | headroom captured |
+|---|---|---|---|
+| native | 10,711 ms | 100.0% | — |
+| cost argmin | 10,242 ms | 95.6% | 12.1% |
+| random pick | 15,772 ms | 147.3% | -130.7% |
+| **carried JOB model** | **9,003 ms** | **84.1%** | **44.1%** |
+| locally-trained model | 8,025 ms | 74.9% | 69.3% |
+
+Weaker -- 44.1% against 69.3% -- and still four times the cost model's 12.1%.
+
+### What it does and does not say
+
+**It transfers, and the direction matters.** Carrying *to* JOB works almost
+perfectly and carrying *from* it works partially. JOB's headroom is enormous and
+concentrated -- native 116 seconds against an oracle of 30 -- so a selector only
+has to avoid the disasters to capture most of it by latency, and generic
+structural features are enough for that. The synthetic schema's headroom is
+spread thinner, and picking well there needs more.
+
+**Total latency captured is not accuracy.** The carried synthetic model picks
+the exact best candidate on **10 of 30** JOB queries, and the carried JOB model
+on **5 of 65** synthetic ones. It is good at avoiding bad plans and mediocre at
+finding the best, which is 2.43's finding about the ensemble arriving by a
+different route.
+
+**The per-table features may be doing less work than their share of the vector
+suggests.** A quarter of the vector is per-table slots, they read zero in both
+experiments, and one of these transfers landed within 1.4 points of a local
+model. That is consistent with the feature audit, which found all six
+`*_occurrences` slots among the sixteen features **never split on** by any
+ensemble member.
+
+The claim "works on any PostgreSQL database" now has a measurement behind it
+rather than an architecture diagram -- and a specific caveat: it is the
+structural half of the model that travels, and how far it gets depends on
+whether the target's headroom is concentrated enough to reach without local
+knowledge.

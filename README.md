@@ -11,7 +11,7 @@ It runs on any PostgreSQL database, ships with a dashboard that explains every
 decision it makes, and refuses to act when it isn't confident. Built end to end:
 data collection, feature engineering, model training, a self-retraining loop
 with rollback, two independent safety mechanisms, a conformally calibrated
-safety gate, and **1,361 tests** behind CI (1,219 backend, of which 18 run
+safety gate, and **1,414 tests** behind CI (1,272 backend, of which 18 run
 against a live PostgreSQL with `pg_hint_plan` actually loaded, plus 142
 frontend).
 
@@ -24,6 +24,7 @@ frontend).
 | [`docs/METRICS.md`](docs/METRICS.md) | How each number is worked out, and why |
 | [`docs/WRITEUP.md`](docs/WRITEUP.md) | Design notes, results, comparison to published work |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | How it was built, stage by stage |
+| [`PENDING.md`](PENDING.md) | **What is not finished** — every open item, with the measurement that says why it matters |
 | [`docs/JOB_RESULTS.md`](docs/JOB_RESULTS.md) | Results on the real JOB/IMDB benchmark |
 | [`docs/CONFIDENCE.md`](docs/CONFIDENCE.md) | **How the optimizer decides whether to trust itself** — and the two fixes that were measured and reverted |
 | [`docs/DATABASE_OPTIMIZATION.md`](docs/DATABASE_OPTIMIZATION.md) | Fixing the *database* rather than one query: correlated columns, server settings, index and table health |
@@ -125,6 +126,23 @@ the real JOB queries, see the next section.
 The generated workload is written to `models/workload_<db>.json`, so you can
 read it, edit it, and replay it. Auto-generation is a starting point, not a
 claim that these are the queries you care about.
+
+**And a trained model carries across schemas, which was never tested until
+2026-09-05.** A quarter of the feature vector is per-table slots that read
+*zero* on a database the model has not seen, so this measures whether the
+schema-agnostic half — costs, tree shape, join-method counts, predicate shape —
+is enough on its own:
+
+| carried model | target | headroom captured | model trained on the target |
+|---|---|---|---|
+| synthetic (6 tables, 755k rows) | JOB/IMDB (21 tables, 73M rows) | **97.0%** | 98.4% |
+| JOB/IMDB | synthetic | 44.1% | 69.3% |
+
+Zero overlapping tables in both directions; cost-argmin captures 12.8% and
+12.1% on the same queries. The caveat is in `docs/WRITEUP.md` §2.64: total
+latency captured is not per-query accuracy, and how far a carried model gets
+depends on whether the target's headroom is concentrated enough to reach without
+local knowledge.
 
 ## Why this design, and not a database engine from scratch
 
@@ -513,23 +531,28 @@ learned-query-optimizer/
 
 | | captured | range |
 |---|---|---|
-| all 59 queries | **41.3%** | 38.9 – 43.0 |
-| **queries the model never trained on** | **45.7%** | 19.3 – 50.4 |
-| hand-written traps and controls only | 33.0% | 20.8 – 34.2 |
+| all 65 queries | **40.8%** | 38.3 – 46.0 |
+| **queries the model never trained on** | **43.0%** | 23.8 – 48.5 |
+| hand-written traps and controls only | 26.0% | 23.6 – 42.2 |
 
 The middle row is the one that matters, and it read **0.0%** on every run ever
 measured until 2026-09-04 — eleven runs across three independent sets. Nothing
 in the model, the features or the action space changed to move it; twelve
 corrections to the measurement and configuration did, and `docs/WRITEUP.md`
-§2.42–2.54 works through each. The third row is lower because 27 of the 59
-queries were generated and *kept* for having headroom, so the headline is partly
-measured on a benchmark selected to be winnable — the gap between rows one and
-three is the size of that effect.
+§2.42–2.54 works through each.
+
+The third row is lower because 27 of the 65 queries were generated and *kept*
+for having headroom, so the first row is partly measured on a benchmark selected
+to be winnable. The **14.8-point gap** between them is the size of that effect,
+and it widened from 8.3 points when six hand-written six-table queries were
+added *without* a headroom filter — three of which have none, by construction.
+The unbiased number went down and the filtered one did not, which is what an
+honest split is supposed to do.
 
 The ranges are wide. The benchmark prints its own resolution floor and it reads
-"a difference smaller than 4.2 points is inside this sample's own spread", so
-the honest claim is "clearly not zero and around a third to a half", not
-"45.7%".
+"a difference smaller than 7.7 points is inside this sample's own spread", so
+the honest claim is "clearly not zero and around a quarter to a half", not
+"43.0%".
 
 **On the real JOB/IMDB benchmark, now yes — and the shape of the win matters
 more than the number.** This said "no" for most of the project's life: 75% of

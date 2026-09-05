@@ -43,6 +43,12 @@ _WHITESPACE = re.compile(r"\s+")
 # near a "how is the deployed optimizer doing" number.
 COLLECTION_SELECTOR = "collection"
 
+# Shadow rows are measurements, not decisions. The learned plan ran and was
+# timed; the user was served native. Counting them here would report plans as
+# served that nobody received -- see `regression_guard.SHADOW_SELECTOR`, which
+# is the consumer they exist for.
+SHADOW_SELECTOR = "shadow"
+
 # What counts as a real difference rather than measurement noise. Deliberately
 # the same shape as the gate the optimizer applies to itself
 # (`learned.DEFAULT_MIN_GAIN_MS` and `MIN_RELATIVE_GAIN`): a run is only scored
@@ -180,6 +186,7 @@ RUNS_SQL = f"""
         FROM plan_execution_log
         WHERE actual_total_time_ms IS NOT NULL
           AND selector_used <> %s
+          AND selector_used <> 'shadow'
         GROUP BY 1, 2
         HAVING MIN(actual_total_time_ms) FILTER (WHERE is_baseline) IS NOT NULL
            AND MIN(actual_total_time_ms) FILTER (WHERE is_chosen) IS NOT NULL

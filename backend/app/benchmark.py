@@ -126,7 +126,19 @@ def run(
 
             candidates = []
             seen_plans = {plan_fingerprint(baseline)}
-            for hint in candidate_hints(optimizer, baseline, tables):
+            hints = candidate_hints(optimizer, baseline, tables)
+            # Drop the hint families that have already regressed on this query,
+            # exactly as `planner.plan_query` does before serving.
+            #
+            # The benchmark did not, and so measured a wider action space than
+            # production offers whenever the guard is on. `--protocol deploy`
+            # runs with `use_guard=True`, which blocked a whole *query* here and
+            # a whole *family* there -- so the deploy figure was taken over
+            # candidates the server would have removed. `compare` turns the
+            # guard off entirely and is unaffected either way.
+            if use_guard:
+                hints = guard.allowed_hints(query_id, hints)
+            for hint in hints:
                 cur.execute("SAVEPOINT cand")
                 try:
                     plan = get_plan(cur, apply_hint(sql, hint))
@@ -139,6 +151,7 @@ def run(
                     continue
                 seen_plans.add(fingerprint)
                 plan["hint"] = hint
+                plan["sql_text"] = sql
                 candidates.append(plan)
 
             if use_guard and guard.is_blocked(query_id):
@@ -387,17 +400,36 @@ def _summarise(results: list[dict], protocol: str, repeat: int) -> None:
             return
         median = statistics.median(values)
         if len(values) == 1:
-            print(f"{label:22s} {median:6.1f}%   (single run -- spread unknown)")
+            print(f"{label:30s} {median:6.1f}%   (single run -- spread unknown)")
             return
         print(
-            f"{label:22s} {median:6.1f}%   "
+            f"{label:30s} {median:6.1f}%   "
             f"range {min(values):.1f}% to {max(values):.1f}%   "
             f"runs {', '.join(f'{v:.1f}' for v in values)}"
         )
 
-    line("headroom captured", captured)
-    line("held-out captured", held)
-    line("curated only", curated)
+    # Ordered so the unbiased figures come first.
+    #
+    # `headroom captured` is over all 59 workload queries, 27 of which were
+    # generated and then *kept* because the best plan in the served action space
+    # beat native by at least 8%. That was the right rule for training coverage
+    # -- a query with nowhere to go teaches nothing -- and it makes the number a
+    # measurement partly of the selection.
+    #
+    # Leading with it is how a project quotes its most flattering figure without
+    # meaning to. The two lines above it are the ones that answer "does this
+    # work": queries the model never trained on, and queries nobody filtered for
+    # being winnable.
+    line("held-out (never trained on)", held)
+    line("curated (not selected)", curated)
+    line("all queries", captured)
+    if curated and captured:
+        gap = statistics.median(captured) - statistics.median(curated)
+        print(
+            f"\nthe {gap:+.1f} point gap between the last two lines is the "
+            f"selection effect: 27 of the workload's queries were kept for "
+            f"having headroom, and the curated group was not."
+        )
 
     if len(captured) > 1:
         spread = max(captured) - min(captured)

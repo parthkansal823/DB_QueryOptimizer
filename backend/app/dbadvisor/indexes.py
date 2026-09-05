@@ -201,7 +201,7 @@ def redundant(cur, schema: str = "public") -> list[dict]:
     return found
 
 
-def report(cur, schema: str = "public") -> dict:
+def report(cur, schema: str = "public", queries: "list[dict] | None" = None) -> dict:
     """
     Everything this module knows about the indexes on this database.
 
@@ -212,10 +212,20 @@ def report(cur, schema: str = "public") -> dict:
     the index catalogue.
     """
     from app.index_advice import brin_opportunities
+    from app.dbadvisor.index_simulation import simulate_unused
 
+    unused_now = unused(cur, schema)
     return {
-        "unused": unused(cur, schema),
+        "unused": unused_now,
         "duplicates": duplicates(cur, schema),
         "redundant": redundant(cur, schema),
         "brin": brin_opportunities(cur, schema),
+        # What dropping each unused index would do to real plans, rather than
+        # what its scan counter says it has done. `queries` is optional because
+        # a caller with no workload to plan against still wants the catalogue
+        # findings; when it is absent the list is empty rather than absent, so a
+        # reader counting findings does not have to guess which keys exist.
+        "unused_simulated": (
+            simulate_unused(cur, unused_now, queries) if queries and unused_now else []
+        ),
     }

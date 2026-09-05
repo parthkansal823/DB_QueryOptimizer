@@ -68,7 +68,12 @@ __all__ = [
 ]
 
 
-def report(cur, schema: str = "public", include_statistics: bool = True) -> dict:
+def report(
+    cur,
+    schema: str = "public",
+    include_statistics: bool = True,
+    queries: "list[dict] | None" = None,
+) -> dict:
     """
     Everything this package can find, in one pass.
 
@@ -78,7 +83,11 @@ def report(cur, schema: str = "public", include_statistics: bool = True) -> dict
     person asking "what should I fix" wants it on.
     """
     findings = {
-        "indexes": indexes.report(cur, schema),
+        # `queries` lets the index findings answer "what would dropping this do
+        # to my plans" instead of only "has it been scanned" -- see
+        # `dbadvisor.index_simulation`. Optional, because the catalogue findings
+        # stand on their own and planning a workload is not free.
+        "indexes": indexes.report(cur, schema, queries=queries),
         "tables": tables.report(cur, schema),
         "maintenance": maintenance.report(cur, schema),
         "workload": query_stats.report(cur, schema),

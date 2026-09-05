@@ -195,6 +195,75 @@ CANDIDATE_BUDGET_TIERS: tuple[tuple[float, int], ...] = (
 )
 UNBUDGETED_CANDIDATES = 64
 
+# How much the budget grows with the width of the join.
+#
+# The tiers above scale the search to what a query is *worth*. They say nothing
+# about how big the thing being searched is, and the join-order space grows
+# factorially:
+#
+#     2 tables       2 orders     8 candidates is exhaustive
+#     4 tables      24 orders     8 candidates is a third of it
+#     7 tables    5040 orders     8 candidates is 0.16% of it
+#
+# So a fixed sample covers exponentially less of the space as the query widens,
+# and it runs out exactly where join order starts to matter. Measured on JOB
+# `17c` -- 7 tables, native 21.6 s -- the cost tiers allow 20 candidates and the
+# best plan found is 1963 ms. Widening the order sample to 60 finds
+# `Leading(n ci mk mc t cn k)` at **1043 ms**: another 47% off, and a pure join
+# order hint, so it is the order count that was binding and not a missing
+# family.
+#
+# The multiplier is applied to the cost tier rather than replacing it, so a
+# cheap wide query is still bounded: every candidate is an EXPLAIN round trip
+# at roughly 2.5 ms, which is 0.7% of a 21-second query and unacceptable on a
+# 20 ms one.
+CANDIDATE_WIDTH_MULTIPLIER: tuple[tuple[int, int], ...] = (
+    (3, 1),   # <= 3 tables: at most 6 orders, the sample is already the space
+    (5, 2),
+    (6, 3),
+)
+MAX_WIDTH_MULTIPLIER = 4
+
+# Below this estimated cost the width multiplier does not apply.
+#
+# A wide join that Postgres prices under a few hundred units has nothing to win
+# whatever its shape, and widening the search there is pure overhead: measured
+# on JOB, an EXPLAIN round trip costs **4.4 ms**, so 16 candidates is 70 ms
+# spent choosing a plan for a query that runs in twenty. The multiplier exists
+# for expensive wide joins, and this keeps it there.
+WIDTH_MULTIPLIER_MIN_COST = 200.0
+
+# Measured native latency below which a query is not worth a wider search.
+#
+# The cost tiers cannot make this call, and the two numbers that prove it sit
+# on opposite sides of every cost threshold:
+#
+#     JOB `17c`                  cost  4409   runs in 21603 ms
+#     synthetic `corr_6w_everything`  cost 12954   runs in   144 ms
+#
+# The cheaper-costed query takes 150x longer. Widening `17c`'s search cost
+# 352 ms of planning against a 21.6-second query -- 1.63% -- and found a plan
+# 47% faster. Widening `corr_6w_everything`'s took planning from 48 ms to 63 ms
+# against a 144 ms query, moving overhead from 33% to 44%. Same multiplier,
+# opposite verdicts, and no cost threshold separates them because cost is
+# *anti-correlated* with runtime across these two.
+#
+# So this reads the measured latency the regression guard already keeps
+# (`guard.native_ms`), and falls back to widening when there is no history --
+# the first sight of a query is when exploration is worth most, and one
+# over-wide search is cheap compared to never finding the plan.
+WIDTH_MULTIPLIER_MIN_NATIVE_MS = 500.0
+
+# A hard ceiling on planning round trips, whatever the tiers work out to.
+#
+# 80 candidates on JOB `17c` measured **352 ms of planning, 1.63%** of that
+# query's 21.6-second runtime -- comfortable. The tiers alone would allow 256 on
+# an expensive 7-table query, which is over a second of EXPLAIN before anything
+# executes, and the returns are already flat: 108 hints on `17c` collapsed to 25
+# distinct plans, because Postgres produces the same plan for most of them. The
+# binding constraint past this point is the plan space, not the sample.
+MAX_CANDIDATES_ABSOLUTE = 96
+
 
 # How many hints may be planned per budget slot while hunting for a distinct
 # plan. Three is enough to absorb the usual duplicate rate without letting a
@@ -203,17 +272,60 @@ UNBUDGETED_CANDIDATES = 64
 MAX_PLANNING_ATTEMPTS_PER_SLOT = 3
 
 
-def budget_for(total_cost: float | None) -> int:
-    """How many candidates this query's estimated cost justifies planning."""
+def width_multiplier(n_tables: int | None) -> int:
+    """How much wider the search gets as the join widens.
+
+    See `CANDIDATE_WIDTH_MULTIPLIER` for the measurement. Unknown width is
+    treated as narrow, because guessing wide would inflate the budget for every
+    caller that does not pass it.
+    """
+    if not n_tables:
+        return 1
+    for ceiling, factor in CANDIDATE_WIDTH_MULTIPLIER:
+        if n_tables <= ceiling:
+            return factor
+    return MAX_WIDTH_MULTIPLIER
+
+
+def budget_for(
+    total_cost: float | None,
+    n_tables: int | None = None,
+    observed_native_ms: float | None = None,
+) -> int:
+    """
+    How many candidates this query justifies planning.
+
+    Two things decide it: what the query is *worth* optimising (the cost tiers)
+    and how big the space being searched is (`width_multiplier`). The second was
+    missing, and it is the one that binds on wide joins -- an 8-candidate sample
+    of a 7-table query's 5040 join orders is 0.16% of the space.
+
+    **The cost estimate is a weak signal here and that is worth stating**, since
+    distrusting it is the premise of the whole project. JOB `17c` is priced at
+    **4409** -- the same tier as a query costing 3900 and running in 400 ms --
+    and takes **21.6 seconds**. Budgeting on cost alone therefore starves the
+    search on precisely the queries whose estimates are most wrong, which are
+    precisely the queries with the most headroom. Multiplying by join width does
+    not fix the estimate; it stops the estimate being the only input.
+    """
     if not ADAPTIVE_CANDIDATE_BUDGET:
         return UNBUDGETED_CANDIDATES
     # No estimate to reason about -- do not silently starve the search.
     if not total_cost or total_cost <= 0:
         return UNBUDGETED_CANDIDATES
+    # A query measured to be fast does not get the wider search whatever its
+    # shape or its estimate: planning is a fixed cost per candidate and it is
+    # the ratio that matters. See WIDTH_MULTIPLIER_MIN_NATIVE_MS.
+    measured_fast = (
+        observed_native_ms is not None
+        and observed_native_ms < WIDTH_MULTIPLIER_MIN_NATIVE_MS
+    )
+    wide_enough = total_cost >= WIDTH_MULTIPLIER_MIN_COST and not measured_fast
+    factor = width_multiplier(n_tables) if wide_enough else 1
     for ceiling, allowed in CANDIDATE_BUDGET_TIERS:
         if total_cost < ceiling:
-            return allowed
-    return UNBUDGETED_CANDIDATES
+            return min(allowed * factor, MAX_CANDIDATES_ABSOLUTE)
+    return min(UNBUDGETED_CANDIDATES * factor, MAX_CANDIDATES_ABSOLUTE)
 
 
 def _index_candidates_for(cur, baseline_plan: dict) -> dict[str, list[str]] | None:
@@ -329,9 +441,15 @@ def plan_query(
     guard=None,
     max_candidates: int = 8,
     cache=None,
+    bypass_block: bool = False,
 ) -> dict:
     """
     Decide which plan to run, without running any of them.
+
+    `bypass_block` runs the full selection for a query the guard has blocked,
+    so it can be *measured* without being served. Only shadow evaluation passes
+    it; see the blocked branch below for why a block that lifts on a timer is
+    not the same as one that lifts on evidence.
 
     Returns the decision plus the hint to apply. The caller executes it --
     keeping "choose" and "run" separate is what lets the same decision be
@@ -348,13 +466,38 @@ def plan_query(
     # running the full candidate sweep before discovering the query was blocked
     # spent N planning round trips to reach a conclusion already known -- on
     # precisely the queries already identified as troublesome.
-    if guard is not None and guard.is_blocked(query_id):
+    if guard is not None and not bypass_block and guard.is_blocked(query_id):
+        # Sampled blocked requests still *plan* the learned path, so
+        # `optimize_and_execute` can measure it without serving it.
+        #
+        # A blocked query never runs the learned path again, so it accumulates
+        # no evidence about it. The block then lifts purely because the old
+        # evidence ages out of `evidence_since()`, and the query is retried with
+        # whatever model is deployed -- having learned nothing in between. That
+        # is a timer, not a decision.
+        shadow_hint = None
+        if not bypass_block and SHADOW_SAMPLE_RATE > 0 and random.random() < SHADOW_SAMPLE_RATE:
+            try:
+                # `plan_query` itself, with the block lifted -- not a
+                # reimplementation of it. Evidence about a *different* decision
+                # procedure is evidence about nothing, and this file already has
+                # a long list of measurements that scored a configuration
+                # nobody runs (docs/WRITEUP.md 2.43, 2.47, 2.50). The cache is
+                # skipped because a cached decision was made for the served
+                # path, not this one.
+                shadow_hint = plan_query(
+                    cur, sql, optimizer, query_id=query_id, guard=guard,
+                    cache=None, bypass_block=True,
+                ).get("hint")
+            except Exception:  # noqa: BLE001 - a measurement must not fail a request
+                shadow_hint = None
         return {
             "hint": None,
             "chosen_plan": get_plan(cur, sql, analyze=False),
             "reason": "regression_guard",
             "n_candidates_planned": 0,
             "optimizer_overhead_ms": (time.perf_counter() - started) * 1000.0,
+            "shadow_hint": shadow_hint,
         }
 
     cached = cache.get(query_id) if cache is not None else None
@@ -369,8 +512,24 @@ def plan_query(
     baseline = get_plan(cur, sql, analyze=False)
     tables = baseline["tables_scanned"]
 
-    # Scaled to what the query is worth optimising; see `budget_for`.
-    budget = budget_for(baseline.get("total_cost"))
+    # Scaled to what the query is worth optimising *and* to how wide the join
+    # is -- see `budget_for`.
+    budget = budget_for(
+        baseline.get("total_cost"),
+        len(tables),
+        # What this query has actually been measured at, when anything has
+        # measured it. `None` on first sight, which widens -- see
+        # WIDTH_MULTIPLIER_MIN_NATIVE_MS.
+        # `getattr` because a guard-shaped stub without measured history is a
+        # legitimate caller -- tests pass one, and so does any path that has a
+        # guard for blocking but no latency table. Missing history widens, which
+        # is the same as no guard at all.
+        observed_native_ms=(
+            getattr(guard, "native_ms", {}).get(query_id)
+            if guard is not None and query_id
+            else None
+        ),
+    )
     hints = candidate_hints(
         optimizer, baseline, tables, max_candidates=max_candidates, cur=cur
     )
@@ -437,6 +596,10 @@ def plan_query(
             continue  # same plan as one already considered; not a real alternative
         seen_plans.add(fingerprint)
         plan["hint"] = hint
+        # `features.predicate_shape` reads the query, not the plan. Training
+        # attaches this in `train._row_to_candidate`; if only one side did, the
+        # model would fit a signal that is absent exactly when it is used.
+        plan["sql_text"] = sql
         candidates.append(plan)
 
     planning_ms = (time.perf_counter() - started) * 1000.0
@@ -610,11 +773,35 @@ def optimize_and_execute(
         except Exception:  # noqa: BLE001 - a failed measurement is not a failed request
             shadow = None
 
+    # A blocked query's learned plan, measured but never served.
+    #
+    # Executed last, after the user already has their answer, and with the same
+    # deadline a real deviation would get -- a shadow that is allowed to run
+    # forever would turn a protected request into a slow one, which is the whole
+    # thing the block exists to prevent.
+    shadow_learned = None
+    shadow_hint = choice.get("shadow_hint")
+    if shadow_hint:
+        try:
+            shadow_learned = execute_chosen(
+                cur, sql, shadow_hint,
+                budget_ms=guard.runtime_budget_ms(query_id, RUNTIME_TIMEOUT_FACTOR)
+                if guard is not None else None,
+            )
+            shadow_learned.pop("deviation_abandoned", None)
+        except Exception:  # noqa: BLE001 - a measurement is not a request
+            shadow_learned = None
+
     result = {
         **choice,
         "executed_plan": executed,
         "execution_ms": executed["actual_total_time_ms"],
         "runtime_budget_ms": budget,
+        # The learned plan for a blocked query: run, timed, and not served. The
+        # caller logs it under `regression_guard.SHADOW_SELECTOR` so the guard
+        # counts it as evidence and `app.stats` does not count it as a decision.
+        "shadow_learned_plan": shadow_learned,
+        "shadow_learned_hint": shadow_hint if shadow_learned else None,
         # The native plan for this same request, when one was measured. The
         # caller logs it as the baseline half of the pair.
         "shadow_native_plan": shadow,
