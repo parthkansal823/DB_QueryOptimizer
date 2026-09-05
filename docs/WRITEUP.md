@@ -6031,3 +6031,717 @@ rather than an architecture diagram -- and a specific caveat: it is the
 structural half of the model that travels, and how far it gets depends on
 whether the target's headroom is concentrated enough to reach without local
 knowledge.
+
+## 2.65 Running the benchmark blinds the sweep that tunes it
+
+`app.autotune` sweeps the selection policy against the action space against the
+gate, and the point of the middle axis is to answer the question 2.27 left open:
+do `resource`, `join_method` and `scan_method` earn their place, or are they off
+because someone switched them off in 2024?
+
+The first run came back with the axis completely flat. Not "close" -- identical,
+every combination of optional families reporting the same net, the same
+deviation rate, the same regression rate and the same worst case:
+
+```
+        policy           extra families     z  gain  dev%  reg%   worst    net%
+ pairwise_rank                     none  0.50  0.05   53%   25%   1.00x   11.5%
+ pairwise_rank                 resource  0.50  0.05   53%   25%   1.00x   11.5%
+ pairwise_rank              join_method  0.50  0.05   53%   25%   1.00x   11.5%
+ pairwise_rank              scan_method  0.50  0.05   53%   25%   1.00x   11.5%
+```
+
+An axis that returns the same answer for every setting is either a finding or a
+blind spot, and the two look identical from the outside. "Is this code reached?"
+is the question that separates them, so: count what the sweep is actually
+scoring.
+
+### 117 candidates, three families
+
+The replay was scoring **117** candidates across the held-out queries --
+`operator_toggle` 69, `join_order` 43, `cardinality` 5. Zero `resource`, zero
+`scan_method`, zero `join_method`. The three families being priced were not in
+the data. The sweep was not measuring them as worthless; it was measuring their
+absence and reporting it as a tie.
+
+The log has them. `corr_5w_premium_supplier` alone carries **976** candidate
+rows across **50** runs. What it does not have is them in the run the replay
+chose.
+
+### Two kinds of run write to the same table
+
+```
+ selector_used |          ts            |  n
+ learned       | 2026-09-05 07:20:22+00 |  12   <- picked
+ learned       | 2026-09-05 07:05:13+00 |  12
+ learned       | 2026-09-05 06:49:56+00 |  12
+ collection    | 2026-09-05 06:12:23+00 |  84
+```
+
+`app.collect_data` **explores**: it walks the action space and writes every
+candidate it executed, all eight families. `app.benchmark` **serves**: one
+decision per query, a dozen rows, and only from the families the current
+deployment has switched on.
+
+`_aggregate_repetitions(latest_run_only=True)` exists for a good reason -- 2.32
+measured the same native query ranging from 2.4 ms to 13.7 ms across runs
+collected months apart, so a *comparison* needs one run's conditions rather than
+a decade's. It implemented that as "the newest `created_at` per query". And a
+benchmark run is always newer than the collection that preceded it, because you
+collect and then you benchmark.
+
+So the filter reliably picked the narrowest run in the log. Across the queries
+being scored that is **117 of 513** candidates -- **77% of the action space
+hidden from the tool whose job is to choose it** -- and on
+`corr_5w_premium_supplier`, 12 rows where the collection had 84.
+
+**Running the benchmark blinds the sweep that tunes the benchmark.**
+
+### The fix, and the fix being inert
+
+Prefer the newest *collection* run per query; fall back to the newest run of any
+kind only for a query nothing has ever collected. That keeps the original
+purpose intact and restores the action space.
+
+Written, and it changed nothing. `FETCH_SQL` did not select `selector_used`, so
+`row.get("selector_used")` was `None` on every row, never equal to
+`COLLECTION_SELECTOR`, and every query fell through to the fallback -- which is
+the old behaviour exactly. A fix whose only symptom is a plausible number,
+inside the fix for a bug whose only symptom was a plausible number.
+
+Adding the column is one line. A regression test asserting the column stays
+selected is the part worth keeping, because nothing else in the system fails if
+it disappears again.
+
+| | before | after |
+|---|---|---|
+| candidates scored | 117 | **513** |
+| `operator_toggle` | 69 | 161 |
+| `join_order` | 43 | 128 |
+| `scan_method` | 0 | **119** |
+| `resource` | 0 | **105** |
+| `cardinality` | 5 | 0 |
+
+### What the axis says now that it can see
+
+With the families visible, the widened space changes the ranker's pick on
+**5 of 15** held-out queries -- so the axis moves. The numbers it produces are
+still nearly identical, and now that is a result rather than an artefact:
+
+| space | ranker's pick changes | net served |
+|---|---|---|
+| narrow | — | +5.27%, 73.8 ms |
+| `+resource` | 1 query, by 1.0 ms | +5.27%, **73.8 ms** |
+| `+scan_method` | 4 queries | +4.77%, 66.8 ms |
+
+`+resource` is identical to the tenth of a millisecond, not merely to the
+decimal place: the one pick it changes is a deviation the gate declines, so the
+family is visible to the ranker and invisible in what gets served.
+
+`resource` is the oracle on 3 of the 14 held-out queries with any headroom and
+`scan_method` on 2, so the families do contain the wins. The ranker does not
+find them: it changes its pick often enough to prove the space is live, and the
+changes are a coin flip. That is 2.43's finding again -- the constraint is the
+comparison, not the menu.
+
+The honest reading of the action-space axis is therefore **"no evidence either
+way at this resolution"**, and 2.32's 8-point floor says a 0.5-point difference
+is not evidence. The defaults stay where they are because nothing has beaten
+them, which is a different sentence from "they were measured best".
+
+### The pattern
+
+This is the third instrument in this project found measuring a narrower world
+than the one being served -- after the calibration replay scoring an action
+space no query is offered (2.47) and 39% of the space classifying as `other` and
+being dropped (2.56). All three had the same signature: a defensible filter,
+written for a real reason, silently doing more than its name says.
+
+And this one has a feedback loop the others did not. The benchmark is what tells
+you whether the configuration is any good; the sweep is what chooses the
+configuration; and running the first was corrupting the second. The more you
+measured, the less the tuner could see.
+
+## 2.66 The held-out number is mostly the split
+
+2.59 noticed the conformal bound achieving **90.6%** coverage on one query-level
+split and **75.5%** on `app.train`'s own held-out list, and filed it as an
+oddity. `app.coverage_sweep` turns it into a measurement: ten query-level
+splits, the same rows, the same model class, one integer different.
+
+```
+  seed  held-out qs  test rows   coverage  (raw means)  typical err   captured
+    42           16        562      71.7%        72.8%        1.30x      48.5%
+    43           16        568      86.3%        87.1%        1.45x      89.1%
+    44           16        578      62.5%        62.8%        1.37x      30.9%
+    45           16        571      78.5%        78.3%        1.33x      60.1%
+    46           16        557      89.4%        88.9%        1.31x      78.7%
+    47           16        605      71.2%        71.4%        1.31x      45.3%
+    48           16        580      77.2%        78.1%        1.38x      82.6%
+    49           16        571      92.6%        92.5%        1.41x      24.2%
+    50           16        550      73.8%        73.1%        1.25x      28.6%
+    51           16        596      73.3%        72.7%        1.31x      61.9%
+```
+
+### The guarantee does not hold
+
+Coverage: median **75.5%**, range **62.5% to 92.6%**, and it reaches the
+advertised 90% on **one split in ten**.
+
+This is not a bug in the conformal implementation. Split conformal promises
+1 - alpha coverage, distribution-free, **under exchangeability of the
+calibration and test rows** -- and a query-level split is built to break
+exchangeability. Rows from one query share a plan shape, a table set, a native
+latency and a headroom; holding out whole queries means the test rows come from
+queries the calibration rows have never described. The theorem does not apply,
+and the measurement says how much that costs: about **15 points of coverage in
+the median, and up to 27 in the tail**.
+
+The honest way to report it is the range. The bound remains useful as a
+calibrated-*ish* interval fitted on real residuals rather than a chosen `z`, and
+it is not the 90% it advertises. `docs/METRICS.md` and the gate's own
+documentation now say so.
+
+### The bigger number is the one nobody was watching
+
+Headroom captured, same ten splits, same everything: **24.2% to 89.1%**. A
+**64.9-point** range.
+
+That is the project's headline train-time metric, and one split is one draw from
+that. 2.63 reads a champion at 62.7% against a challenger at 78.8% and treats
+the 16-point gap as informative; both were measured on seed 42, and 16 points is
+a quarter of the spread the seed alone produces. The promotion decision in 2.63
+does not rest on it -- `app.retrain` compares on worst-case regression over a
+common held-out set, which is why it rejected a model with the better mean --
+but the sentence around it was doing more work than the number could support.
+
+2.32 measured the *benchmark* unable to resolve differences under about 8
+points. This says the *training* report cannot resolve differences under
+something far larger, and for a different reason: the benchmark's problem is
+measurement noise, and this is sampling. Sixteen queries is a small sample of a
+65-query workload, and the queries differ enormously in how much headroom they
+carry.
+
+### Two things it is not
+
+**Not nondeterminism.** Checked, because an earlier pair of sweeps disagreed on
+two of ten seeds. Training is bit-identical across three runs in one process,
+three separate processes on a quiet machine, and three more with eight CPU-bound
+processes competing -- twelve runs, one number. `pg_class.reltuples`, which is
+the denominator of every selectivity feature and is re-`ANALYZE`d on each run,
+is also stable: five ANALYZEs, six tables, zero movement. The original
+disagreement remains unexplained and did not recur.
+
+**Not the calibration skew, though that was real.** The coverage check fed the
+gate **raw** ensemble means. The bound is *fitted* on point-calibrated means --
+the comment at the fit site says fitting on raw means and shifting the point
+underneath would invalidate the guarantee -- and `learned._predict` applies the
+same correction before the gate reads it. So the one number that says whether
+the gate is honest was measured against a gate nothing consults. Fixed, both
+figures now reported, and the difference is **under one point** on every split.
+A train/serve skew that turned out not to matter is still worth the ten minutes:
+the alternative was not knowing.
+
+### What to do about it
+
+Report the range. `app.coverage_sweep` costs one retrain per seed -- about two
+minutes for ten on this workload -- which is cheap enough that there is no
+excuse for quoting a single split.
+
+The deeper fix is more queries. Sixteen held out of 65 is the sample size doing
+the damage, and the same fix answers P7's selection-effect problem. Everything
+else here is a way of being honest about a small sample rather than a way of
+making it larger.
+
+## 2.67 Pricing the optional hint families, on both databases
+
+With 2.65's fix the action-space axis can see what it is pricing, so the
+question 2.27 left open -- do `resource`, `join_method` and `scan_method` earn
+their place, or are they off because someone switched them off? -- is one
+command on each database.
+
+### Synthetic, 15 held-out queries
+
+| policy | extra families | net | deviates | regresses | worst |
+|---|---|---|---|---|---|
+| `pairwise_rank` | none | **+5.27%** | 53% | 25% | 1.00x |
+| `pairwise_rank` | `resource` | +5.27% | 53% | 25% | 1.00x |
+| `pairwise_rank` | `join_method` | +5.27% | 53% | 25% | 1.00x |
+| `pairwise_rank` | `scan_method` | +4.77% | 53% | 25% | 1.00x |
+| `greedy` | none | +1.39% | 27% | 25% | 1.00x |
+| `risk_averse` | `scan_method` | +0.16% | 27% | 25% | 1.00x |
+
+The policy axis is decisive and the action-space axis is not. `pairwise_rank`
+is nearly **four times** `greedy` and thirty times `risk_averse`, which is
+2.43's result reproduced on a wider action space and a bigger workload.
+
+Adding `resource` or `join_method` moves the served total by **0.0 ms**. Adding
+`scan_method` costs **0.50 points**.
+
+### JOB, 8 held-out queries
+
+Every one of the 32 configurations qualifies, and they land between **87.22%**
+and **87.23%**. The whole sweep spans **0.01 points**.
+
+JOB's headroom is enormous and concentrated -- 37 seconds of net improvement
+across 8 queries -- so the entire task is avoiding catastrophes, and every
+policy and every action space avoids them. The benchmark that made the case for
+learned optimizers cannot distinguish between the configurations of one.
+
+That is worth stating plainly, because JOB is the standard evidence and it is
+being asked a question it cannot answer. The synthetic workload, which is
+smaller and less impressive, is the one with resolution here.
+
+### The incumbent rule fired, correctly
+
+On JOB, `greedy` scored 87.23% against `pairwise_rank`'s 87.22% -- and the
+report says `kept_incumbent_over: greedy`. `MIN_POLICY_SWITCH_POINTS` refused to
+recommend switching the served policy on a **0.01-point** difference.
+
+That guard exists because this tool once recommended exactly such a switch on a
+0.8-point difference, having printed two lines earlier that a difference that
+size was inside its own spread (2.50). Applying it would have re-created 2.43 --
+a gate calibrated under one policy while the server selects with another --
+using the instrument built to prevent it.
+
+### The verdict
+
+**The defaults do not change.** `SELECTION_POLICY=pairwise_rank`, and
+`INCLUDE_TUNING`, `INCLUDE_JOIN_METHODS` and `INCLUDE_SCAN_METHODS` all off.
+
+What changed is the reason. They were off because a 24-query measurement in 2.27
+said so, before the workload tripled and before PostgreSQL 18. They are off now
+because a sweep that can see them, on two databases, found no configuration that
+beats them -- and, on the synthetic workload, one that loses by half a point.
+
+The correct reading of the action-space axis is **no evidence either way at this
+resolution**, not "measured worthless". The families do contain wins: across the
+held-out queries `resource` is the single best candidate on 3 of 14 and
+`scan_method` on 2, and widening the space changes the ranker's pick on 5 of 15
+queries. The ranker changes its mind often enough to prove the space is live,
+and the changes are a coin flip. The binding constraint is the comparison, not
+the menu -- which is P4, and is where the next real gain is.
+
+## 2.68 Attributing a seven-point drop, and not believing the first answer
+
+Adding six unfiltered six-table queries moved the curated benchmark figure from
+**33.0%** to **26.0%**. The open question was whether that is dilution -- new
+queries with nothing to win, which are arithmetically neutral -- or a
+regression, the model deviating and losing on them.
+
+### The premise was wrong first
+
+The six were described as "zero-headroom queries", on the grounds that every
+earlier batch was screened by a >=8% headroom filter and these were not.
+Measured, they carry **230.5 ms of headroom on 977.8 ms of native -- 23.6%**,
+which is *more* than the workload average. Unfiltered is not the same as
+headroom-free; the filter selected for headroom, and its absence lets in queries
+with a lot as easily as queries with none.
+
+So the neutrality argument does not apply, and the drop has to be attributed
+rather than dismissed.
+
+### What one deploy pass said
+
+| query | native | served | outcome |
+|---|---|---|---|
+| `corr_6w_supplier_country` | 467.1 | 467.1 | safety veto |
+| `shape_6w_distinct_pairs` | 97.9 | 97.9 | guard blocked |
+| `ctl_6w_uncorrelated` | 75.5 | 75.5 | guard blocked |
+| `shape_6w_anti_join` | 114.1 | 114.1 | safety veto |
+| `corr_6w_band_category` | 95.8 | **104.2** | deviated, lost |
+| `shape_6w_top_suppliers` | 127.4 | **162.2** | deviated, lost |
+
+Captured **-18.7%** of the available headroom. Four of six never deviate at all:
+two safety vetoes and two guard blocks. The protections carry the group, and
+where the model is allowed to act it is 0 for 2.
+
+### And what seven repetitions said
+
+A single pass is not evidence -- 2.18 measured repeated executions of the same
+plan varying 18.6%, and this project has published a single-pass number before.
+Paired and alternated, native and hint in turn so that 2.32's between-run drift
+hits both arms:
+
+| query | native | hinted | one pass said | repeated says |
+|---|---|---|---|---|
+| `corr_6w_band_category` | 98.6 | 100.3 | 1.087x | **1.017x** |
+| `shape_6w_top_suppliers` | 120.0 | 131.4 | 1.273x | **1.095x** |
+
+Neither range is disjoint from its native range. The losses are real in
+direction and roughly a third of the size the deploy pass reported: about
+**13 ms** across the group rather than 43, which puts the captured figure near
+**-5.7%** rather than -18.7%.
+
+The oracle in that table is a single-pass minimum too, and a minimum over noisy
+draws is biased low -- so the denominator is generous and the true figure is
+closer to zero still.
+
+### The answer
+
+**It is a regression, and it is small.** The model does deviate and lose on this
+group, so the drop is not pure dilution; and the effect is a few milliseconds
+against a 7-point move that 2.32's 8-point floor and 2.66's split range both
+swallow whole. The right reading of 33.0% -> 26.0% is that it is not a
+measurement of anything.
+
+### One deviation exceeded its own bound; one did not
+
+| query | pessimistic bound | actually ran at | inside? |
+|---|---|---|---|
+| `corr_6w_band_category` | 0.92x | 1.017x | **no** |
+| `shape_6w_top_suppliers` | 1.20x | 1.095x | yes |
+
+One in two, on a bound advertised at 90% -- consistent with 2.66 measuring its
+real coverage at 75%, and a reminder that the coverage number is not an
+abstraction: it is the rate at which the gate's promise about a served plan
+turns out to be false.
+
+The second row is worth reading carefully, because it looks like a gate failure
+and is not. `shape_6w_top_suppliers` was authorised with a pessimistic estimate
+of **1.20x native** -- the gate knowingly permitted a plan it believed was
+probably slower. That is the rule as designed: the second condition asks whether
+the downside is *bounded* (below 1.25x), not whether the worst case is a win,
+and 2.18 records what happened the last time that was tightened -- a 96% veto
+rate and a system that never deviated at all. Here the design was right and the
+plan came in under its bound.
+
+### What this does and does not license
+
+It does not license turning the guard down. Four of six deviations were stopped
+and the two that got through lost; that ratio is the guard working on a
+workload the model handles badly.
+
+It does not implicate the action space either. `corr_6w_band_category`'s pick
+was an operator toggle and `shape_6w_top_suppliers`' was a cardinality
+correction -- both from the always-on families, neither from anything 2.67
+priced.
+
+What it implicates is the ranking. On six queries with 23.6% headroom available,
+the model's two authorised choices were both worse than doing nothing, and both
+were queries it had **trained on**. That is P3, and it is where the remaining
+value is.
+
+## 2.69 A third of the feature vector cannot separate anything, and it barely matters
+
+2.60 added three query-shape features and did the right thing first: it measured
+`max_same_table_equalities` monotone against headroom -- **16.9% -> 25.3% ->
+31.4%** across its three levels -- before a line was written. That is the
+"is this worth building?" discipline this project keeps crediting.
+
+The features are in the challenger bundle and they are used: all eight ensemble
+members split on all three, **557 splits, 3.0%** of the total. So the natural
+follow-up -- "do the splits land on them?" -- comes back yes.
+
+### Then ablate them
+
+Same rows, same seed, everything else identical, `--exclude-feature` for each:
+
+```
+with      features=67   captured=0.4647327672   err=1.299495
+without   features=64   captured=0.4647327672   err=1.301953
+```
+
+Two different rankers, trained on different vectors, and the held-out capture
+agrees to **ten decimal places**. Checked directly: the pick is the same hint on
+**16 of 16** held-out queries.
+
+### Why: the monotonicity was measured on the wrong axis
+
+`pairwise_rank` compares candidates **within one query**. These three features
+are functions of the SQL text, and every candidate for a query has the same SQL
+text -- a hint changes the plan, not the predicates. So all three take one value
+per query, and a feature constant across the things being compared cannot
+contribute to the comparison.
+
+2.60's measurement was real and it answered a different question. It showed the
+feature predicts **which queries have headroom**, and the ranker is never asked
+that. It is asked which plan, for this query, is faster.
+
+This is the third instance:
+
+| | what it was | found by |
+|---|---|---|
+| `has_hint` | always 1.0, in the vector for months | 2.50 |
+| `Parallel Safe` | constant across a query's candidates | 2.61 |
+| the three shape features | one value per query, by construction | here |
+
+2.61 got it right and wrote the rule down -- "a field constant across a query's
+candidates cannot separate them, whatever it correlates with across queries" --
+in a scratch probe that was deleted. It is now `app.feature_audit`.
+
+### The audit found twenty-three
+
+```
+models/_challenger.pkl: 67 features, over 65 queries with 2+ servable candidates
+
+constant across every query's candidates: 23/67
+splits spent on them: 1,250 of 18,290 (6.8% of the model's capacity)
+```
+
+Every `*_present` and `*_occurrences` slot, `num_joins`, `num_tables`,
+`tree_leaves`, `n_disabled_nodes`, `log_root_width`, and `has_hint` -- which
+2.50 identified as useless and which is still in the vector, still collecting
+**255 splits**.
+
+### On JOB it is fifty-two percent
+
+The same audit against the 21-table schema:
+
+```
+models/plan_selector_job18.pkl: 139 features, over 30 queries
+constant across every query's candidates: 72/139
+splits spent on them: 421 of 12,902 (3.3% of the model's capacity)
+```
+
+More than half the vector, and the effect scales with schema width: 21 tables
+means 105 per-table slots, and a query that touches six of them leaves 15 slots
+reading the same value for every candidate it has.
+
+The wasted *capacity* is smaller than the synthetic model's 6.8%, and for a
+reason worth stating: a slot that is zero on every row of the whole dataset is
+constant, useless and also un-split-on, so it costs nothing but a multiply. The
+expensive ones are features that vary **across** queries and not **within** them
+— `log_root_width` alone takes 247 splits on JOB and 289 on the synthetic
+schema. Those are what a tree will happily spend itself on.
+
+### Dropping all twenty-three makes the model better
+
+Paired across sixteen query-level splits, because 2.66 measured a single split
+worth up to 64.9 points on its own:
+
+| | with all 67 | with 44 |
+|---|---|---|
+| better on | 5/16 splits | **11/16 splits** |
+| mean held-out capture | — | **+8.3 points** |
+| median | — | +1.4 points |
+| best / worst split | — | +42.5 / -3.7 |
+| typical multiplicative error better on | 3/16 | **13/16** |
+
+Signed-rank on the capture deltas: **z = +2.22, p = 0.026**. The sign test alone
+gives p = 0.210, and the difference between the two is eleven gains averaging
+**+12.8** points against five losses averaging **-1.5**.
+
+### And the attribution above is wrong
+
+That paragraph says "dropping twenty-three features helps", and the natural
+reading -- the one this section was originally written with -- is that the
+*class* is the problem. It is not. Isolating the arms says so plainly:
+
+| arm | what it drops | mean vs base | identical to base on |
+|---|---|---|---|
+| `hint` | `has_hint` alone | **+8.3** | 0 of 16 splits |
+| `rest` | the other 22 | **+0.0** | **16 of 16 splits** |
+| `all` | all 23 | +8.3 | 0 of 16 |
+
+Dropping twenty-two of the twenty-three changes **nothing**, on every split, to
+the last decimal. One feature is the entire effect, and 2.70 is what it turned
+out to be.
+
+So the class finding survives only in its weak form: 23 of 67 features cannot
+separate a query's candidates, they are dead weight, and removing them is free.
+Free is not the same as valuable, and this section originally claimed the
+latter.
+
+The audit is still worth having -- it is what found `has_hint` -- and the
+23-of-67 and 72-of-139 counts are real. What is not real is the implied causal
+story, and the cheap way to have caught it was the arm that was not run:
+**ablate the class minus the suspect**.
+
+## 2.70 One feature knew whether it was looking at PostgreSQL's own plan
+
+2.69 found twenty-three features constant across a query's candidates and
+measured dropping them worth a mean +8.3 points. Isolating the arms showed
+twenty-two of them worth exactly nothing -- identical results on 16 of 16
+splits -- and `has_hint` worth all of it.
+
+`has_hint` is 1.0 when a candidate carries a hint. Every candidate carries a
+hint. It has been in the vector since the beginning and 2.50 already identified
+it as useless, and it was still there, still collecting **255 splits**. This is
+why it survived.
+
+### The training rows contain a row type that serving does not
+
+`app.train` trains on **2,322** rows, of which **65** are baselines -- the
+native plan for each query, `hint = NULL`, `has_hint = 0.0`. They are the only
+rows where it is zero.
+
+The pairwise ranker forms pairs within a query, so those 65 rows become
+**2,257 of 42,782 pairs (5.3%)**, each one "is this hinted candidate faster than
+native?". And `has_hint` answers half of that question perfectly.
+
+At serving, `learned.select()` is handed candidates only. The baseline is the
+gate's business -- selection and authorisation are separate steps -- so the
+ranker is never asked that comparison, and in the population it *is* asked
+about, `has_hint` is constant at 1.0.
+
+A feature that is informative in training and constant in serving is not a dead
+feature. It is a **train/serve skew wearing a dead feature's clothes**: 255
+splits that separate training data along an axis that does not exist in
+production. 2.47 found the same baseline-is-not-a-candidate confusion in the
+calibration replay and in `retrain._score_bundle`. This is the third instance
+and the first one that was costing accuracy rather than credibility.
+
+### The obvious fix is wrong
+
+If baseline pairs are the problem, remove them. Sixteen paired splits:
+
+| | mean vs base | better on |
+|---|---|---|
+| drop the `has_hint` **feature**, keep the pairs | **+8.3** | 11/16 |
+| drop the baseline **pairs**, keep every feature | **-4.2** | 6/16 |
+
+Removing the pairs *loses* four points. Best guess, and it is a guess: the
+baseline is the only row in each group whose ratio is exactly 1.0, so it anchors
+where "no better than native" sits. Take it away and the ranker orders
+candidates against each other with nothing to say whether any of them is worth
+serving.
+
+`rank_on_candidates_only` exists, is off, and its docstring carries this table.
+The argument for it was good; the measurement was against it.
+
+### The tool built to find this could not find it
+
+`app.feature_audit` computes constancy over servable candidates and flags
+`has_hint` correctly. `app.train --drop-constant-features`, written an hour
+later, computed it over *training rows* -- baselines included -- so it dropped
+the twenty-two that do not matter and kept the one that does.
+
+The tool that reports and the tool that acts disagreed about the population, and
+the acting one was blind to the only feature worth acting on. Both now compute
+it over candidates only, through one shared function
+(`features.within_query_variance`), so they cannot drift again.
+
+This is the same class of bug as everything else in section 2, committed while
+writing the section that catalogues the class.
+
+### The promotion was refused
+
+44 features, `has_hint` gone, train-time `pairwise_rank` capture **46.5% ->
+67.6%** on seed 42. `app.retrain` rejected it:
+
+```
+challenger's worst pick is 3.31x the best available plan against the
+champion's 1.41x -- a better mean does not buy a worse worst case
+```
+
+Which is 2.63's verdict, on an unrelated challenger, for the second time. Two
+independent changes have now improved the mean and worsened the tail, and the
+promotion rule has declined both.
+
+That is a pattern rather than a coincidence, and it is the most useful thing in
+this section. Every improvement this project has found lately makes the model
+better on average by making it more willing to deviate -- and the tail is
+exactly where deviating costs. The gate reads a point prediction (2.63), the
+conformal bound covers 75% rather than 90% (2.66), and the ranker has none of
+the ensemble's diagnostics. Until one of those changes, "better mean, worse
+worst case" is the only shape an improvement can have here.
+
+## 2.71 Two selectors, both mediocre, better together
+
+2.70 ended on a pattern: every recent change improves the mean and worsens the
+tail, and the promotion rule has declined two of them for it. That is a
+statement about *what kind* of fix is needed, and it points at the item P2 had
+been carrying for weeks -- "give the ranker the diagnostics the ensemble has".
+
+### Most of that list cannot be given
+
+The diagnostics named were `uncertainty_scale`, the conformal bound, the
+calibration sweep and the promotion score. Every one of them is a **per-bundle
+scalar**: one number for the whole model.
+
+2.69's rule disposes of them before anything is built. A feature with one value
+per model has one value per query, and the ranker is a within-query comparator,
+so none of them can change a single decision. Not unhelpful -- *unusable*.
+
+Two things vary per candidate. The first is the ranker's own margin over the
+runner-up, which is its statement of how close the call was and which no part
+of the gate reads. Measured over 160 held-out decisions:
+
+| margin bucket | n | median x native | regressed | worst |
+|---|---|---|---|---|
+| thin | 53 | 0.834x | 19% | 1.23x |
+| middling | 54 | 0.813x | 19% | 1.27x |
+| wide | 53 | 0.824x | 25% | **2.22x** |
+
+Spearman(margin, ratio vs native) = **+0.021**. No signal, and what little there
+is points the wrong way -- the worst regression and the highest regression rate
+are both in the *widest*-margin bucket. So the confidence gate that suggests
+itself does not get built, for the same reason 2.61's `pg_overexplain` features
+did not.
+
+### The second one is the ensemble itself
+
+Within a query, across 96 held-out queries and 6 splits:
+
+| | median Spearman | right sign on |
+|---|---|---|
+| ensemble mean vs latency | **+0.680** | 93/96 |
+| ranker score vs latency | **-0.660** | 95/96 |
+| ensemble spread vs its own error | +0.212 | 72/96 |
+
+The first two are the finding. The ensemble and the ranker train on the same
+rows and the same features, so the intuition is that one must dominate. They do
+not: they are of a strength, and they get there differently. 2.43 already said
+why -- the ensemble predicts a *level* and the ranker predicts an *order*, and
+uniform error cancels in a comparison and not in a prediction.
+
+Two comparably good, differently-wrong rankings is the textbook case for
+aggregating rather than choosing.
+
+### Borda
+
+Rank the candidates by predicted ratio, rank them by Copeland score, add the two
+ranks, take the minimum. No weight to tune -- which matters, because 2.66
+measured a single split worth up to 64.9 points and there is no held-out budget
+here to fit a blending constant with. A weighted sum of a log-ratio and a
+win-share would also be adding two things that are not in the same units.
+
+160 held-out decisions over 10 query-level splits:
+
+| selector | served | captured | worst regression |
+|---|---|---|---|
+| native | 23,526 ms | 0.0% | 1.00x |
+| `pairwise_rank` (shipping) | 19,455 ms | 52.1% | **2.22x** |
+| `greedy` | 19,250 ms | 54.7% | 1.64x |
+| **`borda`** | **18,608 ms** | **63.0%** | **1.64x** |
+| oracle | 15,715 ms | 100.0% | — |
+
+**+10.9 points over the shipping policy, and the worst case improves at the same
+time.** That is the first change in this stretch of the project to move both,
+and 2.70 predicted the shape of what would: not a better single model, but a
+second opinion on the one decision that matters.
+
+### The arm that looked better and was not
+
+The obvious version is stricter: serve the ranker's pick only if the ensemble
+also ranks it in the top three, otherwise keep native. It does bound the risk --
+worst case 1.64x, and it deviates on only **53%** of queries instead of 100% --
+and it captures **42.4%**, eleven points *worse* than the policy it was meant to
+improve.
+
+Declining is not free. Every query it refuses is headroom left on the table, and
+on this workload the refusals cost more than the regressions they avoid. Borda
+gets the same worst case without refusing anything, because it is choosing a
+better candidate rather than choosing less often.
+
+### Ties are not preferences
+
+The first implementation ranked by `sorted()` position, so two candidates a
+selector scored identically got ranks 0 and 1. That invents a preference neither
+selector expressed, and worse, it silently disables the cost tie-break: two
+candidates both selectors rate equally come out with sums 0 and 2 rather than
+tying, so PostgreSQL's estimate never gets consulted. Averaging ranks over ties
+took `borda` from 61.5% to **63.0%**.
+
+### Wiring, which is where this normally goes wrong
+
+`pairwise_rank` was spelled out as a literal in seven files -- the autotune
+sweep, the benchmark's `--policy`, the calibration replay, the promotion
+yardstick, the settings API, the experiment runner and the training evaluation.
+Adding a policy to six of them is exactly 2.50: a `gate_mode` the sweep offered
+and the API ignored, and 2.43: a gate calibrated under a policy the server does
+not run.
+
+They all read `learned.RANKER_POLICIES` now, and `tests/test_borda.py` asserts
+that each of the six scores `borda` *as borda* rather than as the plain ranker.

@@ -312,3 +312,48 @@ def featurize(candidate_plan: dict, table_cardinalities: dict[str, float]) -> di
 def to_vector(features: dict[str, float], feature_columns: list[str]) -> list[float]:
     """Flatten a feature dict into a list ordered by `feature_columns`."""
     return [features.get(col, 0.0) for col in feature_columns]
+
+
+def within_query_variance(
+    featurized: list[dict[str, float]],
+    query_ids: list[str],
+    feature_columns: list[str],
+) -> dict[str, int]:
+    """
+    Per feature, on how many queries it takes more than one value across that
+    query's candidates.
+
+    `pairwise_rank` chooses by comparing candidates **within one query**, so a
+    feature that scores zero here cannot change any decision it makes -- however
+    well it predicts across queries. `docs/WRITEUP.md` 2.69 measured 23 of 67
+    features in that state on the synthetic schema and 72 of 139 on JOB, and
+    dropping them improved held-out capture on 11 of 16 paired splits.
+
+    Shared by `app.train` (which can drop them) and `app.feature_audit` (which
+    reports them), so the two cannot disagree about what "constant" means.
+
+    Rounded, because a float differing in the fifteenth decimal is constant for
+    every purpose a tree has.
+    """
+    seen: dict[str, dict[str, set[float]]] = {}
+    for features, qid in zip(featurized, query_ids, strict=True):
+        per_query = seen.setdefault(qid, {})
+        for col in feature_columns:
+            per_query.setdefault(col, set()).add(round(features.get(col, 0.0), 9))
+
+    counts = dict.fromkeys(feature_columns, 0)
+    for per_query in seen.values():
+        for col, values in per_query.items():
+            if len(values) > 1:
+                counts[col] += 1
+    return counts
+
+
+def within_query_constant(
+    featurized: list[dict[str, float]],
+    query_ids: list[str],
+    feature_columns: list[str],
+) -> set[str]:
+    """The features `within_query_variance` scores zero -- see 2.69."""
+    counts = within_query_variance(featurized, query_ids, feature_columns)
+    return {col for col, n in counts.items() if n == 0}

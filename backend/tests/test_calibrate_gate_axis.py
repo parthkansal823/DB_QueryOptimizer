@@ -232,3 +232,75 @@ def test_the_logged_row_carries_the_disabled_count_forward():
 
     assert _row_to_candidate(row)["disabled_nodes"] == count_disabled_nodes(plan)
     assert _row_to_candidate(row)["disabled_nodes"] > 0
+
+
+# -- the latest run is not the widest run -----------------------------------
+
+
+def _row(qid, hint, when, selector, ms=10.0):
+    plan = {"Node Type": "Seq Scan", "Relation Name": "t", "Alias": "t",
+            "Plan Rows": 1, "Plan Width": 8}
+    return {
+        "query_id": qid, "hint": hint, "is_baseline": False, "raw_plan": plan,
+        "total_cost": 10.0, "actual_total_time_ms": ms,
+        "created_at": when, "selector_used": selector,
+    }
+
+
+def test_a_collection_run_beats_a_newer_benchmark_run():
+    """
+    Two kinds of run write to the log, and they explore very differently:
+
+        app.collect_data   explores the action space   84 candidates on one query
+        app.benchmark      serves one plan per query   12 on the same query
+
+    A benchmark run is newer than the collection before it, so "most recent
+    run" used to mean the 12. Measured on `corr_5w_premium_supplier`: 976 raw
+    rows across 50 runs, newest a benchmark with 12 rows carrying only
+    `join_order`, `operator_toggle` and `cardinality`, while the collection
+    fifteen minutes earlier had 84 including `resource` and `scan_method`.
+
+    The failure was silent and total: `app.autotune`'s action-space axis went
+    inert, every combination of optional families scoring identically, because
+    none of them was in the data being scored.
+    """
+    from app.train import _aggregate_repetitions
+
+    rows = [
+        _row("q", "/*+ Leading(a b) */", "2026-01-01T10:00:00", "collection"),
+        _row("q", "/*+ SeqScan(a) */", "2026-01-01T10:00:00", "collection"),
+        _row("q", "/*+ Set(work_mem '64MB') */", "2026-01-01T10:00:00", "collection"),
+        # Newer, narrower.
+        _row("q", "/*+ Leading(a b) */", "2026-01-01T11:00:00", "learned"),
+    ]
+
+    kept = _aggregate_repetitions(rows, latest_run_only=True)
+    hints = {r["hint"] for r in kept}
+
+    assert "/*+ SeqScan(a) */" in hints, "the wider collection run was discarded"
+    assert len(hints) == 3
+
+
+def test_a_query_never_collected_still_uses_its_newest_run():
+    """Falling back matters: a query only ever seen through the dashboard has no
+    collection run, and dropping it entirely would be worse than using what
+    there is."""
+    from app.train import _aggregate_repetitions
+
+    rows = [
+        _row("adhoc", "/*+ Leading(a b) */", "2026-01-01T10:00:00", "learned"),
+        _row("adhoc", "/*+ Leading(b a) */", "2026-01-01T11:00:00", "learned"),
+    ]
+
+    kept = _aggregate_repetitions(rows, latest_run_only=True)
+
+    assert {r["hint"] for r in kept} == {"/*+ Leading(b a) */"}
+
+
+def test_the_loader_actually_selects_the_column_this_depends_on():
+    """The fix is inert without it -- every row would miss the collection test
+    and fall through to the old behaviour. Checked rather than assumed, because
+    that is the shape of half the bugs in WRITEUP section 2."""
+    from app.train import FETCH_SQL
+
+    assert "selector_used" in FETCH_SQL

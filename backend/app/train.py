@@ -35,8 +35,14 @@ from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
 from app.optimizer.cardinality import JoinCardinalityCorrector
 from app.optimizer import calibration
 from app.optimizer.conformal import ConformalGate, sigma_scale
-from app.optimizer.features import build_feature_columns, featurize, to_vector
-from app.optimizer.ranker import PairwisePlanRanker
+from app.optimizer.features import (
+    build_feature_columns,
+    featurize,
+    to_vector,
+    within_query_constant,
+)
+from app.optimizer.learned import RANKER_POLICIES
+from app.optimizer.ranker import PairwisePlanRanker, borda_select
 from app.plan_extractor import count_disabled_nodes
 from app.plan_extractor import _extract_join_types, _extract_scan_relations, _extract_tables
 from app.schema_introspection import discover_table_cardinalities
@@ -61,7 +67,12 @@ EVAL_PATH = os.getenv("EVAL_OUT_PATH", "models/eval_results.json")
 
 FETCH_SQL = """
     SELECT query_id, sql_text, hint, is_baseline, raw_plan, total_cost,
-           actual_total_time_ms, created_at
+           actual_total_time_ms, created_at,
+           -- Needed by `_aggregate_repetitions(latest_run_only=True)` to tell a
+           -- collection run from a benchmark run. Without it that filter picks
+           -- whichever wrote last, which is usually the benchmark and carries a
+           -- fraction of the action space.
+           selector_used
     FROM plan_execution_log
     WHERE actual_total_time_ms IS NOT NULL
       AND query_id IS NOT NULL
@@ -239,6 +250,32 @@ def _aggregate_repetitions(rows: list[dict], latest_run_only: bool = False) -> l
     the same native query in this log ranges from 2.4 ms to 13.7 ms across runs
     collected months and workloads apart. See `app.calibrate._grouped_rows`.
 
+    ## The most recent run is not the widest one
+
+    "Most recent" used to mean *any* run, and that quietly handed the calibration
+    sweep a fraction of the action space. Two kinds of run write to this log:
+
+        app.collect_data   explores the action space   84 candidates on one query
+        app.benchmark      serves one plan per query   12 candidates on the same
+
+    A benchmark run is newer than the collection that preceded it, so
+    `latest_run_only` picked the 12. Measured on `corr_5w_premium_supplier`:
+    976 raw candidate rows across 50 runs, of which the newest was a benchmark
+    with **12 rows carrying only `join_order`, `operator_toggle` and
+    `cardinality`** -- while the collection fifteen minutes earlier had 84 rows
+    including `resource` and `scan_method`.
+
+    The consequence was silent and total: `app.autotune`'s action-space axis
+    became inert, every combination of optional families scoring identically to
+    four decimal places, because none of those families was in the data being
+    scored. A sweep cannot price a family it cannot see.
+
+    So collection runs are preferred, and any run is used only for a query that
+    has never been collected. That keeps the original purpose -- one run's
+    conditions, not a decade's -- while restoring the action space the sweep
+    exists to reason about. `docs/WRITEUP.md` 2.30 is the same theme: the
+    benchmark changes the system it is measuring.
+
     Why median and not mean: latency has a heavy right tail (a candidate
     occasionally collides with autovacuum, a checkpoint, or another process
     on the machine). The mean chases those outliers; the median ignores
@@ -250,14 +287,27 @@ def _aggregate_repetitions(rows: list[dict], latest_run_only: bool = False) -> l
         # `created_at` defaults to now() and Postgres freezes it per
         # transaction, so one collection of one query shares a single value --
         # which is what makes it an identifier for a run rather than a clock.
+        from app.stats import COLLECTION_SELECTOR
+
+        # Newest *collection* run per query, and newest run of any kind as the
+        # fallback for a query nothing has collected.
         newest: dict[str, object] = {}
+        newest_any: dict[str, object] = {}
         for row in rows:
             at = row.get("created_at")
             if at is None:
                 continue
-            current = newest.get(row["query_id"])
+            qid = row["query_id"]
+            current_any = newest_any.get(qid)
+            if current_any is None or at > current_any:
+                newest_any[qid] = at
+            if row.get("selector_used") != COLLECTION_SELECTOR:
+                continue
+            current = newest.get(qid)
             if current is None or at > current:
-                newest[row["query_id"]] = at
+                newest[qid] = at
+        for qid, at in newest_any.items():
+            newest.setdefault(qid, at)
         if newest:
             rows = [
                 row for row in rows
@@ -447,7 +497,24 @@ def make_regressor():
     return _build_model()[0]
 
 
-def _query_level_split(query_ids: list[str], test_fraction: float = 0.25, seed: int = 42):
+# Which queries land in the held-out set. One number, and every held-out figure
+# this project reports is conditional on it.
+#
+# Split conformal guarantees coverage under **exchangeability**, and a
+# query-level split is the one thing that breaks it: rows from the same query
+# share a plan shape, a table set and a native latency, so calibration and test
+# are drawn from different distributions by construction. 2.66 measures the
+# size of that -- coverage moves 15 points across seeds on the same model and
+# the same rows.
+#
+# Kept as a constant rather than a literal so a sweep over it is a loop rather
+# than a patch.
+DEFAULT_SPLIT_SEED = 42
+
+
+def _query_level_split(
+    query_ids: list[str], test_fraction: float = 0.25, seed: int = DEFAULT_SPLIT_SEED
+):
     unique = sorted(set(query_ids))
     rng = random.Random(seed)
     rng.shuffle(unique)
@@ -496,7 +563,7 @@ def _evaluate_selection(
     """
     from app.calibrate import _servable
 
-    selectors = list(POLICIES) + (["pairwise_rank"] if ranker is not None else [])
+    selectors = list(POLICIES) + (list(RANKER_POLICIES) if ranker is not None else [])
     per_policy: dict[str, list[float]] = {p: [] for p in selectors}
     native_latencies, heuristic_latencies, oracle_latencies = [], [], []
     beats_heuristic = {p: 0 for p in selectors}
@@ -534,10 +601,16 @@ def _evaluate_selection(
                 beats_heuristic[policy] += 1
 
         if ranker is not None:
-            idx = ranker.select(vectors, tie_break_costs=costs)
-            per_policy["pairwise_rank"].append(latencies[idx])
-            if latencies[idx] <= heuristic_latency:
-                beats_heuristic["pairwise_rank"] += 1
+            scores = ranker.scores(vectors)
+            means, _ = ensemble.predict_mean_std(vectors)
+            for name, idx in (
+                ("pairwise_rank",
+                 ranker.select(vectors, tie_break_costs=costs, scores=scores)),
+                ("borda", borda_select(means, scores, tie_break_costs=costs)),
+            ):
+                per_policy[name].append(latencies[idx])
+                if latencies[idx] <= heuristic_latency:
+                    beats_heuristic[name] += 1
 
     n = len(native_latencies)
     if not n:
@@ -582,6 +655,10 @@ def train(
     aggregate_reps: bool = True,
     latest_run_only: bool = False,
     conformal_alpha: float = DEFAULT_CONFORMAL_ALPHA,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    exclude_features: tuple[str, ...] = (),
+    drop_constant_features: bool = False,
+    rank_on_candidates_only: bool = False,
 ) -> dict:
     # Checked before any work: this used to sit beside the write, so an
     # invalid destination was only reported after a full training run.
@@ -640,14 +717,65 @@ def train(
 
     table_cardinalities = _discover_cardinalities()
     feature_columns = build_feature_columns(list(table_cardinalities))
+    if exclude_features:
+        # Ablation. `to_vector` reads features by name, so dropping a name from
+        # this list removes it everywhere -- training, evaluation and serving --
+        # rather than leaving a zeroed column the trees can still split on.
+        #
+        # An unknown name is an error, not a no-op: a typo would silently run
+        # the control arm twice and report the feature as worthless.
+        unknown = [f for f in exclude_features if f not in feature_columns]
+        if unknown:
+            raise ValueError(
+                f"not features of this schema: {unknown}. "
+                f"Ablating a name that does not exist measures nothing."
+            )
+        dropped = set(exclude_features)
+        feature_columns = [c for c in feature_columns if c not in dropped]
+        print(f"ablation: dropped {len(dropped)} feature(s) -- {sorted(dropped)}")
 
     candidates = [_row_to_candidate(r) for r in rows]
     query_ids = [r["query_id"] for r in rows]
 
-    X_all = [to_vector(featurize(c, table_cardinalities), feature_columns) for c in candidates]
+    featurized = [featurize(c, table_cardinalities) for c in candidates]
+
+    if drop_constant_features:
+        # Baselines excluded, and this is the whole ballgame.
+        #
+        # Computing constancy over *all* training rows misses `has_hint`, which
+        # is 1.0 on every candidate and 0.0 on the 65 baseline rows -- so it
+        # looks like it varies. It does, in training. At serving the ranker is
+        # handed candidates only, where it is constant at 1.0.
+        #
+        # That difference is not a detail; measured over 16 paired splits it is
+        # the entire effect. Dropping the other 22 constant features gives
+        # results **identical on 16 of 16 splits**; dropping `has_hint` alone
+        # gives mean +8.3 points. A version of this check that computes over
+        # training rows drops the 22 that do not matter and keeps the one that
+        # does (2.70).
+        candidate_rows = [
+            (f, q) for f, q, row in zip(featurized, query_ids, rows, strict=True)
+            if not row["is_baseline"]
+        ]
+        constant = within_query_constant(
+            [f for f, _ in candidate_rows],
+            [q for _, q in candidate_rows],
+            feature_columns,
+        )
+        if constant:
+            feature_columns = [c for c in feature_columns if c not in constant]
+            print(
+                f"dropped {len(constant)} feature(s) constant across every "
+                f"query's candidates, leaving {len(feature_columns)}"
+            )
+        dropped_constant = sorted(constant)
+    else:
+        dropped_constant = None
+
+    X_all = [to_vector(f, feature_columns) for f in featurized]
     y_all = _relative_targets(rows)
 
-    train_ids, test_ids = _query_level_split(query_ids)
+    train_ids, test_ids = _query_level_split(query_ids, seed=split_seed)
     train_idx = [i for i, q in enumerate(query_ids) if q in train_ids]
     test_idx = [i for i, q in enumerate(query_ids) if q in test_ids]
 
@@ -729,10 +857,36 @@ def train(
     except (RuntimeError, ValueError) as exc:  # too few rows, or every row in-bag
         print(f"[warn] conformal gate not calibrated: {exc}")
 
-    # Pairwise ranker (Lero-style), trained on the same rows. Pairs are
-    # formed within a query only -- see optimizer/ranker.py.
+    # Pairwise ranker (Lero-style). Pairs are formed within a query only --
+    # see optimizer/ranker.py.
+    #
+    # **`rank_on_candidates_only` is off, and the reason is a measurement that
+    # contradicted a very good argument.**
+    #
+    # The argument: groups are built from every training row, baselines
+    # included, so the ranker learns "is A faster than B" over pairs where B is
+    # native PostgreSQL -- 2,257 of 42,782 pairs, 5.3%. At serving,
+    # `learned.select()` is handed candidates only; the baseline is the gate's
+    # business, not the policy's. Those are comparisons the served ranker is
+    # never asked to make, which is 2.47's finding for the third time. And
+    # `has_hint` is exactly the feature separating a baseline from a candidate,
+    # so in training it looks informative (255 splits) while at serving it is
+    # constant at 1.0 -- 2.50's dead feature, explained.
+    #
+    # The measurement, 16 paired splits: removing them **loses 4.2 points** of
+    # held-out capture on average and wins on 6 of 16. Dropping the `has_hint`
+    # *feature* while keeping the pairs is the intervention that helps (2.70).
+    #
+    # Best guess at why, and it is a guess: the baseline row is the only
+    # candidate in each group whose latency ratio is exactly 1.0, so it anchors
+    # what "no better than native" looks like. Removing it leaves the ranker
+    # ordering candidates against each other with nothing to say where native
+    # sits. Kept as an option because it is the honest control arm for that
+    # claim, and off because the data says off.
     train_groups: dict[str, tuple[list, list]] = {}
     for i in train_idx:
+        if rank_on_candidates_only and rows[i]["is_baseline"]:
+            continue
         vectors, latencies = train_groups.setdefault(query_ids[i], ([], []))
         vectors.append(X_all[i])
         latencies.append(y_all[i])
@@ -771,12 +925,27 @@ def train(
     # exactly what a schema or workload change does.
     conformal_report = None
     if conformal is not None and conformal.fitted:
+        # Calibrated means, because that is what the gate is consulted with.
+        #
+        # The bound is *fitted* on `oob_calibrated` -- the comment at the fit
+        # site says fitting on raw means and shifting the point underneath
+        # would invalidate the guarantee -- and `learned._predict` applies the
+        # same correction before `_upper_bound` reads it. This check fed the
+        # **raw** ensemble means, so the one number that says whether the gate
+        # is honest was measured against a gate nothing consults. Both are
+        # reported: the difference between them is the size of the correction,
+        # and a reader who has quoted the old figure can see which it was.
+        test_calibrated = point_calibration.apply(test_means)
         conformal_report = {
             "alpha": conformal.alpha,
             "q": conformal.q,
             "n_calibration": conformal.n_calibration,
             "target_coverage": 1.0 - conformal.alpha,
             "held_out_coverage": (
+                conformal.coverage(test_calibrated, test_stds, y_test)
+                if y_test else None
+            ),
+            "held_out_coverage_uncalibrated": (
                 conformal.coverage(test_means, test_stds, y_test) if y_test else None
             ),
         }
@@ -813,6 +982,12 @@ def train(
         "n_rows_raw": n_raw_rows,
         "reps_aggregated_to_median": aggregate_reps,
         "latest_run_only": latest_run_only,
+        # A held-out number without the split that produced it is not
+        # reproducible: 2.66 measured 15 points of coverage swing across seeds.
+        "split_seed": split_seed,
+        "excluded_features": sorted(exclude_features) or None,
+        "dropped_constant_features": dropped_constant,
+        "rank_on_candidates_only": rank_on_candidates_only,
         "n_rows_total": len(rows),
         "n_rows_train": len(X_train),
         "n_rows_test": len(X_test),
@@ -845,6 +1020,7 @@ def train(
                 # to choose a gate against honest predictions rather than
                 # against the ones the model fitted.
                 "held_out_queries": sorted(test_ids),
+                "split_seed": split_seed,
                 "feature_columns": feature_columns,
                 "table_cardinalities": table_cardinalities,
             },
@@ -872,6 +1048,29 @@ if __name__ == "__main__":
         "--n-models", type=int, default=8, help="bootstrapped ensemble size (drives uncertainty estimates)"
     )
     parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=DEFAULT_SPLIT_SEED,
+        help="which queries are held out. Every held-out figure is conditional "
+             "on this; `app.coverage_sweep` varies it to say how much",
+    )
+    parser.add_argument(
+        "--drop-constant-features",
+        action="store_true",
+        help="drop every feature that takes one value across a query's own "
+             "candidates. `pairwise_rank` compares within a query, so those "
+             "cannot change a decision (2.69). Derived from the data, so it "
+             "works on any schema",
+    )
+    parser.add_argument(
+        "--exclude-feature",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="drop this feature from the vector, for ablation. Repeatable. "
+             "An unknown name is an error rather than a no-op",
+    )
+    parser.add_argument(
         "--register",
         action="store_true",
         help="record the trained model in the version registry as a candidate. "
@@ -885,6 +1084,9 @@ if __name__ == "__main__":
         eval_path=args.eval_out,
         n_models=args.n_models,
         latest_run_only=args.latest_run_only,
+        split_seed=args.split_seed,
+        exclude_features=tuple(args.exclude_feature),
+        drop_constant_features=args.drop_constant_features,
     )
     print(json.dumps(results, indent=2))
 

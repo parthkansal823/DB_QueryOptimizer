@@ -79,6 +79,36 @@ The biggest gains land exactly on the traps that were designed in:
 both at **93.6%**. The mechanism predicted the outcome, which is the real
 evidence that the diagnosis was right. Full analysis in `docs/WRITEUP.md` §2.9.
 
+### The three-line fix that beats this entire project
+
+PostgreSQL can be told about those correlations directly, and
+`data/extended_stats.sql` does it. Measured (§2.57), three rounds alternating:
+
+| arm | native | oracle | headroom |
+|---|---|---|---|
+| statistics OFF | 602.0 ms | 481.4 ms | **18.6%** |
+| statistics ON | 595.9 ms | 567.4 ms | **0.4%** |
+
+Ranges disjoint. **98% of the opportunity, gone** — and note where it went:
+native is unchanged. PostgreSQL's plan was already close to the best available;
+what changed is that it started finding the good plan itself.
+
+**On a real database, run that file first.** Three `CREATE STATISTICS`
+statements beat any plan-picking layer on cost, coverage and risk: they fix
+every query against those columns forever, including ones this optimizer never
+sees, and they cannot regress a query the way a wrong hint can. `app.advisor`
+recommends them for your schema.
+
+They are deliberately **not** in `schema.sql`, because a layer that corrects the
+optimizer cannot be evaluated on a workload the optimizer already gets right —
+0.4% of headroom would leave the benchmark measuring noise. Every number in this
+README was measured without them; turning them on needs a re-collect, and the
+headline capture figure should be expected to **fall**.
+
+That is the honest frame for everything below: this system is worth running on
+the queries a well-tuned database still gets wrong, and the first job is finding
+out how many of those you actually have.
+
 > **If you change the action space, re-run `app.collect_data`.** Widening it
 > without retraining sent 17 of 25 queries into the safety veto, because the
 > model was scoring plan types it had never seen. That is train/serve skew,
@@ -457,6 +487,8 @@ learned-query-optimizer/
 ├── postgres/                Postgres image with pg_hint_plan + init scripts
 ├── data/
 │   ├── schema.sql            synthetic benchmark schema + skewed seed data
+│   ├── extended_stats.sql   the 3 CREATE STATISTICS that remove 98% of the
+│   │                        headroom -- opt-in, and the file says why
 │   └── job/                  JOB/IMDB stretch goal: loader + docs
 ├── backend/
 │   ├── tests/                 pytest suite (1,090 unit + 17 integration)
@@ -834,7 +866,11 @@ jackknife+-after-bootstrap (Kim, Xu & Barber, NeurIPS 2020), which exists for
 ensembles built exactly the way `bandit.py` builds this one.
 
 `app.train` reports the achieved coverage on held-out queries, so the guarantee
-is checked rather than asserted.
+is checked rather than asserted -- and it does not hold. Across ten query-level
+splits (`python -m app.coverage_sweep`) coverage runs **62.5% to 92.6%**, median
+**75.5%**, reaching the advertised 90% on one split in ten. See §2.66: a
+query-level split breaks the exchangeability the theorem needs, and this is what
+that costs. Quote the range.
 
 **Which bound is used is measured, not chosen.** `app.calibrate` sweeps
 `fixed_z` and `conformal` as one grid over the same held-out queries, and
@@ -892,3 +928,9 @@ What it does *not* claim: coverage is marginal and assumes exchangeability. A
 workload or schema that stops resembling the training queries breaks that
 assumption, and the guarantee with it — the same assumption the rest of the
 model already runs on, stated rather than buried.
+
+That is no longer hypothetical. Holding out whole *queries* already breaks
+exchangeability, because rows from one query share a plan shape, a table set and
+a native latency; §2.66 measures the result at 15 points of median coverage
+below target. The bound is worth keeping as an interval fitted on real residuals
+instead of a chosen `z`, and it is not 90%.

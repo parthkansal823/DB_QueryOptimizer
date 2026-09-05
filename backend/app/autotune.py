@@ -51,9 +51,10 @@ from app.calibrate import (
     sweep,
 )
 from app.optimizer.bandit import POLICIES
+from app.optimizer.learned import RANKER_POLICIES
 from app.retrain import served_policy
 
-POLICY_CHOICES = tuple(POLICIES) + ("pairwise_rank",)
+POLICY_CHOICES = tuple(POLICIES) + RANKER_POLICIES
 
 # The families a candidate hint can belong to. `join_order`, `operator_toggle`
 # and `cardinality` are always on -- they are the families this project exists

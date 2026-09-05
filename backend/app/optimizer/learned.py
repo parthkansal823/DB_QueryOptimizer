@@ -46,6 +46,7 @@ import random
 
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
+from app.optimizer.ranker import borda_select
 
 # How much worse than native Postgres's own plan a learned pick is allowed
 # to be (predicted) before we discard it and keep the native plan. 0.15 =
@@ -71,6 +72,13 @@ from app.optimizer.features import featurize, to_vector
 # eventually disagree with it, and the fix is to delete the duplicate rather
 # than to synchronise it. The compose override is gone; this is the decision.
 DEFAULT_SELECTION_POLICY = "pairwise_rank"
+
+# Policies that live on the ranker rather than on the ensemble, so they are not
+# in `bandit.POLICIES` and every tool that offers a `--policy` has to know about
+# them. Kept here, once, because the list was previously spelled out as a
+# literal in seven files and adding `borda` to six of them would have been the
+# 2.50 mistake again: a setting the API accepted and the server ignored.
+RANKER_POLICIES = ("pairwise_rank", "borda")
 
 DEFAULT_SAFETY_MARGIN = 0.15
 
@@ -664,7 +672,7 @@ class LearnedOptimizer:
         if vectors is None:
             vectors = self._vectorize(candidate_plans)
 
-        if self.policy == "pairwise_rank":
+        if self.policy in RANKER_POLICIES:
             if self.ranker is None:
                 # Trained before the ranker existed, or too few distinct
                 # latencies to learn an ordering -- don't fail a live query
@@ -675,9 +683,22 @@ class LearnedOptimizer:
             # `scores` ran the O(n^2) pairwise sweep twice over the same
             # vectors to reach the same answer.
             scores = self.ranker.scores(vectors)
-            index = self.ranker.select(vectors, tie_break_costs=costs, scores=scores)
+            if self.policy == "borda":
+                # `predictions` is passed in by `select_plan`, which has already
+                # run the ensemble for the gate. Re-running it here would double
+                # the model calls on the path whose economic case rests on
+                # planning being cheap relative to execution.
+                means = (
+                    predictions[0] if predictions is not None
+                    else self._predict(vectors)[0]
+                )
+                index = borda_select(means, scores, tie_break_costs=costs)
+            else:
+                index = self.ranker.select(
+                    vectors, tie_break_costs=costs, scores=scores
+                )
             self.last_decision = {
-                "policy": "pairwise_rank",
+                "policy": self.policy,
                 "pairwise_win_rate": scores[index],
                 "all_pairwise_win_rate": scores,
             }

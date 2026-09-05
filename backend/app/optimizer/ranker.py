@@ -150,3 +150,91 @@ class PairwisePlanRanker:
             return winners[0]
         # Degrade to the Phase 0 heuristic among tied candidates.
         return min(winners, key=lambda i: tie_break_costs[i])
+
+
+def _ranks(values: list[float], reverse: bool) -> list[float]:
+    """Competition ranks over `values`, tied values sharing the average rank."""
+    order = sorted(range(len(values)), key=lambda i: -values[i] if reverse else values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        shared = (i + j) / 2
+        for k in range(i, j + 1):
+            ranks[order[k]] = shared
+        i = j + 1
+    return ranks
+
+
+def borda_select(
+    means: list[float],
+    scores: list[float],
+    tie_break_costs: list[float] | None = None,
+) -> int:
+    """
+    Rank aggregation over the ensemble's prediction and the ranker's score.
+
+    ## Why two selectors instead of a better one
+
+    The ensemble and the ranker are trained on the same rows and the same
+    features, so the intuition is that one of them must be strictly better. They
+    are not: measured within-query over 96 held-out queries,
+
+        Spearman(ensemble mean, latency)    +0.680, right sign on 93/96
+        Spearman(ranker score, latency)     -0.660, right sign on 95/96
+
+    Comparable strength, and they get there differently -- the ensemble predicts
+    a level and the ranker predicts an order, which 2.43 measured as the whole
+    reason `pairwise_rank` beats point-prediction policies. Two comparably good,
+    differently-wrong rankings is exactly the case where aggregating beats
+    picking one.
+
+    ## Why Borda rather than averaging the numbers
+
+    A predicted log-ratio and a Copeland win-share are not on the same scale and
+    a weighted sum of them would be a made-up constant. Ranks are scale-free, so
+    the aggregate has nothing to tune, which matters on a workload where 2.66
+    measured a single split worth up to 64.9 points -- there is no held-out
+    budget here to fit a blending weight with.
+
+    ## Measured
+
+    160 held-out decisions over 10 query-level splits (2.71):
+
+        selector      captured    worst regression
+        pairwise_rank    52.1%    2.22x
+        greedy           54.7%    1.64x
+        borda            61.5%    1.64x
+
+    The first change in this project's recent history to improve the mean and
+    the tail together. 2.70 records two challengers rejected for the opposite
+    trade.
+    """
+    n = len(means)
+    if n != len(scores):
+        raise ValueError(f"{n} predictions against {len(scores)} ranker scores")
+    if n == 0:
+        raise ValueError("no candidates to rank")
+
+    # Ascending predicted ratio (lower is faster) and descending Copeland score
+    # (higher wins more duels), with **tied values sharing a rank**.
+    #
+    # Enumeration order is not information. Assigning 0 and 1 to two candidates
+    # a selector scored identically invents a preference it did not express,
+    # and it silently disables the cost tie-break below: two candidates that
+    # both selectors rate equally would come out with sums 0 and 2 rather than
+    # tying, so the estimate never gets consulted.
+    rank_of_mean = _ranks(means, reverse=False)
+    rank_of_score = _ranks(scores, reverse=True)
+
+    combined = [rank_of_mean[i] + rank_of_score[i] for i in range(n)]
+    best = min(combined)
+    winners = [i for i, c in enumerate(combined) if c == best]
+    if len(winners) == 1 or tie_break_costs is None:
+        return winners[0]
+    # The same tie-break `select` uses, for the same reason: among candidates
+    # the model cannot separate, PostgreSQL's own estimate is better than
+    # whichever happened to be enumerated first.
+    return min(winners, key=lambda i: tie_break_costs[i])

@@ -248,8 +248,14 @@ What is left is arithmetic, and it is slow rather than hard:
    is twenty minutes each, so budget two to three hours);
 2. re-train and compare against the 99.2% recorded above, which is a figure
    against the *old* ceiling;
-3. run `app.autotune`, which sweeps `scan_method` as a fourth optional family
-   now, to settle whether it earns its planning cost per database;
+3. ~~run `app.autotune`, which sweeps `scan_method` as a fourth optional family
+   now, to settle whether it earns its planning cost per database~~ — **done,
+   2.67**. On the synthetic workload `scan_method` costs 0.50 points and
+   `resource` and `join_method` change the served total by 0.0 ms; on JOB all 32
+   configurations land within 0.01 points of each other, so it cannot separate
+   them at all. The defaults stay off, now for a measured reason rather than an
+   inherited one. Re-run it after step 1, since these are replays over the log
+   and step 1 changes the log;
 4. do the same on the synthetic workload and re-run the headline benchmark --
    `17c` measured 80 candidates at 352 ms of planning, 1.63% of its runtime, but
    the synthetic queries are milliseconds and the ratio there is unmeasured.

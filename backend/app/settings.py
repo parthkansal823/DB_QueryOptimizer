@@ -31,6 +31,8 @@ import json
 import os
 import threading
 
+from app.optimizer.learned import RANKER_POLICIES
+
 SETTINGS_PATH = "models/settings.json"
 
 # Each field declares enough for the UI to render and validate it without
@@ -38,7 +40,7 @@ SETTINGS_PATH = "models/settings.json"
 FIELDS: dict[str, dict] = {
     "selection_policy": {
         "type": "enum",
-        "options": ["greedy", "thompson", "risk_averse", "pairwise_rank"],
+        "options": ["greedy", "thompson", "risk_averse", *RANKER_POLICIES],
         "label": "Selection policy",
         "group": "Model",
         "help": (

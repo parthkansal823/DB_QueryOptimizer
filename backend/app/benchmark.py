@@ -24,7 +24,11 @@ from app.logging_store import log_execution
 from app.optimizer.bandit import POLICIES
 from app.optimizer.hints import apply_hint, plan_fingerprint
 from app.optimizer.planner import candidate_hints
-from app.optimizer.learned import DEFAULT_SELECTION_POLICY, LearnedOptimizer
+from app.optimizer.learned import (
+    DEFAULT_SELECTION_POLICY,
+    RANKER_POLICIES,
+    LearnedOptimizer,
+)
 from app.optimizer.regression_guard import RegressionGuard
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
@@ -65,6 +69,7 @@ def run(
     limit: int | None = None,
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
     gate: dict | None = None,
+    paired_reps: int = 1,
 ) -> dict:
     """Run the workload and return the run's metrics.
 
@@ -184,28 +189,53 @@ def run(
                     is_chosen=(i == chosen_index and not kept_native),
                 )
 
-            native_total += baseline["actual_total_time_ms"]
-            served_total += served_plan["actual_total_time_ms"]
+            native_ms = baseline["actual_total_time_ms"]
+            served_ms = served_plan["actual_total_time_ms"]
             # The best any selector could have done -- the ceiling this run
             # was measured against (see docs/WRITEUP.md on why the oracle
             # matters for reading these numbers).
-            best = min(
-                [baseline["actual_total_time_ms"]]
-                + [c["actual_total_time_ms"] for c in candidates]
+            best_plan = min(
+                [baseline] + candidates, key=lambda p: p["actual_total_time_ms"]
             )
+            best = best_plan["actual_total_time_ms"]
+
+            if paired_reps > 1:
+                # Re-measure the three numbers this run reports, alternating
+                # them so 2.32's between-run drift lands on all three equally,
+                # and take medians.
+                #
+                # The enumeration pass above times every candidate once, which
+                # is enough to *choose* and not enough to *report*: 2.18 measured
+                # the same plan varying 18.6% between executions, and 2.68 found
+                # a single deploy pass overstating a regression threefold
+                # (1.273x falling to 1.095x under seven repetitions).
+                #
+                # The oracle is re-measured too, and for a subtler reason: it is
+                # a `min` over noisy draws, so it is biased low even when every
+                # individual timing is unbiased. That inflates the headroom
+                # denominator and deflates every capture figure computed from
+                # it.
+                native_ms, served_ms, best = _paired_medians(
+                    cur, sql,
+                    {"native": baseline, "served": served_plan, "oracle": best_plan},
+                    paired_reps,
+                )
+
+            native_total += native_ms
+            served_total += served_ms
             oracle_total += best
 
             if query_id in held_out:
                 n_held_out += 1
-                held_native += baseline["actual_total_time_ms"]
-                held_served += served_plan["actual_total_time_ms"]
+                held_native += native_ms
+                held_served += served_ms
                 held_oracle += best
 
             # The curated half, reported separately -- see `_CURATED_NOTE`.
             if not query_id.startswith("gen_"):
                 n_curated += 1
-                cur_native += baseline["actual_total_time_ms"]
-                cur_served += served_plan["actual_total_time_ms"]
+                cur_native += native_ms
+                cur_served += served_ms
                 cur_oracle += best
 
             say(f"--- {query_id} ({len(candidates)} candidates) ---")
@@ -344,6 +374,45 @@ def run(
 # `deploy` leaves the guard on and does one pass. Its number is a point on a
 # trend, and it must never be compared against a `compare` number -- different
 # question, different system.
+def _paired_medians(cur, sql: str, plans: dict[str, dict], reps: int) -> tuple:
+    """
+    Re-time native, served and oracle **alternately**, and return their medians.
+
+    Alternating is the whole design. 2.32 measured two independent three-run
+    benchmarks of an identical configuration landing 8 points apart, which is
+    drift on a timescale longer than one query -- a checkpoint, an autovacuum,
+    another process on the machine. Timing all the natives and then all the
+    served plans lets that drift land on one arm; interleaving them makes it
+    common-mode, and a ratio of two numbers that drifted together is unharmed.
+
+    Medians, not means, for 2.3's reason: latency has a heavy right tail and the
+    mean chases it.
+
+    A plan that fails to re-execute keeps its original timing rather than
+    dropping out, because a missing arm would silently turn a paired comparison
+    back into an unpaired one.
+    """
+    import statistics as _stats
+
+    samples: dict[str, list[float]] = {k: [] for k in plans}
+    for _ in range(reps):
+        for name, plan in plans.items():
+            hint = plan.get("hint")
+            cur.execute("SAVEPOINT paired")
+            try:
+                got = get_plan(cur, apply_hint(sql, hint) if hint else sql)
+                cur.execute("RELEASE SAVEPOINT paired")
+                samples[name].append(got["actual_total_time_ms"])
+            except Exception:  # noqa: BLE001
+                cur.execute("ROLLBACK TO SAVEPOINT paired")
+
+    return tuple(
+        _stats.median(samples[name]) if samples[name]
+        else plans[name]["actual_total_time_ms"]
+        for name in ("native", "served", "oracle")
+    )
+
+
 PROTOCOLS = {
     "compare": {
         "use_guard": False,
@@ -373,6 +442,32 @@ PROTOCOLS = {
         "note": (
             "guard on, one pass: a point on a trend, not comparable with a "
             "`compare` number"
+        ),
+    },
+    "paired": {
+        # The instrument, rather than the configuration, is what this protocol
+        # improves. `compare` attacks noise by running the whole workload five
+        # times, which is expensive and still leaves 2.32's between-run drift
+        # inside the estimate. This re-times the three numbers each query
+        # actually reports -- native, served, oracle -- alternately, so drift is
+        # common-mode and cancels in every ratio computed from them.
+        #
+        # 2.68 is the case for it. A single deploy pass reported a query
+        # regressing to 1.273x native; seven alternated repetitions put it at
+        # 1.095x, and the group's captured figure moved from -18.7% to about
+        # -5.7%. The conclusion survived and its magnitude did not.
+        #
+        # Costs three extra executions per repetition per query rather than a
+        # whole extra workload pass, so five paired reps are cheaper than two
+        # `compare` runs on any workload with more than three candidates a
+        # query -- which is all of them.
+        "use_guard": True,
+        "default_repeat": 1,
+        "default_paired_reps": 5,
+        "question": "how big is the effect, not just its sign?",
+        "note": (
+            "guard on, and native/served/oracle re-timed alternately so "
+            "between-run drift cancels instead of accumulating"
         ),
     },
 }
@@ -446,7 +541,7 @@ if __name__ == "__main__":
     # number measured a policy nobody uses -- and the two differ in sign on
     # held-out queries (2.43).
     parser.add_argument(
-        "--policy", choices=list(POLICIES) + ["pairwise_rank"],
+        "--policy", choices=list(POLICIES) + list(RANKER_POLICIES),
         default=DEFAULT_SELECTION_POLICY,
     )
     parser.add_argument("--risk-lambda", type=float, default=1.0)
@@ -458,6 +553,15 @@ if __name__ == "__main__":
             "'compare' to evaluate a configuration (guard off, repeated); "
             "'deploy' to report what the running system delivers (guard on, one pass)"
         ),
+    )
+    parser.add_argument(
+        "--paired-reps",
+        type=int,
+        default=None,
+        help="re-time native/served/oracle this many times, alternately, and "
+             "use the medians; defaults to the protocol's own (paired: 5, "
+             "otherwise 1). Attacks measurement noise where it lands rather "
+             "than by repeating the whole workload",
     )
     parser.add_argument(
         "--repeat",
@@ -480,6 +584,10 @@ if __name__ == "__main__":
 
     spec = PROTOCOLS[args.protocol]
     repeat = args.repeat if args.repeat is not None else spec["default_repeat"]
+    paired_reps = (
+        args.paired_reps if args.paired_reps is not None
+        else spec.get("default_paired_reps", 1)
+    )
     use_guard = spec["use_guard"] and not args.no_guard
 
     results = []
@@ -492,6 +600,7 @@ if __name__ == "__main__":
                 risk_lambda=args.risk_lambda,
                 use_guard=use_guard,
                 statement_timeout_ms=args.timeout_ms,
+                paired_reps=paired_reps,
                 quiet=repeat > 1,
             )
         )

@@ -75,7 +75,9 @@ import os
 from app.optimizer.regression_guard import UNSEEN_QUERY_CAUTION
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
-from app.optimizer.learned import DEFAULT_SELECTION_POLICY
+from app.optimizer.ranker import borda_select
+from app.optimizer.bandit import POLICIES
+from app.optimizer.learned import DEFAULT_SELECTION_POLICY, RANKER_POLICIES
 from app.retrain import served_policy
 from app.train import _aggregate_repetitions, _load_rows, _row_to_candidate
 
@@ -327,7 +329,7 @@ def evaluate_setting(
         # A bundle from before the gate existed cannot be scored under it.
         # Returning fixed_z numbers labelled "conformal" would be worse.
         raise ValueError("this bundle has no fitted conformal gate to score")
-    if policy == "pairwise_rank" and bundle.get("ranker") is None:
+    if policy in RANKER_POLICIES and bundle.get("ranker") is None:
         # The loop below used to `continue` past every query in this case, which
         # returns `n_queries=0` with a 0% deviation rate, a 0% regression rate
         # and a 1.00x worst case -- a flawless gate, computed from nothing. That
@@ -384,12 +386,21 @@ def evaluate_setting(
         # one of bandit.POLICIES. The confidence gate still reads the
         # ensemble's prediction for whichever candidate was put forward --
         # selection and authorisation are separate steps (see learned.py).
-        if policy == "pairwise_rank":
+        if policy in RANKER_POLICIES:
             ranker = bundle.get("ranker")
             if ranker is None:
                 continue
             costs = [c["total_cost"] or float("inf") for c in candidates]
-            best_i = ranker.select(vectors, tie_break_costs=costs)
+            if policy == "borda":
+                # The same aggregation `learned.select` runs, over the same two
+                # inputs. A replay that scored `borda` as the ranker alone would
+                # be 2.43 again: a gate calibrated against a policy the server
+                # does not use.
+                best_i = borda_select(
+                    means, ranker.scores(vectors), tie_break_costs=costs
+                )
+            else:
+                best_i = ranker.select(vectors, tie_break_costs=costs)
         else:
             # Seeded, because `thompson` samples an ensemble member and an
             # unseeded replay is one draw dressed up as a measurement. Measured
@@ -953,7 +964,7 @@ if __name__ == "__main__":
         # calibrated for a selection process nobody runs -- and the two
         # policies do not merely differ, they differ in sign (2.43).
         "--policy", default=served_policy(),
-        choices=["greedy", "thompson", "risk_averse", "pairwise_rank"],
+        choices=list(POLICIES) + list(RANKER_POLICIES),
         help="selection policy to sweep the gate under (default: the served one)",
     )
     parser.add_argument("--max-regression-rate", type=float, default=0.25)

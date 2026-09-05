@@ -43,7 +43,8 @@ from app.db import get_cursor
 from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
-from app.optimizer.learned import DEFAULT_SELECTION_POLICY
+from app.optimizer.learned import DEFAULT_SELECTION_POLICY, RANKER_POLICIES
+from app.optimizer.ranker import borda_select
 from app.train import _load_rows, _row_to_candidate, train
 
 # Enough new executions to be worth the retrain cost. Retraining on a
@@ -204,14 +205,24 @@ def _score_bundle(
         latencies = [c["actual_total_time_ms"] for c in candidates]
         vectors = [to_vector(featurize(c, cardinalities), feature_columns) for c in candidates]
         try:
-            # `pairwise_rank` lives on the ranker, not the ensemble, so it is not
-            # one of `bandit.POLICIES` -- the same split `calibrate.py` handles.
-            if policy == "pairwise_rank":
+            # `pairwise_rank` and `borda` live on the ranker, not the ensemble,
+            # so they are not in `bandit.POLICIES` -- the same split
+            # `calibrate.py` handles. Scoring a challenger under a policy the
+            # server does not run is 2.43, and this is the yardstick that
+            # decides promotions.
+            if policy in RANKER_POLICIES:
                 ranker = bundle.get("ranker")
                 if ranker is None:
                     return None
                 costs = [c["total_cost"] or float("inf") for c in candidates]
-                index = ranker.select(vectors, tie_break_costs=costs)
+                scores = ranker.scores(vectors)
+                if policy == "borda":
+                    means, _ = bundle["model"].predict_mean_std(vectors)
+                    index = borda_select(means, scores, tie_break_costs=costs)
+                else:
+                    index = ranker.select(
+                        vectors, tie_break_costs=costs, scores=scores
+                    )
             else:
                 index, _ = select_index(model, vectors, policy=policy)
         except Exception:  # noqa: BLE001 - a stale bundle shouldn't block a retrain
@@ -333,7 +344,17 @@ def retrain_if_needed(
     min_new_rows: int = DEFAULT_MIN_NEW_ROWS,
     min_improvement: float = DEFAULT_MIN_IMPROVEMENT,
     force: bool = False,
+    drop_constant_features: bool = False,
 ) -> dict:
+    """Train a challenger and let the held-out comparison decide.
+
+    `drop_constant_features` builds the challenger without the features that
+    take one value across a query's own candidates (2.69). Measured over 16
+    paired splits that is worth a mean +8.3 points of held-out capture,
+    signed-rank p = 0.026 -- which is evidence, not a promotion. The comparison
+    below is what promotes, and 2.63 is why: a challenger with a better mean and
+    a worse worst case was rejected, correctly.
+    """
     new_rows = rows_since_last_training()
     if not force and new_rows < min_new_rows:
         return {
@@ -348,7 +369,11 @@ def retrain_if_needed(
     # Train the challenger. `train()` writes to a scratch path -- promotion
     # is this module's decision, not train()'s.
     challenger_path = "models/_challenger.pkl"
-    metrics = train(model_path=challenger_path, eval_path="models/_challenger_eval.json")
+    metrics = train(
+        model_path=challenger_path,
+        eval_path="models/_challenger_eval.json",
+        drop_constant_features=drop_constant_features,
+    )
     challenger = _load_challenger_bundle(challenger_path)
 
     version_id = model_store.save_version(challenger, metrics)
@@ -467,6 +492,12 @@ if __name__ == "__main__":
     parser.add_argument("--rollback", action="store_true", help="promote the previous version")
     parser.add_argument("--min-new-rows", type=int, default=DEFAULT_MIN_NEW_ROWS)
     parser.add_argument("--min-improvement", type=float, default=DEFAULT_MIN_IMPROVEMENT)
+    parser.add_argument(
+        "--drop-constant-features",
+        action="store_true",
+        help="build the challenger without features that cannot separate a "
+             "query's candidates (2.69)",
+    )
     args = parser.parse_args()
 
     if args.status:
@@ -481,6 +512,7 @@ if __name__ == "__main__":
                     min_new_rows=args.min_new_rows,
                     min_improvement=args.min_improvement,
                     force=args.force,
+                    drop_constant_features=args.drop_constant_features,
                 ),
                 indent=2,
                 default=str,

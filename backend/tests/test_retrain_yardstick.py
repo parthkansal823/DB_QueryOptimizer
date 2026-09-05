@@ -155,7 +155,15 @@ def _cand(hint, latency, disabled=False, baseline=False):
 
 
 class _PickFirst:
-    def select(self, vectors, tie_break_costs=None):
+    """Mirrors `PairwisePlanRanker`'s signature, `scores=` included.
+
+    It did not, and `_score_bundle` passing the pre-computed scores through --
+    which the real ranker has accepted since the O(n^2) sweep was deduplicated
+    -- made every call raise `TypeError` inside a `try` and return `None`. A
+    stub narrower than the thing it stands for turns an interface change into
+    four assertions about `None`."""
+
+    def select(self, vectors, tie_break_costs=None, scores=None):
         return 0
 
     def scores(self, vectors):

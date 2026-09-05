@@ -25,13 +25,14 @@ import threading
 import time
 
 from app.experiment import Arm, compare
+from app.optimizer.learned import RANKER_POLICIES
 
 IDLE, RUNNING, DONE, FAILED = "idle", "running", "done", "failed"
 
 # What a comparison may be asked to do. Anything else is rejected rather than
 # passed through to `benchmark.run`, which takes arbitrary keyword arguments.
 COMPARISONS = ("guard", "policy")
-POLICIES = ("greedy", "thompson", "risk_averse", "pairwise_rank")
+POLICIES = ("greedy", "thompson", "risk_averse") + RANKER_POLICIES
 
 # A paired run is two full benchmark sweeps. Twenty of them is already an hour
 # or more, and an unbounded request would hold the slot indefinitely.
