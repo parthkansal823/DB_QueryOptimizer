@@ -11,8 +11,9 @@ It runs on any PostgreSQL database, ships with a dashboard that explains every
 decision it makes, and refuses to act when it isn't confident. Built end to end:
 data collection, feature engineering, model training, a self-retraining loop
 with rollback, two independent safety mechanisms, a conformally calibrated
-safety gate, and **1,239 tests** behind CI (1,107 backend, of which 17 run against a live PostgreSQL with
-`pg_hint_plan` actually loaded, plus 132 frontend).
+safety gate, and **1,361 tests** behind CI (1,219 backend, of which 18 run
+against a live PostgreSQL with `pg_hint_plan` actually loaded, plus 142
+frontend).
 
 ## Documentation
 
@@ -45,9 +46,12 @@ plan-picker could possibly do.
 
 | | v1 synthetic | TPC-H | JOB/IMDB |
 |---|---|---|---|
-| Mean best-possible gain | **6.5%** | ~23% | **~75%** |
-| Queries with >5% available | 7 / 25 | — | 3 / 4 |
-| Best model's top-1 accuracy | **0%** | — | 25% |
+| Mean best-possible gain | **6.5%** | ~23% | **~82%** |
+| Queries with >5% available | 7 / 25 | — | 5 / 8 |
+| Best model's top-1 accuracy | **0%** | — | **38%** |
+
+The JOB column is the 2026-09-05 re-run (8 held-out queries, `docs/JOB_RESULTS.md`);
+it read 25% top-1 on the original 8-query collection.
 
 On v1, PostgreSQL was already optimal for 18 of 25 queries, and **none of six
 model types** (LightGBM, random forest, extra trees, gradient boosting, ridge,
@@ -114,12 +118,9 @@ The same command was checked on two unrelated databases:
 
 **Read that second row narrowly.** It says the generator produced a workload on
 a 21-table schema with no declared foreign keys, and that one policy did well on
-*those* queries — native averages 210.9 ms on them. It does **not** say this
-system is good at JOB. Run against the real Join Order Benchmark queries, where
-native averages 3703 ms and the best available plan averages 919 ms, it captures
-**none** of that 75% gap: every selector returns the native plan
-(`docs/JOB_RESULTS.md`). Two numbers, two workloads, and the harder one is the
-one that matters — see `docs/WRITEUP.md` §4 and `docs/ROADMAP.md` item 1.
+*those* queries — native averages 210.9 ms on them. That is not the Join Order
+Benchmark; it is a workload this system wrote for itself on the same tables. For
+the real JOB queries, see the next section.
 
 The generated workload is written to `models/workload_<db>.json`, so you can
 read it, edit it, and replay it. Auto-generation is a starting point, not a
@@ -507,15 +508,67 @@ learned-query-optimizer/
 
 ## Does it actually beat Postgres?
 
-**On the synthetic schema, yes.** Every live run beats native PostgreSQL,
-averaging about **26% of the available oracle headroom with no regressions**
-(`docs/WRITEUP.md` §2.2).
+**On the synthetic schema, yes.** The current measurement, three runs under the
+`compare` protocol:
 
-**On the real JOB/IMDB benchmark, no**, and that result is more useful. There,
-75% of the latency is provably available (native 3703 ms against an oracle of
-919 ms on held-out queries) and this system captures none of it, because 194
-executions across 8 queries cannot teach a 17-table join space.
-`docs/JOB_RESULTS.md` measures the gap rather than hiding it.
+| | captured | range |
+|---|---|---|
+| all 59 queries | **41.3%** | 38.9 – 43.0 |
+| **queries the model never trained on** | **45.7%** | 19.3 – 50.4 |
+| hand-written traps and controls only | 33.0% | 20.8 – 34.2 |
+
+The middle row is the one that matters, and it read **0.0%** on every run ever
+measured until 2026-09-04 — eleven runs across three independent sets. Nothing
+in the model, the features or the action space changed to move it; twelve
+corrections to the measurement and configuration did, and `docs/WRITEUP.md`
+§2.42–2.54 works through each. The third row is lower because 27 of the 59
+queries were generated and *kept* for having headroom, so the headline is partly
+measured on a benchmark selected to be winnable — the gap between rows one and
+three is the size of that effect.
+
+The ranges are wide. The benchmark prints its own resolution floor and it reads
+"a difference smaller than 4.2 points is inside this sample's own spread", so
+the honest claim is "clearly not zero and around a third to a half", not
+"45.7%".
+
+**On the real JOB/IMDB benchmark, now yes — and the shape of the win matters
+more than the number.** This said "no" for most of the project's life: 75% of
+the latency provably available (native 3703 ms against an oracle of 919 ms) and
+**none of it captured**, because 194 executions across 8 queries could not teach
+a 17-table join space.
+
+Re-run on PostgreSQL 18 with **1614 executions across all 30** of the smallest
+queries and **8 held out**, on held-out queries averaging **3960 ms** native —
+the same expensive regime as the original:
+
+| selector | avg latency | headroom captured |
+|---|---|---|
+| native PostgreSQL | 3960.2 ms | — |
+| cost heuristic | 2285.3 ms | +42% |
+| oracle (best candidate) | 695.6 ms | 100% |
+| **`risk_averse`** | **713.7 ms** | **+99.4%** |
+| `pairwise_rank` | 722.8 ms | +99.2% |
+| `greedy` | 726.9 ms | +99.0% |
+| `thompson` | 863.9 ms | +94.8% |
+
+All four policies clear 94%, and the top three sit within 0.4 points of each
+other — which matters more than which one leads. One policy at 99% invites the
+question of whether it got lucky; four independent selection rules landing
+within half a point of the oracle is a property of the candidate set and the
+model, not of the rule reading them.
+
+**Read the breakdown, not just the total.** On three of the eight held-out
+queries it picks the **oracle plan exactly** — `17c` goes from **21.6 seconds to
+2.0**, an 11x speedup, and is 76% of all the saving; a fourth (`1b`) lands within
+0.1 ms of it. The other four *regress*, totalling −208 ms against 26,099 ms
+saved, and three of those had almost nothing to win (2.7 ms, 14.4 ms, and one
+where no candidate beats native at all).
+
+So: half the held-out queries get slightly worse, two very expensive ones carry
+the aggregate, and the trade is 26 seconds saved for 0.2 lost. Those are also
+*ungated* numbers — the confidence gate exists for exactly the near-tie queries
+that regress here and would decline most of them.
+`docs/JOB_RESULTS.md` has the per-query table and the caveats.
 
 **It no longer loses to native.** The original design forced the optimizer to
 deviate on *every* query. The native plan was never something the model could

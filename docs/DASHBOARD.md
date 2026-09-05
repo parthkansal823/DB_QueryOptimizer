@@ -27,6 +27,25 @@ whole**, and they are there from the moment you open the page.
 | Do PostgreSQL's estimates match reality? | Database | Is there anything here to learn? |
 | Day by day | System | Longer-term trend (only shows after day two) |
 | What we found in your database | Database | What does it know about my schema? |
+| Settings | System | What is it configured to do, and what is actually in force? |
+
+### A control can show one value while another is applied
+
+Two of the settings are not what the optimizer uses. `confidence_z` and
+`min_relative_gain` are declared with defaults of 1.0 and 0.05, and the
+optimizer overrides both with the measured gate in `models/gate.json` unless
+somebody explicitly chooses them &mdash; deferring to a measurement over a default
+is the point of calibrating one.
+
+The panel used to show the default and say nothing, so it read **z = 1.0** while
+the gate in force was **1.5** (`WRITEUP.md` 2.54). Any control whose value has
+been superseded now carries a line under it:
+
+> **In force: 0.02** &mdash; the measured gate in `models/gate.json` is being applied
+> instead of this value. Changing this setting overrides the calibration.
+
+Editing the control is still how you override the calibration; the note exists
+so you know that is what you are doing.
 
 ---
 
@@ -147,8 +166,12 @@ this dashboard:
 | `gate_calibrated_on_too_few_queries` | The threshold was chosen on a handful of queries, so its reported regression rate moves in steps of 1/n and is fitted to whichever queries happened to be held out. |
 | `uncertainty_understated` | The eight models disagree by less than the model's actual error, by the factor shown. `docs/CONFIDENCE.md` §3 explains why no arrangement of the ensemble fixes that. |
 | `error_comparable_to_headroom` | Predictions are typically off by about as much as the speedups worth chasing. More distinct queries is the lever, not a different model. |
-| `gate_promise_not_met` | The calibration promised a regression rate and the system is exceeding it. Either the workload has moved or the gate was chosen on too few queries. |
+| `gate_promise_not_met` | The calibration promised a regression rate and the system is exceeding it. Either the workload has moved or the gate was chosen on too few queries. Scoped to runs served *since this gate was applied* — before that it inherited the previous gate's verdict and reported a freshly-calibrated gate as already broken (2.49). |
 | `optimizer_never_deviates` | Nothing has deviated recently, so the optimizer is currently a no-op. |
+| `gate_calibrated_for_another_policy` | The gate's thresholds were swept under one selection policy and the server selects with another. Not a rounding difference: on 15 held-out queries `greedy` landed at 104.1% of native and `pairwise_rank` at 95.1% (`WRITEUP.md` 2.43). Re-run `app.autotune --apply`. |
+| `gate_calibrated_for_another_action_space` | Same idea, for the hint families on offer. The action space decides what there is to select from, so a threshold measured against a different one is measuring a different system. |
+| `gate_does_not_record_its_policy` | The gate file predates `calibrated_with_policy`, so the two cannot be compared at all. "Cannot tell" rather than "they disagree". |
+| `no_usable_coverage_bound` | A conformal bound at this risk level would need so many sigma that `GATE_MODE=conformal` would decline almost every query. Correct, and not currently actionable. |
 
 "No problems found" is a result, not an empty panel.
 

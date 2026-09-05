@@ -188,42 +188,47 @@ finally agree, having disagreed by 5.4 points until the safety veto was
 modelled.
 
 
-### 1. Reload JOB into PostgreSQL 18 and re-run it
+### 1. Reload JOB into PostgreSQL 18 and re-run it &mdash; **done, 2026-09-05**
 
-`docs/JOB_RESULTS.md` records this system capturing **none** of a 75% oracle gap
-on the real 21-table IMDB benchmark (native 3703 ms against an oracle of 919 ms
-on held-out queries). **Everything built since then** — shape coverage (2.35),
-the workload at 59 queries, the worst-case promotion metric (2.31), the PG18
-features — was built after that result and has never been tested against it.
+`docs/JOB_RESULTS.md` recorded this system capturing **none** of a 75% oracle
+gap on the real 21-table IMDB benchmark (native 3703 ms against an oracle of
+919 ms on held-out queries). Everything built since &mdash; shape coverage (2.35),
+the 59-query workload, the worst-case promotion metric (2.31), the PG18
+features, the corrections in 2.42-2.54 &mdash; had never been tested against it.
 
-It is the only test of whether any of it generalises past a six-table toy
-schema, and the answer is currently unknown rather than good.
+**Reloaded**: 8.7 GB, 73.0M rows, 22 tables, via `bash data/job/load_job.sh`.
+`app.collect_data_job` runs from the host now (`--query-dir`) rather than only
+from inside the backend container.
 
-**Reloaded 2026-09-04**: 8.7 GB, 73.0M rows, 22 tables, via
-`bash data/job/load_job.sh`. `app.collect_data_job` runs from the host now
-(`--query-dir`, defaulting to the repo copy when the container mount is absent)
-rather than only from inside the backend container.
+**Re-run**: all 30 of the smallest queries, 1614 raw rows against the original's
+194, **8 held out** against its 2. The held-out queries average **3960 ms**
+native against the original's 3703 ms &mdash; the same expensive-query regime,
+which is what makes it a comparison rather than a different measurement.
 
-The original result rested on **8 queries with 2 held out**, which its own text
-called "nowhere near enough to claim the model learned anything". The re-run
-collects 30.
+| selector | avg latency | headroom captured |
+|---|---|---|
+| native | 3960.2 ms | &mdash; |
+| cost heuristic | 2285.3 ms | +42% |
+| oracle | 695.6 ms | 100% |
+| **`risk_averse`** | **713.7 ms** | **+99.4%** |
+| `pairwise_rank` | 722.8 ms | +99.2% |
+| `greedy` | 726.9 ms | +99.0% |
+| `thompson` | 863.9 ms | +94.8% |
 
-**Partial result, 14 of 30 queries collected**: `pairwise_rank` captures
-**+39.3%** of the available headroom on four held-out queries (native 185.3 ms,
-oracle 151.0 ms) — the first non-zero figure this project has recorded on real
-IMDB data. `thompson` loses 19.5%, consistent with 2.5's finding that
-data-starved JOB punishes any policy trusting its own point predictions.
+All four policies clear 94% and the top three sit within 0.4 points, so this is
+a property of the candidate set and the model rather than of one selection rule.
+`risk_averse` leading reproduces 2.5's finding that data-starved JOB rewards
+modelling uncertainty over modelling the target.
 
-**This does not close the item**, and the reason is the point of keeping it
-open. The earlier run's held-out queries averaged **3703 ms** native; these
-average **185 ms**. Both asked for the smallest JOB queries and got different
-ones into the held-out quarter, so the specific claim — 75% available on
-expensive queries, 0% captured — remains untested. The `17*` family times out on
-most of its candidates at 120 s each (`17e` alone took 21 minutes), which is
-correct behaviour and slow to discover.
+On three of the eight it picks the **oracle plan exactly** (within 0.1 ms on a
+fourth) &mdash; `17c` goes from **21.6 s to 2.0**, 76% of all the saving. The other four regress by **-208 ms**
+total against 26,099 ms saved, and three of those had 2.7 ms, 14.4 ms and
+*nothing* available respectively. Ungated numbers: the confidence gate exists
+for exactly those near-ties.
 
-What is left: finish the collection so the held-out quarter contains expensive
-queries, then re-train and compare against the 3703/919 figures directly.
+**What is left**, and it is smaller than what was closed: the benchmark's larger
+queries &mdash; JOB goes to 17 tables &mdash; have never been touched, and eight
+held-out queries is more than two and still few.
 
 ### 2. Fix the ranking on unseen queries
 

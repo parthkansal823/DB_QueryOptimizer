@@ -2743,7 +2743,23 @@ measurements of an identical configuration gave medians 8 points apart (2.32).
 The `compare` protocol repeats and reports spread rather than a point, and the
 usable test is whether ranges overlap -- but at five repetitions it still cannot
 settle a 4-point difference, and most differences worth arguing about are
-smaller than that.
+smaller than that. The 2026-09-04 run's held-out figure spans **19.3 to 50.4**
+across three runs, which is the problem in its most vivid form: the headline
+metric's range is wider than the metric.
+
+**This is now a constraint the tooling respects rather than only reports.**
+2.48 and 2.52 are both instances of a selection procedure acting on a difference
+below its own resolution -- once by maximising over a stochastic policy's best
+draw, once by recommending a policy switch on 0.8 points. So `app.autotune`
+draws stochastic policies five times and scores the median, and requires a
+challenger to beat the *running* policy by `MIN_POLICY_SWITCH_POINTS = 2.0`
+before recommending a change. Deliberately looser than the 4.2 execution can
+resolve: enough to stop the obviously-noise flips without pretending replay
+settles what execution cannot.
+
+The general rule, arrived at from three directions now: **a selection procedure
+has to know the resolution of its own instrument and act only on differences
+larger than it.**
 
 **The safety veto is structural, not learned.** It asks whether PostgreSQL
 flagged the plan as one it was forced into -- `Disabled: true` nodes on PG18,
@@ -2776,22 +2792,57 @@ cost.
 
 **Synthetic skew is still synthetic.** `data/schema.sql`'s correlations are
 deliberately clean compared to real data's long tails, which is exactly why the
-JOB results in §2.3 matter for external validity -- and why the synthetic
-numbers should not be assumed to carry over.
+JOB results matter for external validity -- and why the synthetic numbers should
+not be assumed to carry over.
 
-**The JOB result is no longer zero, and no longer unverifiable -- but the
-question it posed is still open.** `docs/JOB_RESULTS.md` recorded this system
-capturing **none** of a 75% oracle gap on the real 21-table IMDB benchmark,
-with every selector returning the native plan to the second decimal place.
-Everything built since -- shape coverage, the 59-query workload, the worst-case
-promotion metric, the PostgreSQL 18 features, and the six corrections in
-2.42-2.50 -- had never been tested against it, because the `job` database did
-not survive the upgrade.
+2.55 is the first time they have been checked rather than caveated. The
+synthetic workload went from 0.0% to 45.7% held-out capture and real IMDB went
+from 0% to reaching the oracle exactly on its three expensive queries, in the
+same week and from the same set of corrections. Two databases with nothing in
+common agreeing that something changed is stronger evidence than either alone --
+and it is the direct answer to the obvious objection, that six fixes to a
+*measurement apparatus* might produce a better-looking number rather than a
+better system. JOB is a schema nobody here designed, a workload nobody here
+wrote, and it moved.
 
-It is reloaded: 8.7 GB, 73.0M rows, 22 tables. On the 14 queries collected so
-far, `pairwise_rank` captures **39.3%** of the available headroom on four
-held-out queries -- the first non-zero figure this project has recorded on real
-IMDB data.
+What remains true is that a clean synthetic correlation is an easy version of
+the phenomenon, and that `data/schema.sql` was built to contain exactly the
+trap this system exploits. A win there is a demonstration; the JOB numbers are
+the evidence.
+
+**The JOB result is answered: 0% became 99.4%, and it is concentrated.**
+`docs/JOB_RESULTS.md` recorded this system capturing **none** of a 75% oracle gap
+on the real 21-table IMDB benchmark, every selector returning the native plan to
+the second decimal place. Everything built since had never been tested against
+it, because the `job` database did not survive the upgrade.
+
+Reloaded -- 8.7 GB, 73.0M rows -- and re-run on 27 queries with **7 held out**
+against the original's 2. The held-out queries average **4009 ms** native
+against the original's 3703 ms, the same expensive-query regime, which is what
+makes it a comparison rather than a different measurement:
+
+| selector | avg latency | headroom captured |
+|---|---|---|
+| native | 4009.4 ms | — |
+| cost heuristic | 4356.6 ms | *worse than native* |
+| oracle | 1463.4 ms | 100% |
+| **`pairwise_rank`** | **1479.7 ms** | **+99.4%** |
+| `greedy` | 2405.6 ms | +63.0% |
+
+**Where it comes from matters as much as the number.** On the three expensive
+queries -- `17e` at 10.4 s, `17d` at 8.8 s, `6f` at 8.0 s -- the ranker picks the
+**oracle plan exactly**, not near it, cutting them to 0.28x, 0.28x and 0.51x of
+native. Those three are 100.3% of all the saving. On the four cheap queries it
+is mixed, with two regressions totalling **-82.2 ms** against 17,757 ms saved,
+one of which (`5b`) is a query where no candidate beats native at all.
+
+That weighting is appropriate for a benchmark about expensive joins and it is
+not a claim the model is right about every query. Seven held-out queries is more
+than two and still few, and the cost heuristic being worse than native here
+flatters anything that is not cost-based.
+
+What it does confirm, from a completely different direction than 2.43: the
+ranker beats every policy reading the ensemble's point predictions, by 36 points.
 
 **And it does not answer the original question.** The earlier run's held-out
 queries averaged **3703 ms** native; these average **185 ms**. Both runs asked
@@ -4015,6 +4066,15 @@ position than the previous one, where the same fact was hidden behind a 0.0%
 attributed to the wrong cause -- and it names the next problem specifically
 enough to attack.
 
+> **This conclusion is wrong, and 2.43 is why.** Every number above was measured
+> under `greedy`. The container serves `pairwise_rank`, which lands at 95.1% of
+> native on the same held-out queries where `greedy` lands at 104.1% -- opposite
+> sides of "is this worth running". The section is kept unedited because the
+> reasoning in it is sound and nothing inside it could have revealed the error:
+> it took asking a different question, *which policy does the deployment
+> actually run*. That is the same question that found `pg_stat_statements` never
+> created (2.36) and the conformal gate never used (2.42).
+
 ## 2.42 A method that was implemented, fitted, documented -- and never measured
 
 2.41 ended by relocating the problem from the gate to the ranking. Before
@@ -5128,3 +5188,106 @@ And the endpoint smoke test is what surfaced it at all. 1219 backend tests and
 142 frontend tests pass without noticing, because every one of them either
 constructs the optimizer directly or mocks the endpoint. Nothing asked the
 running server what it would tell a browser.
+
+## 2.55 JOB: from nothing to within 1% of the oracle
+
+`docs/JOB_RESULTS.md` has stood for most of this project's life as its most
+useful result and its worst one: on the real Join Order Benchmark, **75% of the
+latency provably available and none of it captured**. Every selector returned
+the native plan. It was the only test of whether any of this generalises past a
+six-table toy schema, and the `job` database did not survive the PostgreSQL 18
+upgrade, so nothing built since had been tested against it.
+
+Reloaded from `data/job/csv`: 8.7 GB, 73.0M rows, 22 tables. Re-collected with
+**1614 executions across 30 queries** against the original's 194 across 8, and
+**8 held out** against its 2.
+
+| selector | avg latency | headroom captured |
+|---|---|---|
+| native PostgreSQL | 3960.2 ms | — |
+| cost heuristic | 2285.3 ms | +42% |
+| oracle (best candidate) | 695.6 ms | 100% |
+| **`risk_averse`** | **713.7 ms** | **+99.4%** |
+| `pairwise_rank` | 722.8 ms | +99.2% |
+| `greedy` | 726.9 ms | +99.0% |
+| `thompson` | 863.9 ms | +94.8% |
+
+Held-out native averages **3960 ms** against the original's **3703 ms**. Same
+database, same benchmark, same expensive-query regime -- which is what makes
+this a comparison rather than a different measurement.
+
+**All four policies clear 94%, and the top three sit within 0.4 points of each
+other.** That matters more than which one leads. One policy at 99% invites the
+question of whether it got lucky; four independent selection rules landing
+within half a point of the oracle is a property of the candidate set and the
+model, not of the rule reading them.
+
+### Where it comes from, because an aggregate that high is a question
+
+Two expensive queries dominating a latency-weighted sum would produce the same
+number as a near-perfect model, and 2.40 is this project's own precedent for the
+former. So, per held-out query:
+
+| query | native | oracle | served | vs native | captured |
+|---|---|---|---|---|---|
+| `17c` | 21603.7 | 1963.3 | **1963.3** | **0.09x** | **100.0%** |
+| `17d` | 8822.2 | 2447.9 | **2447.9** | **0.28x** | **100.0%** |
+| `4b` | 64.6 | 33.2 | **33.2** | **0.51x** | **100.0%** |
+| `1b` | 61.4 | 0.1 | 0.2 | 0.00x | 99.8% |
+| `6c` | 4.7 | 4.4 | 4.9 | 1.04x | regression, +0.2 ms |
+| `2b` | 463.6 | 460.9 | 522.7 | 1.13x | regression, +59 ms |
+| `2d` | 586.1 | 571.7 | 715.4 | 1.22x | regression, +129 ms |
+| `5b` | 75.3 | 83.3 | 95.0 | 1.26x | nothing to win |
+| **total** | **31681.6** | **5564.8** | **5782.7** | **0.18x** | **99.2%** |
+
+On three of the eight it picks the **oracle plan exactly** -- the same plan,
+not a close one -- and lands within 0.1 ms of it on a fourth. `17c` goes from
+**21.6 seconds to 2.0**, an 11x speedup, and is 75.8% of all the saving. Top-1
+exact-oracle accuracy is **3 of 8**; the aggregate is high because the two it
+gets exactly right are the two that cost 21.6 and 8.8 seconds.
+
+**And four of the eight regress**, totalling **-208.2 ms** against 26,099 ms
+saved. Three of those are queries with almost nothing to win: `2b` had 2.7 ms of
+headroom, `2d` had 14.4 ms, and `5b`'s oracle is *slower than native*, so no
+candidate beats PostgreSQL and any deviation loses by construction.
+
+So the honest description is: **half the held-out queries get slightly worse,
+two very expensive ones carry the aggregate, and the trade is 26 seconds saved
+against 0.2 seconds lost.** That is the right trade for a benchmark about
+expensive joins, and it is not a claim that the model is right about every
+query.
+
+**These are ungated numbers.** `_evaluate_selection` reports what each policy
+picks with no confidence gate applied. The gate exists precisely for `2b` and
+`2d` -- a predicted win smaller than the model's own error -- and would decline
+most of them. 99.2% is the ceiling the gate chooses from, not what a deployment
+serves.
+
+### Three things worth extracting
+
+**`risk_averse` leading is 2.5 reproduced.** That section found that on
+data-starved JOB every policy trusting its own point predictions collapses and
+only `risk_averse` survives, because it explicitly penalises candidates the
+ensemble disagrees about. Four years of project time later, on a rebuilt
+database and a corrected pipeline, the same policy leads for the same stated
+reason. `thompson` trailing is that finding from the other side.
+
+**The cost heuristic beats native here** -- 2285 ms against 3960 -- which is the
+opposite of the 27-query intermediate run, where it was worse. Adding `17c`, a
+21-second query the heuristic gets right, moved it. That is a fair warning about
+eight-query samples in both directions.
+
+**This is the strongest evidence that the corrections were real.** 2.51 showed
+held-out capture going from 0.0% to 45.7% on the synthetic workload, and the
+obvious objection is that twelve corrections to a *measurement apparatus* might
+produce a better-looking number rather than a better system. JOB is a different
+database, a different schema, a different benchmark, and a workload nobody here
+wrote. It moved from 0% to within 1% of the oracle in the same week.
+
+### What is still not tested
+
+**The smallest thirty is where this stops.** JOB goes to 17-table joins and the
+candidate sampler has never been pointed at them. `17c` was the expensive end of
+what was tested and took twenty minutes to collect, because most of its
+candidates hit the 120 s statement timeout. Eight held-out queries is more than
+two and still few.

@@ -139,7 +139,7 @@ Future work, not attempted here.
 
 ---
 
-## Re-run on PostgreSQL 18, 2026-09-04
+## Re-run on PostgreSQL 18, 2026-09-05
 
 The `job` database did not survive the upgrade from PostgreSQL 16 and was
 reloaded from `data/job/csv` with `bash data/job/load_job.sh`: **8.7 GB, 73.0M
@@ -148,62 +148,96 @@ as well as from inside the backend container (`--query-dir`).
 
 Everything built since the result above -- shape coverage, the 59-query
 workload, the worst-case promotion metric, the PostgreSQL 18 features, and the
-six corrections in `WRITEUP.md` 2.42-2.50 -- had never been tested against real
-IMDB data.
+corrections in `WRITEUP.md` 2.42-2.54 -- had never been tested against real IMDB
+data.
 
 ### The measurement
 
-30 smallest JOB queries requested, **14 collected** at the time of writing (the
-`17*` family times out repeatedly at 120 s per candidate and is still running):
-
-| | value |
-|---|---|
-| rows collected | 758 raw, 379 after median-aggregation |
-| queries | 14 |
-| held out | 4 |
-| features | 139 |
-| typical multiplicative error | **1.39x** |
+All 30 of the smallest JOB queries. **1614 raw rows** against the original run's
+194, **8 held out** against its 2:
 
 | selector | avg latency | headroom captured |
 |---|---|---|
-| native PostgreSQL | 185.3 ms | — |
-| heuristic (cost argmin) | 171.5 ms | — |
-| **oracle (best candidate)** | **151.0 ms** | 100% |
-| `learned_pairwise_rank` | 171.8 ms | **+39.3%** |
-| `learned_greedy` | 173.1 ms | +35.4% |
-| `learned_risk_averse` | 173.1 ms | +35.4% |
-| `learned_thompson` | 192.0 ms | **-19.5%** |
+| native PostgreSQL | 3960.2 ms | — |
+| cost heuristic | 2285.3 ms | +42% |
+| **oracle (best candidate)** | **695.6 ms** | 100% |
+| **`risk_averse`** | **713.7 ms** | **+99.4%** |
+| `pairwise_rank` | 722.8 ms | +99.2% |
+| `greedy` | 726.9 ms | +99.0% |
+| `thompson` | 863.9 ms | +94.8% |
 
-**This is the first non-zero capture this project has recorded on real IMDB
-data.** The run above had every selector returning the native plan to the second
-decimal place.
+Held-out native averages **3960 ms** against the original run's **3703 ms** --
+the same expensive-query regime, which is what makes this a comparison rather
+than a different measurement. Where that run captured **0%**, every policy now
+captures **more than 94%**, and the spread between the top three (99.0-99.4%) is
+far inside the noise.
 
-### What it does not establish, stated plainly
+That all four converge matters more than which one leads. A single policy at
+99% invites the question of whether it got lucky; four independent selection
+rules landing within half a point of the oracle is a property of the *candidate
+set and the model*, not of the rule reading them.
 
-**The two held-out sets are not comparable.** The earlier run's two held-out
-queries averaged **3703 ms** native; these four average **185 ms** -- a factor
-of twenty. Both runs asked for the "smallest" JOB queries by alias count, and
-which ones landed in the held-out quarter differs. So this is a *new*
-measurement on JOB, not a like-for-like re-run, and **the headline result above
--- 75% of the headroom available on expensive queries, 0% of it captured -- has
-not been retested.**
+### Where it comes from, because an aggregate that high is a question
 
-Retesting it needs the collection to finish, so that the held-out quarter
-includes the expensive queries. That is running; the `17*` family is slow enough
-that most of its candidates hit the 120 s statement timeout and are skipped,
-which is correct behaviour (a candidate twenty times slower than native is not a
-candidate) and expensive to discover.
+| query | native | oracle | served | vs native | captured |
+|---|---|---|---|---|---|
+| `17c` | 21603.7 | 1963.3 | **1963.3** | **0.09x** | **100.0%** |
+| `17d` | 8822.2 | 2447.9 | **2447.9** | **0.28x** | **100.0%** |
+| `4b` | 64.6 | 33.2 | **33.2** | **0.51x** | **100.0%** |
+| `1b` | 61.4 | 0.1 | 0.2 | 0.00x | 99.8% |
+| `6c` | 4.7 | 4.4 | 4.9 | 1.04x | regression, +0.2 ms |
+| `2b` | 463.6 | 460.9 | 522.7 | 1.13x | regression, +59 ms |
+| `2d` | 586.1 | 571.7 | 715.4 | 1.22x | regression, +129 ms |
+| `5b` | 75.3 | 83.3 | 95.0 | 1.26x | nothing to win |
+| **total** | **31681.6** | **5564.8** | **5782.7** | **0.18x** | **99.2%** |
 
-**Four held-out queries is still too few**, for the reason this file already
-gives about two: a rate over four queries moves in steps of 25%.
+**On three queries it picks the oracle plan exactly** -- the same plan, not a
+close one -- and lands within 0.1 ms of it on a fourth. `17c` goes from **21.6
+seconds to 2.0**, an 11x speedup, and is 75.8% of all the saving; `17d` is
+another 24.6%. Top-1 exact-oracle accuracy is **3 of 8**, against 25% on the
+original collection.
 
-**`thompson` losing 19.5% is consistent with the earlier finding** that on
-data-starved JOB every policy trusting its own point predictions collapses --
-and `pairwise_rank` leading here, rather than `risk_averse`, is a genuine
-difference from the 2.5 result worth re-checking once the collection completes.
+**Four of the eight regress**, totalling **-208.2 ms** against 26,099 ms saved.
+Three of those four are queries with almost nothing to win: `2b` had 2.7 ms of
+headroom, `2d` had 14.4 ms, and `5b`'s oracle (83.3 ms) is *slower* than native
+(75.3 ms), so no candidate in the action space beats PostgreSQL and any
+deviation is a loss by construction. `6c` gave up 0.2 ms on a 4.7 ms query.
 
-### Status
+So: half the held-out queries get slightly worse, the aggregate is carried by
+two very expensive ones, and the trade is 26 seconds saved for 0.2 seconds lost.
+That is the right trade for this benchmark and it is not "the model is right
+about every query".
 
-Non-zero on real data, on the easy end of the benchmark, with a sample too small
-to lean on. Better than the previous result and not yet the answer to the
-question the previous result posed.
+**These are ungated numbers.** `_evaluate_selection` reports what each policy
+picks, with no confidence gate applied. The gate exists precisely for queries
+like `2b` and `2d` -- a predicted win smaller than the model's own error -- and
+would decline most of them. The 99.2% is the ceiling the gate is choosing from,
+not what a deployment serves.
+
+### What this settles and what it does not
+
+**Settles**: the original finding -- 75% available on real IMDB data and none of
+it captured -- no longer holds. On the same class of queries, four independent
+policies now reach within 1% of the oracle.
+
+**Does not settle**: eight held-out queries is more than two and still few. And
+**the smallest thirty is where this stops** -- JOB goes to 17-table joins and the
+candidate sampler has never been pointed at them. The `17*` family is the
+expensive end of what was tested, and `17c` alone took twenty minutes to collect
+because most of its candidates hit the 120 s statement timeout.
+
+**Consistent with 2.5**: `risk_averse` leading on data-starved JOB is exactly
+what that section found, for the reason it gave -- when data is thin relative to
+the problem, modelling uncertainty matters more than modelling the target.
+`thompson` trailing is the same finding from the other side.
+
+### The partial runs, kept for the record
+
+Trained on the first **14** queries: `pairwise_rank` +39.3% on four held-out
+queries averaging 185 ms native -- recorded at the time as explicitly *not*
+comparable, because the held-out set was twenty times cheaper than the original's.
+
+Trained on **27**: `pairwise_rank` +99.4% on seven held-out queries averaging
+4009 ms native, with three expensive queries carrying all of it. The full
+30-query run above is the one to read.
+
