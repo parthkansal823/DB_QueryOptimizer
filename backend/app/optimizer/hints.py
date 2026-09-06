@@ -515,9 +515,11 @@ def generate_index_candidates(
 # checked against the running extension with `debug_print` on rather than
 # against the documentation. All 31 others were accepted; this one was not.
 #
-# Kept, because the technique is sound and the keyword exists upstream. Turning
-# it on is a matter of upgrading pg_hint_plan and adding an
-# `include_disable_index` flag -- not of changing anything here.
+# Kept, because the technique is sound and the keyword exists upstream. Both
+# have since happened: pg_hint_plan 1.8.1 arrived with the PostgreSQL 18
+# upgrade and `INCLUDE_DISABLE_INDEX` exists. It then generated nothing for a
+# further stretch, because the catalog map it needs was gated on
+# `INCLUDE_INDEX_PINNING` -- see `planner._index_candidates_for`.
 def generate_disable_index_candidates(
     table_indexes: dict[str, list[str]] | None,
     max_tables: int = 2,
@@ -904,6 +906,9 @@ def generate_candidates(
     # other opt-in family: whether it earns its planning cost is a measurement,
     # and `docs/WRITEUP.md` 2.27 is what happens when that measurement is run.
     include_disable_index: bool = False,
+    # True, and the docstring at the call site explains why an opt-in family has
+    # an opt-out default: the catalog map used to be the flag.
+    include_index_pinning: bool = True,
     join_graph: dict[str, list[str]] | None = None,
     table_indexes: dict[str, list[str]] | None = None,
 ) -> list[str]:
@@ -972,7 +977,19 @@ def generate_candidates(
     # Index pinning is last because it is the only family that can be empty for
     # a reason outside the query -- no catalog map was supplied -- and the
     # budget in `planner.py` truncates from the end.
-    if table_indexes:
+    #
+    # `include_index_pinning` defaults to True, which looks backwards for an
+    # opt-in family and is the honest translation of what this line used to do.
+    # It read `if table_indexes:` with no flag at all, because the only way to
+    # get a catalog map was to switch index pinning on -- the presence of the
+    # map *was* the flag.
+    #
+    # That stopped being true the moment a second family needed the same map.
+    # `DisableIndex` also names an index, and once `_index_candidates_for`
+    # learned to build the map for it (2.74), this line would have fired for it
+    # too: one flag switching on two families, silently, which is the bug being
+    # fixed inverted rather than repaired.
+    if include_index_pinning and table_indexes:
         candidates += generate_index_candidates(table_indexes)
     return candidates
 

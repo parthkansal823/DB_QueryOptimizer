@@ -91,3 +91,62 @@ describe("the saved/lost bar keeps the rules that make it visible", () => {
     expect(rule(".delta-fill")).toMatch(/position:\s*absolute/);
   });
 });
+
+/**
+ * The classes this file *cannot* see.
+ *
+ * `classNamesIn` reads literal strings, so a class built at render time --
+ * `finding-${f.severity}`, `dq-${p.color}` -- is invisible to the check above.
+ * That is the same blind spot in the other direction: the rule can be missing
+ * and nothing complains, exactly as it did for `.settings-grid`.
+ *
+ * There is no general fix, because the set of values is decided by the backend.
+ * What there is: the backend emits three severities and only three, and this
+ * asserts a rule exists for each. If a fourth is ever added, the finding renders
+ * unstyled and this test is the only thing that would say so.
+ */
+describe("classes built from backend values", () => {
+  const rules = new Set([...css.matchAll(/\.([a-zA-Z0-9_-]+)/g)].map((m) => m[1]));
+
+  // `diagnostics.warnings_for` and `dbadvisor` between them emit exactly these.
+  it.each(["high", "medium", "low"])("styles a %s-severity finding", (severity) => {
+    expect(rules.has(`finding-${severity}`)).toBe(true);
+  });
+
+});
+
+/**
+ * Colours that are not classes at all.
+ *
+ * `DecisionQuality` assigns each outcome a `color` and paints the segment with
+ * `background: colors[p.color]`, where `colors` comes from `usePalette()`. A
+ * name the palette does not define is not a styling *mistake* -- it is
+ * `undefined`, which renders the segment with no background at all. Invisible,
+ * in a chart whose whole job is to show the proportions.
+ *
+ * Both palettes are checked: they are separate objects, and a key present in
+ * one and missing from the other would fail only in one colour scheme.
+ */
+describe("palette keys the components ask for", () => {
+  const source = fs.readFileSync(
+    path.join(SRC, "components", "DecisionQuality.jsx"),
+    "utf8",
+  );
+  const asked = [...source.matchAll(/color:\s*"([a-z]+)"/g)].map((m) => m[1]);
+
+  const palette = fs.readFileSync(path.join(SRC, "usePalette.js"), "utf8");
+  const blocks = palette.split("const DARK");
+  const keysIn = (text) =>
+    new Set([...text.matchAll(/^\s{2}([a-zA-Z]+):/gm)].map((m) => m[1]));
+
+  it("asks for at least one colour", () => {
+    expect(asked.length).toBeGreaterThan(0);
+  });
+
+  it.each(["LIGHT", "DARK"])("%s defines every colour asked for", (which) => {
+    const keys = keysIn(which === "LIGHT" ? blocks[0] : blocks[1]);
+    const missing = [...new Set(asked)].filter((c) => !keys.has(c));
+
+    expect(missing, `palette ${which} has no entry for: ${missing.join(", ")}`).toEqual([]);
+  });
+});

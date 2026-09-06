@@ -176,6 +176,16 @@ def hint_family(hint: str | None) -> str | None:
     return "other"
 
 
+# The `selector_used` value a shadow execution writes.
+#
+# Declared here rather than beside its explanation below, because **both**
+# regression queries interpolate it and the family-level one comes first. It
+# used to sit under `REGRESSION_SQL`, which was fine while only that query
+# referred to it -- and the moment the family query started counting shadow
+# rows too, the module stopped importing.
+SHADOW_SELECTOR = "shadow"
+
+
 FAMILY_REGRESSION_SQL = f"""
     WITH native AS (
         SELECT query_id, AVG(actual_total_time_ms) AS native_avg
@@ -192,7 +202,15 @@ FAMILY_REGRESSION_SQL = f"""
             AVG(actual_total_time_ms) AS family_avg,
             COUNT(*)                  AS n_served
         FROM plan_execution_log
-        WHERE is_chosen
+        -- Shadow rows count, exactly as they do in `REGRESSION_SQL`.
+        --
+        -- They did not, and the two queries deciding what evidence counts
+        -- disagreed: a family block removed its family from the action space,
+        -- so the family produced no `is_chosen` row, so only the evidence
+        -- window expiring could clear it. `planner.plan_query` now skips
+        -- `allowed_hints` on the shadow path so the rows exist; this is the
+        -- half that lets them be seen.
+        WHERE (is_chosen OR selector_used = '{SHADOW_SELECTOR}')
           AND hint IS NOT NULL
           AND query_id IS NOT NULL
           AND actual_total_time_ms IS NOT NULL
@@ -238,7 +256,6 @@ OBSERVATION_COUNT_SQL = """
 # deployed, having learned nothing in between. Shadowing turns that into real
 # evidence at the cost of one extra execution on a sampled fraction of blocked
 # requests, without ever exposing a user to the plan.
-SHADOW_SELECTOR = "shadow"
 
 REGRESSION_SQL = f"""
     SELECT
@@ -337,6 +354,28 @@ class RegressionGuard:
         self.native_ms: dict[str, float] = {}
 
     def refresh(self, cur) -> dict[str, dict]:
+        """
+        Re-read the evidence. Safe to call while requests are being served.
+
+        **Every field is rebound, never mutated in place**, and that is what
+        makes this lock-free rather than lucky. `self.blocked = {...}` swaps a
+        fully-built dict for the old one, so a concurrent reader sees one or the
+        other. `self.blocked.clear()` followed by `update()` reads as the same
+        thing, keeps every test passing, and lets a reader observe an empty
+        block list mid-refresh -- serving a regressing plan to a query that
+        should have been blocked.
+
+        Measured on a live database: 3.1 million reads across six threads while
+        a seventh refreshed, zero errors (2.87).
+        `tests/test_guard_concurrency.py` asserts the rebinding, because the
+        race it prevents is timing-dependent and would not fail reliably.
+
+        What is *not* protected: the four fields are assigned in sequence, so a
+        reader between two of them pairs a new `blocked` with an old
+        `observations`. The window is two bytecodes and the consequence is one
+        decision using caution from the previous refresh, which is bounded and
+        was judged not worth a snapshot object.
+        """
         # One boundary for every query below, resolved once: a refresh that used
         # a slightly different cutoff per statement could block a query on
         # evidence it had already decided was too old to count.

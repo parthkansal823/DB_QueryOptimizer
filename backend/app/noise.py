@@ -80,6 +80,126 @@ def _spread(samples: list[float]) -> dict:
     }
 
 
+# The blocks an `EXPLAIN (ANALYZE, BUFFERS)` plan reports, summed over its tree.
+BUFFER_KEYS = (
+    "Shared Hit Blocks", "Shared Read Blocks", "Shared Dirtied Blocks",
+    "Shared Written Blocks", "Temp Read Blocks", "Temp Written Blocks",
+    "Local Hit Blocks", "Local Read Blocks",
+)
+
+
+def _walk(node):
+    yield node
+    for child in node.get("Plans", []) or []:
+        yield from _walk(child)
+
+
+def buffer_signature(plan: dict | None) -> tuple | None:
+    """Total page work for a plan, or None if it was recorded without BUFFERS."""
+    totals = dict.fromkeys(BUFFER_KEYS, 0)
+    seen = False
+    for node in _walk(plan or {}):
+        for key in BUFFER_KEYS:
+            if key in node:
+                totals[key] += node[key] or 0
+                seen = True
+    return tuple(totals[k] for k in BUFFER_KEYS) if seen else None
+
+
+def floor_from_buffers(rows: list[dict] | None = None) -> dict:
+    """
+    A noise floor per query, from pairs of plans that did **identical page
+    work** -- and therefore free.
+
+    ## Why this is a second estimator and not a replacement
+
+    `measure_query` re-executes one unchanged plan and calls the disagreement
+    noise. That is the definition, and it costs executions: `--reps 5` over the
+    workload is a full extra pass, and it measures the *native* plan only.
+
+    This reads the log. Two candidates for the same query whose plans report the
+    same shared, temp and local block counts read and wrote the same pages, so
+    any latency difference between them is timing -- cache state, contention,
+    scheduler jitter -- rather than one plan doing less work. That is the same
+    argument, applied to pairs that already exist.
+
+    Measured over the 65-query synthetic log: **276** such groups spanning
+    **1,228** pairs, at least one on **every** query. Median spread within a
+    group **11.2%**, mean 16.8%, max **129.7%** -- and 92 of the 276 exceed
+    2.18's global 18.6% floor. On `gen_27_5w` two plans doing identical page
+    work differ by more than **2x**, so a "2x speedup" measured there is
+    indistinguishable from a lucky moment.
+
+    2.58 rejected buffers as a *label* (Spearman 0.341 against latency) and the
+    train/serve skew rules them out as a *feature* -- they come from
+    `EXPLAIN ANALYZE` and serving plans with `analyze=False`. Neither objection
+    touches this use, which is offline, pairwise, and about what a difference
+    has to beat before it counts.
+    """
+    import statistics
+    from collections import defaultdict
+
+    from app.calibrate import _row_to_candidate, _servable, without_provable_noops
+    from app.train import _aggregate_repetitions, _load_rows
+
+    if rows is None:
+        rows = _aggregate_repetitions(_load_rows())
+
+    by_query: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_query[row["query_id"]].append(row)
+
+    per_query: dict[str, dict] = {}
+    every_spread: list[float] = []
+    for qid, qrows in by_query.items():
+        base = [r for r in qrows if r["is_baseline"]]
+        cands = [
+            c for c in _servable([_row_to_candidate(r) for r in qrows
+                                  if not r["is_baseline"]])
+            if not c.get("disabled_nodes")
+        ]
+        if not base:
+            continue
+        cands = without_provable_noops(cands, base[0].get("raw_plan"))
+        if len(cands) < 2:
+            continue
+
+        by_sig: dict[tuple, list[float]] = defaultdict(list)
+        for c in cands:
+            sig = buffer_signature(c.get("raw_plan"))
+            if sig is not None:
+                by_sig[sig].append(c["actual_total_time_ms"])
+
+        spreads, n_pairs = [], 0
+        for latencies in by_sig.values():
+            if len(latencies) < 2:
+                continue
+            n_pairs += len(latencies) * (len(latencies) - 1) // 2
+            median = statistics.median(latencies)
+            if median > 0:
+                spreads.append((max(latencies) - min(latencies)) / median)
+        if spreads:
+            per_query[qid] = {
+                # The widest disagreement seen between plans doing the same
+                # work: what a difference on this query has to beat.
+                "floor_fraction": max(spreads),
+                "median_fraction": statistics.median(spreads),
+                "n_groups": len(spreads),
+                "n_pairs": n_pairs,
+            }
+            every_spread.extend(spreads)
+
+    return {
+        "source": "identical buffer counts",
+        "n_queries": len(per_query),
+        "n_groups": sum(v["n_groups"] for v in per_query.values()),
+        "n_pairs": sum(v["n_pairs"] for v in per_query.values()),
+        "median_fraction": statistics.median(every_spread) if every_spread else None,
+        "max_fraction": max(every_spread) if every_spread else None,
+        "per_query": per_query,
+    }
+
+
 def measure_query(cur, sql: str, reps: int = DEFAULT_REPS) -> dict:
     """
     Execute one unchanged query `reps` times and describe how much the timings
@@ -177,7 +297,46 @@ if __name__ == "__main__":
                         help="executions per query (more reps, tighter estimate)")
     parser.add_argument("--apply", action="store_true",
                         help=f"write the measured floor to {NOISE_PATH}")
+    parser.add_argument(
+        "--from-buffers", action="store_true",
+        help="derive the floor from the log instead of re-executing: pairs of "
+             "plans that did identical page work, so any latency difference "
+             "between them is timing. Free, per-query, and needs no database "
+             "time at all",
+    )
     args = parser.parse_args()
+
+    if args.from_buffers:
+        report = floor_from_buffers()
+        if not report["n_queries"]:
+            raise SystemExit(
+                "no query has two candidates with identical buffer counts -- "
+                "either the log predates `BUFFERS` or every plan does different "
+                "page work. Use the re-execution path instead."
+            )
+        print(f"{'query':<32}{'floor':>9}{'median':>9}{'groups':>8}{'pairs':>7}")
+        for qid, v in sorted(
+            report["per_query"].items(), key=lambda kv: -kv[1]["floor_fraction"]
+        ):
+            print(f"{qid[:31]:<32}{v['floor_fraction']:>8.1%}"
+                  f"{v['median_fraction']:>9.1%}{v['n_groups']:>8}{v['n_pairs']:>7}")
+        print()
+        print(
+            f"{report['n_queries']} queries, {report['n_groups']} groups of "
+            f"plans doing identical page work, {report['n_pairs']} pairs. "
+            f"Median disagreement {report['median_fraction']:.1%}, "
+            f"worst {report['max_fraction']:.1%}."
+        )
+        print()
+        print(
+            "Every difference above is noise by construction: the plans read "
+            "and wrote the same pages."
+        )
+        print(
+            "A query's own floor is the bar a measured win on it has to beat, "
+            "and it is not the workload's median -- see the spread in the table."
+        )
+        raise SystemExit(0)
 
     report = measure_workload(reps=args.reps)
 

@@ -153,7 +153,8 @@ warning.
 `geqo_seed` is the interesting one: *"Varying the value changes the set of join
 paths explored, and may result in a better or worse best path being found."*
 That is a random-restart search — run the same query under several seeds and
-keep the best plan. On JOB's 17-table queries, where GEQO is unavoidable, this
+keep the best plan. On JOB's 17-table queries — the `29*` family, not the
+collected thirty, and the only ones where GEQO runs at all (§2.81) — this
 is a cheap way to widen the search that costs nothing but planning time.
 
 It is also a **measurement hazard**: with GEQO active and the seed unpinned, the

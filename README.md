@@ -157,22 +157,28 @@ The generated workload is written to `models/workload_<db>.json`, so you can
 read it, edit it, and replay it. Auto-generation is a starting point, not a
 claim that these are the queries you care about.
 
-**And a trained model carries across schemas, which was never tested until
-2026-09-05.** A quarter of the feature vector is per-table slots that read
-*zero* on a database the model has not seen, so this measures whether the
-schema-agnostic half — costs, tree shape, join-method counts, predicate shape —
-is enough on its own:
+**And a trained model does *not* carry across schemas — which was never tested
+until 2026-09-05, and then was measured against the wrong ceiling.** A quarter
+of the feature vector is per-table slots that read *zero* on a database the
+model has not seen, so this measures whether the schema-agnostic half — costs,
+tree shape, join-method counts, predicate shape — is enough on its own:
 
 | carried model | target | headroom captured | model trained on the target |
 |---|---|---|---|
-| synthetic (6 tables, 755k rows) | JOB/IMDB (21 tables, 73M rows) | **97.0%** | 98.4% |
+| synthetic (6 tables, 755k rows) | JOB/IMDB (21 tables, 73M rows) | **−5.3%** | 96.5% |
 | JOB/IMDB | synthetic | 44.1% | 69.3% |
 
-Zero overlapping tables in both directions; cost-argmin captures 12.8% and
-12.1% on the same queries. The caveat is in `docs/WRITEUP.md` §2.64: total
-latency captured is not per-query accuracy, and how far a carried model gets
-depends on whether the target's headroom is concentrated enough to reach without
-local knowledge.
+Zero overlapping tables in both directions. The first row read **97.0%** until
+§2.86 re-ran it on the wide action space: under a narrow one almost every
+candidate was survivable, so any selector scored well. Given a space that
+contains catastrophic plans as well as good ones, the carried model serves JOB
+**4% slower than doing nothing**.
+
+It is not choosing at random — random selection lands at 125.8% of native
+against the carried model's 104.0%, so the structural features rank plans far
+above chance. They are not enough to clear the bar that matters, which is
+native. Deploying a foreign model is worse than deploying nothing; whether one
+makes local training *converge faster* is a different question, and unasked.
 
 ## Why this design, and not a database engine from scratch
 
@@ -266,6 +272,10 @@ Everything it decides is inspectable:
 | `python -m app.dbadvisor` | what is wrong with this database? |
 | `python -m app.audit_binding` | did every hint the optimizer generates actually bind? |
 | `python -m app.generalisation` | does the model predict unseen queries as well as trained ones? |
+| `python -m app.selection_effect` | how much of the headline is the workload having been chosen? |
+| `python -m app.feature_audit` | which features cannot separate the plans being compared? |
+| `python -m app.coverage_sweep` | how much of a held-out number is the split? |
+| `python -m app.noise --from-buffers` | how big does a difference have to be on *this* query to be real? |
 
 The dashboard shows the first two. The third exists because a hint that is
 ignored is indistinguishable from one that did nothing, and the fourth because
@@ -403,6 +413,22 @@ docker compose exec backend python -m app.retrain --status     # deployed versio
 docker compose exec backend python -m app.retrain              # retrain if there is enough new data
 docker compose exec backend python -m app.retrain --rollback   # go back to the previous version
 ```
+
+And the three that exist to argue with the numbers above:
+
+```bash
+docker compose exec backend python -m app.selection_effect     # 6 of 40 generated queries have >=8% headroom (2.72)
+docker compose exec backend python -m app.feature_audit        # 23 of 67 features can't separate a query's candidates (2.69)
+docker compose exec backend python -m app.coverage_sweep       # conformal coverage 62.5-92.6% across ten splits (2.66)
+docker compose exec backend python -m app.noise --from-buffers # per-query noise floor, free: 6% to 130% (2.88)
+docker compose exec backend python -m app.benchmark --protocol paired
+```
+
+`--protocol paired` re-times native, served and oracle **alternately** per
+query and reports medians, so §2.32's between-run drift is common-mode instead
+of landing on one arm — and so is the oracle's low bias, which is a `min` over
+noisy draws. §2.68 is the case for it: a single pass reported a query regressing
+to 1.273x native and seven alternated repetitions put it at 1.095x.
 
 Open `http://localhost:5173`. Paste a query or pick a sample, and you get
 PostgreSQL's plan against the chosen one, every candidate measured, why the
@@ -558,14 +584,28 @@ learned-query-optimizer/
 
 ## Does it actually beat Postgres?
 
-**On the synthetic schema, yes.** The current measurement, three runs under the
-`compare` protocol:
+**On the synthetic schema, yes — and by less than this page used to say.**
+Measured under `--protocol paired`, which re-times native, served and oracle
+alternately so the ceiling stops being a minimum over noisy draws (§2.85):
 
-| | captured | range |
+| | captured | headroom it is a fraction of |
 |---|---|---|
-| all 65 queries | **40.8%** | 38.3 – 46.0 |
-| **queries the model never trained on** | **43.0%** | 23.8 – 48.5 |
-| hand-written traps and controls only | 26.0% | 23.6 – 42.2 |
+| all 65 queries | **48.1%** | 448 ms (7.9% of native) |
+| **queries the model never trained on** | **18.4%** | 63 ms |
+| hand-written traps and controls only | 48.3% | 385 ms |
+
+Single run — `paired` prints `(spread unknown)` and means it.
+
+Against the `deploy` protocol on the same code and the same hour, one pass
+instead of five alternated: headroom **1,304 ms → 448 ms** and the latency
+actually saved **797 ms → 215 ms**. Three quarters of the measured benefit was
+noise, and more than half the "available headroom" was the `min` bias. The
+system still saves latency net; it saves about a quarter of what a single pass
+reports.
+
+This page previously said 40.8% / 43.0% / 26.0% from three `compare` runs. Those
+were measured with the guard off, before §2.83 removed candidates from the
+benchmark that the server never offers, and against a single-pass oracle.
 
 The middle row is the one that matters, and it read **0.0%** on every run ever
 measured until 2026-09-04 — eleven runs across three independent sets. Nothing
@@ -573,13 +613,16 @@ in the model, the features or the action space changed to move it; twelve
 corrections to the measurement and configuration did, and `docs/WRITEUP.md`
 §2.42–2.54 works through each.
 
-The third row is lower because 27 of the 65 queries were generated and *kept*
-for having headroom, so the first row is partly measured on a benchmark selected
-to be winnable. The **14.8-point gap** between them is the size of that effect,
-and it widened from 8.3 points when six hand-written six-table queries were
-added *without* a headroom filter — three of which have none, by construction.
-The unbiased number went down and the filtered one did not, which is what an
-honest split is supposed to do.
+The gap between the first and third rows is the selection effect: 27 of the 65
+queries were generated and *kept* for having headroom. It has read +14.8, +7.8
+and −0.2 points across three protocols, which is three numbers for one quantity
+and therefore a measurement of nothing at this sample size.
+
+`python -m app.selection_effect` is the version to quote instead: it draws
+generated queries and removes the filter explicitly rather than inferring the
+effect from two hand-written subsets. On 40 queries only **6** clear 8% headroom
+and the median has **none** — a **+12.8-point** effect, measured rather than
+differenced (§2.72).
 
 The ranges are wide. The benchmark prints its own resolution floor and it reads
 "a difference smaller than 7.7 points is inside this sample's own spread", so
@@ -590,27 +633,34 @@ the honest claim is "clearly not zero and around a quarter to a half", not
 more than the number.** This said "no" for most of the project's life: 75% of
 the latency provably available (native 3703 ms against an oracle of 919 ms) and
 **none of it captured**, because 194 executions across 8 queries could not teach
-a 17-table join space.
+JOB's join space.
 
-Re-run on PostgreSQL 18 with **1614 executions across all 30** of the smallest
-queries and **8 held out**, on held-out queries averaging **3960 ms** native —
-the same expensive regime as the original:
+Re-collected on PostgreSQL 18 across all 30 of the smallest queries under the
+**wide** action space (§2.56) — 3,100 rows, 8h 22m, 8 held out:
 
 | selector | avg latency | headroom captured |
 |---|---|---|
-| native PostgreSQL | 3960.2 ms | — |
-| cost heuristic | 2285.3 ms | +42% |
-| oracle (best candidate) | 695.6 ms | 100% |
-| **`risk_averse`** | **713.7 ms** | **+99.4%** |
-| `pairwise_rank` | 722.8 ms | +99.2% |
-| `greedy` | 726.9 ms | +99.0% |
-| `thompson` | 863.9 ms | +94.8% |
+| native PostgreSQL | 2,715 ms | — |
+| cost heuristic | 2,457 ms | +12% |
+| oracle (best candidate) | 520 ms | 100% |
+| **`borda`** | **688 ms** | **+92.3%** |
+| `risk_averse` | 701 ms | +91.7% |
+| `greedy` | 707 ms | +91.4% |
+| `pairwise_rank` | 718 ms | +91.0% |
+| `thompson` | 747 ms | +89.7% |
 
-All four policies clear 94%, and the top three sit within 0.4 points of each
-other — which matters more than which one leads. One policy at 99% invites the
-question of whether it got lucky; four independent selection rules landing
-within half a point of the oracle is a property of the candidate set and the
-model, not of the rule reading them.
+**This page used to say 99.2%, and that number was about the action space rather
+than the model** (§2.80). Widening the space left the served latency unchanged
+at ~720 ms and dropped the ceiling from 696 ms to 520 ms — so the same model,
+picking the same plans, went from 99.2% to 91.0%. Capturing 99.2% of a 27 ms
+opportunity is easy; the 176 ms that appeared is the part worth reporting.
+
+Exact-oracle picks went **up**, 3 of 8 to 4 of 8, and the regressions shrank from
+−208 ms to −73 ms. Almost all the lost capture is one query, `17c`, whose ceiling
+fell by 1.1 seconds and whose served plan did not move. Per-query detail in
+[`docs/JOB_RESULTS.md`](docs/JOB_RESULTS.md).
+
+Read the ceiling next to the ratio. That is the whole lesson.
 
 **Read the breakdown, not just the total.** On three of the eight held-out
 queries it picks the **oracle plan exactly** — `17c` goes from **21.6 seconds to

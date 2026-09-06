@@ -52,8 +52,10 @@ def query_fingerprint(sql: str) -> str:
     stable across runs (so history accumulates) without pretending the query
     was part of a curated workload.
 
-    Must stay in sync with `QUERY_KEY_SQL` below, which reproduces this same
-    id in SQL for rows written before ids were assigned.
+    `QUERY_KEY_SQL` below is the SQL fallback for rows written before ids were
+    assigned. It reproduces the `GROUP_BY_TEMPLATE = False` branch **only** --
+    see the note there, and do not read this docstring's former claim that the
+    two are the same id.
     """
     normalized = (
         query_template(sql) if GROUP_BY_TEMPLATE else _WHITESPACE.sub(" ", sql.strip())
@@ -62,9 +64,33 @@ def query_fingerprint(sql: str) -> str:
     return ADHOC_PREFIX + hashlib.md5(normalized.encode(), usedforsecurity=False).hexdigest()
 
 
-# The SQL equivalent of `query_fingerprint`, applied as a fallback so rows
-# logged before this existed (query_id IS NULL) group together with newer
-# rows for the same query instead of being discarded.
+# The SQL fallback for rows logged before ids existed (query_id IS NULL), so
+# they group with newer rows for the same query instead of being discarded.
+#
+# **It is not the same rule as `query_fingerprint`, and the docstring above used
+# to say it was.** This normalises whitespace; `query_fingerprint` applies
+# `query_template` when `GROUP_BY_TEMPLATE` is set, which also strips literals
+# and `/*+ ... */` hints. The setting defaults to **True**, so on the default
+# configuration the two disagree:
+#
+#     same template, different literal   python: same   sql: different
+#     bare against hinted                python: same   sql: different
+#     whitespace only                    python: same   sql: same
+#
+# `COALESCE` prefers the recorded id, so this only decides the grouping of rows
+# that have none -- of which there are currently **0 of 33,634**. Latent, and
+# recorded rather than fixed for a specific reason: `query_template` is a pair
+# of Python regexes over SQL text, and reproducing it in SQL would create a
+# second implementation of query identity guaranteed to drift from the first.
+# This project has spent a long night on pairs of definitions that had to agree
+# and stopped (2.75, 2.76, 2.77); adding another to close a path nothing takes
+# would be the wrong trade.
+#
+# What would make it bite: rows arriving with a NULL `query_id`. If that ever
+# happens, `stats.py` is built on matched pairs, and a baseline and its served
+# candidate landing in different groups is a pair that silently stops existing.
+# `tests/test_query_key_fallback.py` pins the difference so it is a decision
+# rather than a discovery.
 QUERY_KEY_SQL = (
     r"COALESCE(query_id, 'adhoc:' || md5("
     r"regexp_replace(btrim(sql_text, E' \t\r\n'), '\s+', ' ', 'g')))"

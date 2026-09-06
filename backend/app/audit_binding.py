@@ -15,14 +15,30 @@ from app.optimizer.hint_binding import check_binding, enable_hint_debug
 from app.plan_extractor import get_plan
 from app.workload import WORKLOAD
 
+# Every opt-in family, because "did every hint bind?" is worth nothing if the
+# answer excludes the families most likely not to.
+#
+# `include_disable_index` was missing, so the two families that name an index
+# were audited unevenly: pinning rode in on `table_indexes` (which used to be
+# its own switch) and `DisableIndex` was never generated here at all -- the
+# family whose keyword did not exist before pg_hint_plan 1.8.1 and whose
+# rejection arrives at INFO severity, which the default `client_min_messages`
+# discards (2.20). Precisely the family this tool exists for.
+#
+# `include_index_pinning` is explicit for the same reason it is explicit in
+# `planner`: it defaults True, and a dict of family switches that leaves one
+# implicit is how the last one went missing.
 FULL = dict(
     include_join_methods=True, include_tuning=True, include_bushy=True,
     include_scan_methods=True, include_negative_scans=True,
     include_negative_joins=True, include_memoize=True, include_parallel=True,
     include_enable_settings=True, include_extended_toggles=True,
-    include_cost_model=True,
+    include_cost_model=True, include_disable_index=True,
+    include_index_pinning=True,
 )
-SERVED = dict(include_hint_sets=True)  # planner defaults: order + hint sets
+# planner defaults: order + hint sets. Pinning off explicitly, because its
+# default is True and SERVED must mean what the server serves.
+SERVED = dict(include_hint_sets=True, include_index_pinning=False)
 
 
 def family_of(hint: str) -> str:
@@ -30,6 +46,11 @@ def family_of(hint: str) -> str:
         ("join method", ("HashJoin(", "NestLoop(", "MergeJoin(")),
         ("negative join", ("NoHashJoin(", "NoNestLoop(", "NoMergeJoin(")),
         ("negative scan", ("NoSeqScan(", "NoIndexScan(", "NoBitmapScan(")),
+        # Before the negative and scan-method rows, because `DisableIndex(` does
+        # not contain any of their markers and would otherwise fall through to
+        # the default and be reported as a join order (2.56's `other` bucket,
+        # with a more confident label).
+        ("disable index", ("DisableIndex(",)),
         ("scan method", ("SeqScan(", "IndexScan(", "BitmapScan(", "IndexOnlyScan(")),
         ("memoize", ("Memoize(", "NoMemoize(")),
         ("parallel", ("Parallel(",)),

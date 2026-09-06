@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+
+import { fetchSettings } from "../api";
 
 // Settling a comparison, rather than reading one number off one run.
 //
@@ -59,6 +61,19 @@ function Verdict({ result }) {
   );
 }
 
+// Fallback only. The real list comes from `/settings`, because the backend is
+// where policies are added and this component is the eighth place the list used
+// to be spelled out -- after the autotune sweep, the benchmark's --policy, the
+// calibration replay, the promotion yardstick, the settings API, the experiment
+// runner and the training evaluation, all of which now read one constant
+// (`learned.RANKER_POLICIES`).
+//
+// `borda` was added to all seven and not to this file, so the dashboard offered
+// an A/B over four policies while the server ran five. A panel that cannot
+// select the policy you want to compare is a panel that quietly decides the
+// comparison for you.
+const FALLBACK_POLICIES = ["greedy", "thompson", "risk_averse", "pairwise_rank"];
+
 export default function ExperimentPanel({ status, onStart, busy }) {
   const [comparison, setComparison] = useState("guard");
   const [armA, setArmA] = useState("risk_averse");
@@ -66,6 +81,26 @@ export default function ExperimentPanel({ status, onStart, busy }) {
   const [policy, setPolicy] = useState("pairwise_rank");
   const [runs, setRuns] = useState(10);
   const [error, setError] = useState(null);
+  const [policies, setPolicies] = useState(FALLBACK_POLICIES);
+
+  // The settings endpoint already declares the options for `selection_policy`,
+  // and the settings page renders them without knowing what they mean. This
+  // borrows the same list rather than keeping a second one.
+  useEffect(() => {
+    let cancelled = false;
+    fetchSettings()
+      .then((settings) => {
+        const field = settings?.fields?.find((f) => f.name === "selection_policy");
+        if (!cancelled && field?.options?.length) setPolicies(field.options);
+      })
+      .catch(() => {
+        // A panel that cannot reach the API still has to render; the fallback
+        // is stale rather than wrong.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const running = status?.is_running;
 
@@ -97,7 +132,7 @@ export default function ExperimentPanel({ status, onStart, busy }) {
           <label>
             Policy
             <select value={policy} onChange={(e) => setPolicy(e.target.value)} disabled={running}>
-              {["greedy", "thompson", "risk_averse", "pairwise_rank"].map((p) => (
+              {policies.map((p) => (
                 <option key={p} value={p}>
                   {p}
                 </option>
@@ -109,7 +144,7 @@ export default function ExperimentPanel({ status, onStart, busy }) {
             <label>
               Arm A
               <select value={armA} onChange={(e) => setArmA(e.target.value)} disabled={running}>
-                {["greedy", "thompson", "risk_averse", "pairwise_rank"].map((p) => (
+                {policies.map((p) => (
                   <option key={p} value={p}>
                     {p}
                   </option>
@@ -119,7 +154,7 @@ export default function ExperimentPanel({ status, onStart, busy }) {
             <label>
               Arm B
               <select value={armB} onChange={(e) => setArmB(e.target.value)} disabled={running}>
-                {["greedy", "thompson", "risk_averse", "pairwise_rank"].map((p) => (
+                {policies.map((p) => (
                   <option key={p} value={p}>
                     {p}
                   </option>

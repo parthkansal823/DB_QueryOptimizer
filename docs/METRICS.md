@@ -16,6 +16,17 @@ Almost everything here is built on one idea.
 the time the plan that actually ran took, for the same query, measured seconds
 apart.
 
+"Measured seconds apart" is doing real work. Repeated executions of the *same*
+plan vary 18.6% (§2.18), and two independent three-run benchmarks of an
+identical configuration landed 8 points apart (§2.32) — drift on a timescale
+longer than one query. `app.benchmark --protocol paired` re-times native, served
+and oracle **alternately** and takes medians, so that drift is common-mode and
+cancels in every ratio built from them; it also re-times the oracle, which is a
+`min` over noisy draws and therefore biased low even when each timing is not.
+§2.68 is the case for it: one pass reported a query regressing to 1.273x native
+and seven alternated repetitions put it at 1.095x. The conclusion survived; its
+magnitude did not.
+
 Runs are reconstructed from `plan_execution_log` by grouping on
 `(query key, created_at)`:
 
@@ -128,6 +139,21 @@ headroom_captured_pct = (Σ native_ms − Σ served_ms) / headroom_ms × 100
 
 `best_ms` is the fastest plan measured on that run — the **oracle**, the
 ceiling any selector could have reached.
+
+**Candidates the baseline plan proves cannot differ from it are excluded from
+`best_ms`.** `Set(enable_mergejoin off)` on a plan with no Merge Join node
+returns the identical plan, so its latency is a second noisy draw of native —
+and `min()` over noisy draws is biased low, so it competes to be the ceiling
+native is measured against. It won on 11 of 65 queries, one of them recording
+3,561 ms against 787 ms for the same plan (§2.76). The same rows stay in the
+*training* set, where they are honest evidence about the 1.0x level.
+
+**Read the ceiling next to the ratio.** A capture percentage is a fraction of an
+opportunity and says nothing on its own about the size of it. The JOB headline
+read 99.2% when the best plan in the action space was 27 ms faster than the one
+being served; widening the space put 176 ms on the table, the same model served
+the same plans, and the number became 91.0% (§2.80). A narrow action space
+looks exactly like a good model in this metric.
 
 This is the fairer score. A database where PostgreSQL is already optimal
 offers no headroom, and scoring 0% improvement there is not a failure. When
@@ -301,6 +327,15 @@ Code: `backend/app/stats.py` — `cost_vs_latency`, `_spearman`
 | `thompson` | Sample one ensemble member per decision, so it keeps exploring |
 | `risk_averse` | Penalise predictions the ensemble disagrees about |
 | `pairwise_rank` | Lero-style learn-to-rank over plan pairs |
+| `borda` | Rank aggregation over the other two: sum the ensemble's rank and the ranker's, take the minimum |
+
+`borda` exists because the ensemble and the ranker are comparably strong within
+a query (Spearman +0.680 and −0.660 against latency) and wrong in different
+places, so combining them beats either — 63.0% of held-out headroom against
+`pairwise_rank`'s 52.1% with a better worst case, on the synthetic workload
+(§2.71), and the best of the five on JOB (§2.80). It is **not** the default:
+under the deployed gate it deviates on 44% of queries where `pairwise_rank`
+deviates on 81%, and nets less as a result (§2.79).
 
 ### Two safety mechanisms
 

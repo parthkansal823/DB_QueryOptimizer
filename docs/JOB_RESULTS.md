@@ -99,8 +99,9 @@ this time it is not the hint bug. Hints do bind here: the feature vector is
 which is only possible if the candidates actually differ. The real reason is
 that a test MAE of **1657 ms** on queries averaging 3703 ms means the model
 has no usable signal. 194 raw executions across 8 queries, 65 after median
-aggregation, with 2 held-out queries, is nowhere near enough to learn a
-17-table join space. With no signal to go on, the selectors fall back to the
+aggregation, with 2 held-out queries, is nowhere near enough to learn JOB's
+join space. (These are the *smallest* thirty: the largest joins seven tables,
+not seventeen — see §2.81 on the naming trap.) With no signal to go on, the selectors fall back to the
 candidate that happens to be the native plan, and the safety veto would have
 caught them if they had not.
 
@@ -155,6 +156,10 @@ data.
 
 All 30 of the smallest JOB queries. **1614 raw rows** against the original run's
 194, **8 held out** against its 2:
+
+> **Superseded by the wide-action-space re-collection below.** These numbers
+> were measured against a ceiling only 27 ms below the plan being served; see
+> "The 99.2% was a statement about the action space".
 
 | selector | avg latency | headroom captured |
 |---|---|---|
@@ -315,3 +320,83 @@ Trained on **27**: `pairwise_rank` +99.4% on seven held-out queries averaging
 4009 ms native, with three expensive queries carrying all of it. The full
 30-query run above is the one to read.
 
+
+## The 99.2% was a statement about the action space
+
+`docs/WRITEUP.md` 2.56 widened the action space and left this page's headline
+flagged as stale. Re-collecting all 30 JOB queries under the wide space took
+**8h 22m** and 3,100 rows. Same model class, same 8 held-out queries, same split
+seed 42.
+
+| | old (narrow) | new (wide) | change |
+|---|---|---|---|
+| native | 3,960 ms | 2,715 ms | −1,246 |
+| oracle (ceiling) | 696 ms | **520 ms** | **−176** |
+| served by `pairwise_rank` | 723 ms | **718 ms** | **−5** |
+| served **minus** oracle | 27 ms | **198 ms** | **+171** |
+| captured | **99.2%** | **91.0%** | **−8.2** |
+
+**The model did not get worse. It did not change at all** — served latency moved
+5 ms, and the same plans come out. What changed is the ceiling: 176 ms of plan
+quality that did not previously exist, of which it captured none.
+
+So 99.2% was never a measurement of how well the model chooses. The best plan in
+the narrow space was 27 ms better than the one being served, and capturing 99.2%
+of 27 ms is easy.
+
+### Every policy, on the new collection
+
+| selector | avg latency | headroom captured |
+|---|---|---|
+| native PostgreSQL | 2,715 ms | — |
+| cost heuristic | 2,457 ms | +12% |
+| **oracle (best candidate)** | **520 ms** | 100% |
+| **`borda`** | **688 ms** | **+92.3%** |
+| `risk_averse` | 701 ms | +91.7% |
+| `greedy` | 707 ms | +91.4% |
+| `pairwise_rank` | 718 ms | +91.0% |
+| `thompson` | 747 ms | +89.7% |
+
+`borda` leads, which is the second independent workload where aggregating the
+ensemble's ranking with the ranker's beats either (2.71 measured it on the
+synthetic schema). It is not deployed; 2.79 has the reason.
+
+### Per query
+
+| query | native | oracle | served | vs native | captured |
+|---|---|---|---|---|---|
+| `17c` | 9659.1 | 838.5 | 2100.3 | 0.22x | 85.7% |
+| `17d` | 10670.0 | 2447.9 | **2447.9** | 0.23x | **100.0%** |
+| `1b` | 62.7 | 0.1 | **0.1** | 0.00x | **100.0%** |
+| `2b` | 502.0 | 322.9 | **322.9** | 0.64x | **100.0%** |
+| `2d` | 673.0 | 415.8 | 737.7 | 1.10x | regression, +65 ms |
+| `4b` | 64.6 | 44.2 | **44.2** | 0.69x | **100.0%** |
+| `5b` | 80.9 | 83.5 | 86.4 | 1.07x | nothing to win |
+| `6c` | 4.4 | 4.7 | 6.2 | 1.40x | regression, +2 ms |
+| **total** | **21716.6** | **4157.7** | **5745.6** | **0.26x** | **91.0%** |
+
+Read the aggregate and the per-query table together, because they say different
+things:
+
+- **Exact-oracle picks went from 3 of 8 to 4 of 8.** `2b` is the new one, and it
+  is the query 2.56 predicted: `SeqScan(cn)` took it from 464 ms to 311 ms in the
+  probe, and the model now finds it. The model got *better* at choosing.
+- **Almost all the lost capture is `17c`.** Its ceiling fell from 1963 ms to
+  **838 ms** — a plan more than a second better than anything the narrow space
+  contained — and the model still serves 2100 ms. That single query is 1,262 ms
+  of the 1,588 ms gap.
+- **The regressions shrank.** Four of eight regressed before, totalling −208 ms;
+  three do now, totalling −73 ms. `2b` moved from a 59 ms regression to an exact
+  oracle pick.
+
+### Native moved 31% between runs
+
+3,960 ms to 2,715 ms for the same eight queries, with nothing about the queries
+or the database changed. That is 2.32's between-run drift on a real benchmark, at
+a scale that dwarfs every effect this project argues about — which is why the
+comparison table above reads *within* each run, and why "served minus oracle" is
+the row to trust: both of its numbers were measured against each other in the
+same run.
+
+Any cross-run comparison of JOB latencies on this page is worth about as much as
+that 31%.

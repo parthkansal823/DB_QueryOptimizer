@@ -121,6 +121,75 @@ def _is_join_method_hint(hint: str | None) -> bool:
     return bool(hint) and _JOIN_METHOD_RE.search(hint) is not None
 
 
+def rows_without_provable_noops(rows: list[dict]) -> tuple[list[dict], dict]:
+    """
+    Drop rows whose hint the baseline plan proves could not have changed it.
+
+    `Set(enable_mergejoin off)` on a plan with no Merge Join node penalises
+    nothing, so the planner returns the identical plan and the row is a second
+    noisy execution of native wearing a hint. `optimizer/prefilter.py` refuses
+    to plan these and `planner.candidate_hints` runs it, so serving never offers
+    them.
+
+    `app.collect_data` called `generate_candidates` directly and skipped that
+    filter, so it executed and logged them for the project's whole history --
+    **188 of 1,304** servable candidates on the synthetic log, 14.4%. Collection
+    runs the prefilter now; this exists for the rows collected before it did.
+
+    Verified rather than assumed: on the ten queries whose logged oracle was one
+    of these hints, planning with and without gave the same `plan_fingerprint`
+    on **10 of 10**. One recorded 3,561 ms against 787 ms for the identical
+    plan.
+
+    Two things it corrupts, and the second is the one that matters:
+
+      * the **label**. A row whose true ratio is exactly 1.0 carries whatever
+        the executor did that second, so the model learns noise as signal.
+      * the **oracle**. `min()` over noisy draws is biased low, so a candidate
+        that *is* native competes to be the ceiling native is measured against,
+        and wins on **11 of 65** queries.
+
+    The aggregate is small -- the measured ceiling moves 33.2% to 32.9% -- and
+    the per-query effect is not. Reported rather than silent, because a headline
+    that moves when a filter is added should say which filter.
+
+    Needs each query's baseline plan, so it groups first; a query with no
+    baseline row is passed through untouched rather than dropped, on the
+    principle that a missing baseline is a reason to know less, not to discard
+    evidence.
+    """
+    
+    from app.optimizer.prefilter import is_provable_noop
+
+    baselines: dict[str, dict] = {}
+    for row in rows:
+        if row.get("is_baseline") and isinstance(row.get("raw_plan"), dict):
+            baselines.setdefault(row["query_id"], row["raw_plan"])
+
+    kept = []
+    for row in rows:
+        plan = baselines.get(row["query_id"])
+        if (
+            not row.get("is_baseline")
+            and plan is not None
+            and row.get("hint")
+            and is_provable_noop(row["hint"], plan)
+        ):
+            continue
+        kept.append(row)
+
+    dropped = len(rows) - len(kept)
+    return kept, {
+        "filtered": bool(dropped),
+        "dropped_rows": dropped,
+        "kept_rows": len(kept),
+        "reason": (
+            "the baseline plan proves the hint changes nothing, so the row is a "
+            "second execution of the native plan and serving never offers it"
+        ),
+    }
+
+
 def rows_without_disabled_plans(rows: list[dict]) -> tuple[list[dict], dict]:
     """
     Drop rows whose plan carries nodes the planner was forbidden to build.
@@ -561,7 +630,7 @@ def _evaluate_selection(
     So `headroom_captured_vs_oracle`, which is the number `app.retrain` prints
     and the dashboard shows, described an action space no query is given.
     """
-    from app.calibrate import _servable
+    from app.calibrate import _servable, without_provable_noops
 
     selectors = list(POLICIES) + (list(RANKER_POLICIES) if ranker is not None else [])
     per_policy: dict[str, list[float]] = {p: [] for p in selectors}
@@ -580,6 +649,22 @@ def _evaluate_selection(
         # `rows_without_disabled_plans` already ran upstream, but a bundle
         # evaluated on rows from elsewhere should not quietly regain them.
         candidates = [c for c in candidates if not c.get("disabled_nodes")]
+        # And the candidates the baseline plan proves are the baseline.
+        #
+        # These stay in the *training* rows on measurement (see `train`'s
+        # `drop_provable_noops`) -- they anchor the level. They cannot stay
+        # here, because this is where the **oracle** is computed and the oracle
+        # is a `min` over noisy draws: a candidate that is byte-identical to
+        # native competes to be the ceiling native is measured against, and wins
+        # on 11 of 65 queries. One recorded 3,561 ms against 787 ms for the same
+        # plan.
+        #
+        # `planner.candidate_hints` runs the same filter, so this is also the
+        # 2.47 rule -- score the action space a served query is offered -- with
+        # the filter that was missing from it.
+        candidates = without_provable_noops(
+            candidates, baseline_rows[0].get("raw_plan")
+        )
         if not candidates:
             continue
         latencies = [c["actual_total_time_ms"] for c in candidates]
@@ -659,6 +744,27 @@ def train(
     exclude_features: tuple[str, ...] = (),
     drop_constant_features: bool = False,
     rank_on_candidates_only: bool = False,
+    # **Off, and the measurement is the reason.**
+    #
+    # These rows are provably the native plan wearing a hint (2.76 verified the
+    # `plan_fingerprint` identical on 10 of 10), so the argument for dropping
+    # them from *training* is strong: 3,556 rows whose true ratio is exactly 1.0
+    # and whose recorded ratio is whatever the executor did that second.
+    #
+    # Measured over 16 paired splits, dropping them makes the model's typical
+    # multiplicative error **worse on 15 of 16** (sign test p = 0.001) while
+    # doing nothing legible to headroom captured (9/16, p = 0.80, and the
+    # per-split swings run from -52 to +63 points, which is 2.66's range).
+    #
+    # The reading that fits: a row saying "this hint changed nothing, and the
+    # result was 1.0x" is real evidence about the *level*, and the level is what
+    # the gate reads. It is the same shape as 2.70, where removing the baseline
+    # pairs from the ranker cost 4.2 points -- both times the rows that look
+    # like duplicates were anchoring the scale.
+    #
+    # Where they are genuinely wrong is the **oracle**, and that is fixed where
+    # the oracle is computed rather than by deleting the rows.
+    drop_provable_noops: bool = False,
 ) -> dict:
     # Checked before any work: this used to sit beside the write, so an
     # invalid destination was only reported after a full training run.
@@ -684,6 +790,14 @@ def train(
 
     # Before aggregation, so a family that is not served contributes nothing at
     # all -- not even to a median.
+    noop_report = {"filtered": False, "dropped_rows": 0}
+    if drop_provable_noops:
+        rows, noop_report = rows_without_provable_noops(rows)
+    if noop_report["filtered"]:
+        print(
+            f"Dropped {noop_report['dropped_rows']} row(s) whose hint the "
+            f"baseline plan proves is a no-op -- {noop_report['reason']}."
+        )
     rows, disabled_report = rows_without_disabled_plans(rows)
     if disabled_report["filtered"]:
         print(
@@ -987,6 +1101,7 @@ def train(
         "split_seed": split_seed,
         "excluded_features": sorted(exclude_features) or None,
         "dropped_constant_features": dropped_constant,
+        "dropped_provable_noop_rows": noop_report["dropped_rows"],
         "rank_on_candidates_only": rank_on_candidates_only,
         "n_rows_total": len(rows),
         "n_rows_train": len(X_train),

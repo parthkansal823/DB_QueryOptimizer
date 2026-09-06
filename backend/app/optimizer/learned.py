@@ -73,6 +73,32 @@ from app.optimizer.ranker import borda_select
 # than to synchronise it. The compose override is gone; this is the decision.
 DEFAULT_SELECTION_POLICY = "pairwise_rank"
 
+# How much the two selectors disagreeing raises the bar for deviating.
+#
+# `caution` is multiplied by `1 + DISAGREEMENT_CAUTION * disagreement`, so at
+# 0.5 a total disagreement -- the ensemble ranking the ranker's pick last --
+# would ask for half again the usual margin, and agreement changes nothing.
+#
+# **Off, because it cannot currently be measured.** The signal is real: over 384
+# held-out decisions the agree bucket regressed 13% of the time with a worst
+# case of 1.64x against the disagree bucket's 22% and 3.22x (`select_plan` has
+# the table). Swept through the replay it changes nothing at all:
+#
+#     DISAGREEMENT_CAUTION=0.0   z=2.0 gain=0.00   69% deviate, 18% regress, +4.2%
+#     DISAGREEMENT_CAUTION=0.5   z=2.0 gain=0.00   69% deviate, 18% regress, +4.2%
+#     DISAGREEMENT_CAUTION=1.0   z=2.0 gain=0.05   62% deviate, 20% regress, +3.5%
+#
+# Byte-identical at 0.5, and worse at 1.0. The reason is 2.79: the deployed gate
+# has `min_relative_gain = 0`, and `required = 1.0 - min_relative_gain * caution`
+# is 1.0 for *every* caution -- so the whole caution mechanism, this term and the
+# regression guard's unseen-query 2.0 alike, is inert on the condition that
+# decides whether a win is worth taking.
+#
+# So this ships as a mechanism with its measurement attached and its default at
+# zero. Turning it on is a decision to make after `min_relative_gain` is
+# non-zero, not before, and `app.calibrate` now says so when it recommends zero.
+DISAGREEMENT_CAUTION = float(os.getenv("DISAGREEMENT_CAUTION", "0"))
+
 # Policies that live on the ranker rather than on the ensemble, so they are not
 # in `bandit.POLICIES` and every tool that offers a `--policy` has to know about
 # them. Kept here, once, because the list was previously spelled out as a
@@ -284,6 +310,24 @@ class LearnedOptimizer:
             means = calibration.apply(means)
         return means, stds
 
+    def _selector_disagreement(self, means: list[float], chosen: int) -> float:
+        """
+        How far down the ensemble's own ranking the chosen candidate sits.
+
+        0.0 when the ensemble would have picked it too, 1.0 when it ranks it
+        last. See `select_plan` for the measurement that made this a gate input.
+
+        Returns 0.0 whenever there is nothing to disagree about -- a single
+        candidate, or a policy that *is* the ensemble's argmin, where this would
+        otherwise be a constant zero dressed up as a signal. `borda` is a
+        deliberate exception: it consults both and lands between them, so how
+        far its pick sits from the ensemble's is real information.
+        """
+        if len(means) < 2 or self.policy not in RANKER_POLICIES:
+            return 0.0
+        by_mean = sorted(range(len(means)), key=lambda i: means[i])
+        return by_mean.index(chosen) / (len(means) - 1)
+
     def _vectorize(self, candidate_plans: list[dict]) -> list[list[float]]:
         """Feature vectors for `candidate_plans`, shaped for the loaded bundle."""
         return [
@@ -360,17 +404,60 @@ class LearnedOptimizer:
             self.last_decision = {"reason": "no_candidates", "fell_back_to_baseline": True}
             return baseline_plan
 
-        # No model, or no native plan to compare against: fall back to the
-        # old behaviour (heuristic argmin + prospective cost veto).
-        if self.model is None or baseline_plan is None:
+        # **No model: serve native.**
+        #
+        # This used to take the cost argmin over the candidates -- with native
+        # not among them -- and serve it, `fell_back_to_baseline = False`, with
+        # only `_is_unsafe` in the way. On PG18 that veto's cost test can never
+        # fire (see its docstring), so a fresh deployment deviated on **every
+        # query** with nothing checking whether it should.
+        #
+        # Replayed over the 65-query log, that is what it costs:
+        #
+        #     current    1.040x native   deviates 65/65   35% regress   worst 5.32x
+        #     native     1.000x native   deviates  0/65
+        #
+        # A fresh install was slower than doing nothing, and one query ran 5.3x.
+        #
+        # The obvious repair -- deviate only when PostgreSQL costs the candidate
+        # *below* native -- was measured and is **worse**: 1.109x, and **10 of
+        # the 12** deviations it permits regress. That is this project's own
+        # thesis pointed at itself. The cost model's disagreement with reality is
+        # the signal the model exists to exploit, so "the estimate says this is
+        # cheaper" selects for exactly the queries where the estimate is wrong.
+        # Requiring a 10% margin made it worse again (1.111x, 9 of 10).
+        #
+        # So there is no cheap cold-start heuristic here, and the docstring above
+        # already said what to do: "defaulting to native unless there is
+        # *evidence* a hinted plan is better". With no model there is no
+        # evidence. The branch now agrees with the contract it sits under.
+        #
+        # `_select_heuristic` still exists and is still the Phase 0 reference
+        # point every evaluation scores against -- `train._evaluate_selection`
+        # and `app.benchmark` compute it directly from the costs. This is only
+        # about what a live query is served.
+        if self.model is None:
+            if baseline_plan is not None:
+                self.last_decision = {
+                    "policy": "heuristic_min_cost",
+                    "chosen_index": None,
+                    "fell_back_to_baseline": True,
+                    "reason": "no_model_yet",
+                }
+                return baseline_plan
+            # No baseline either, so there is nothing to compare against and
+            # nothing to fall back to. The cost argmin is the only ordering
+            # available.
+            index = self.select(candidate_plans)
+            self.last_decision["chosen_index"] = index
+            self.last_decision["fell_back_to_baseline"] = False
+            return candidate_plans[index]
+
+        if baseline_plan is None:
             index = self.select(candidate_plans)
             chosen = candidate_plans[index]
             self.last_decision["chosen_index"] = index
             self.last_decision["fell_back_to_baseline"] = False
-            if baseline_plan is not None and self._is_unsafe(chosen, baseline_plan):
-                self.last_decision["fell_back_to_baseline"] = True
-                self.last_decision["reason"] = "predicted_regression_vs_native"
-                return baseline_plan
             return chosen
 
         return self._select_against_native(candidate_plans, baseline_plan, caution)
@@ -441,6 +528,41 @@ class LearnedOptimizer:
         best_i = self.select(candidate_plans, vectors=vectors, predictions=(means, stds))
         policy_decision = dict(self.last_decision)
         predicted_ratio = math.exp(means[best_i])
+
+        # A second opinion, spent as caution rather than as a veto.
+        #
+        # 2.63 is the gate's standing weakness: it reads a point prediction, so
+        # a confident wrong one is exactly the input it cannot decline. Two
+        # candidate replacements were measured and rejected -- the ranker's own
+        # margin over the runner-up (Spearman +0.021 against outcome, worst case
+        # in the *widest* bucket) and the ensemble spread (+0.212, and
+        # `uncertainty_scale` says it understates the error 3.2x).
+        #
+        # This is the third, and it comes from 2.71: the ensemble and the ranker
+        # are comparably strong within a query (+0.680 and -0.660) and wrong in
+        # different places, which is why aggregating them beat either. Where
+        # they *agree*, both are saying the same thing; where they disagree, at
+        # least one is wrong and the gate has no way to know which.
+        #
+        # Measured over 384 held-out decisions across 24 splits, bucketed by the
+        # ensemble's rank of the ranker's pick:
+        #
+        #     agree      13% regressed   worst 1.64x
+        #     middling   21% regressed   worst 3.22x
+        #     disagree   22% regressed   worst 2.22x
+        #
+        # Note what it does and does not predict. Spearman against the served
+        # *ratio* is -0.033 -- nothing. It predicts **variance**: the disagree
+        # bucket has both a better median (0.753x) and twice the regression
+        # rate. That is the shape of a risk signal, and bounding risk rather
+        # than maximising the mean is the gate's entire job.
+        #
+        # Spent through `caution` because the veto form was measured too:
+        # 2.71's `consensus` arm bounded the worst case identically and captured
+        # **11 points less**, since every query it refused is headroom left on
+        # the table. Raising the bar is not refusing to clear it.
+        disagreement = self._selector_disagreement(means, best_i)
+        caution *= 1.0 + DISAGREEMENT_CAUTION * disagreement
         # Pessimistic ratio: the worst this plan plausibly is. `caution` scales
         # the bound outward for queries the guard has no history for, under
         # either gate.
@@ -463,6 +585,10 @@ class LearnedOptimizer:
             "pessimistic_speedup_vs_native": upper_ratio,
             "required_speedup": required_ratio,
             "predicted_uncertainty_log": stds[best_i],
+            # 0.0 when the ensemble would have picked the same candidate, 1.0
+            # when it ranks it last. Reported so the dashboard's "why this plan"
+            # panel can say the gate was cautious and why.
+            "selector_disagreement": disagreement,
             "gate": gate_used,
             # The ceiling the pessimistic case has to stay under. Reported so a
             # reader can see which of the two conditions a held plan failed --

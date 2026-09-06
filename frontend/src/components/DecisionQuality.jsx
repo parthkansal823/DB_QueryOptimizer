@@ -9,30 +9,35 @@ const fmtMs = (v) => (v == null ? "-" : v >= 1000 ? `${(v / 1000).toFixed(2)} s`
 // carries the meaning on its own.
 const OUTCOMES = {
   deviated_win: {
+    group: "deviated",
     icon: "✓",
     label: "Paid off",
     color: "good",
     detail: "changed the plan, and the query got faster",
   },
   deviated_wash: {
+    group: "deviated",
     icon: "=",
     label: "No real change",
     color: "neutral",
     detail: "changed the plan, but the difference was too small to matter",
   },
   deviated_loss: {
+    group: "deviated",
     icon: "✕",
     label: "Backfired",
     color: "critical",
     detail: "changed the plan, and the query got slower",
   },
   held_correct: {
+    group: "held",
     icon: "✓",
     label: "Right to hold",
     color: "good",
     detail: "kept PostgreSQL's plan, and nothing faster was available",
   },
   held_missed: {
+    group: "held",
     icon: "!",
     label: "Missed a win",
     color: "warning",
@@ -95,8 +100,24 @@ export default function DecisionQuality({ quality }) {
   if (!quality) return <div className="empty-state">No decisions to grade yet.</div>;
 
   const part = (key) => ({ key, count: quality[key] ?? 0, ...OUTCOMES[key] });
-  const deviated = ["deviated_win", "deviated_wash", "deviated_loss"].map(part);
-  const held = ["held_correct", "held_missed"].map(part);
+  // Derived from OUTCOMES rather than listed again.
+  //
+  // These were two hardcoded arrays, which made this the third place the
+  // backend's five outcome names are spelled out -- after `stats.OUTCOMES` and
+  // `metrics.render`. A sixth outcome would have been dropped here silently,
+  // and worse than silently: the segments within each group are percentages of
+  // that group's own total, so the chart would still add to 100% and look
+  // complete while omitting a category.
+  //
+  // Now adding one means adding one entry to the object above. An outcome the
+  // backend sends that this file has never heard of is surfaced by
+  // `unknown` below rather than discarded.
+  const keys = Object.keys(OUTCOMES);
+  const deviated = keys.filter((k) => OUTCOMES[k].group === "deviated").map(part);
+  const held = keys.filter((k) => OUTCOMES[k].group === "held").map(part);
+  const unknown = Object.keys(quality).filter(
+    (k) => !(k in OUTCOMES) && !k.endsWith("_ms") && typeof quality[k] === "number",
+  );
   const nDeviated = deviated.reduce((s, p) => s + p.count, 0);
   const nHeld = held.reduce((s, p) => s + p.count, 0);
 
@@ -120,6 +141,14 @@ export default function DecisionQuality({ quality }) {
           <div className="stat-sub">wins it passed up</div>
         </div>
       </div>
+
+      {unknown.length > 0 && (
+        <p className="decision-note">
+          Not charted, because this dashboard does not know what they are:{" "}
+          {unknown.join(", ")}. The backend classifies decisions into more
+          categories than this panel renders.
+        </p>
+      )}
 
       <div className="dq-groups">
         <Segments title="When it changed the plan" total={nDeviated} parts={deviated} colors={colors} />

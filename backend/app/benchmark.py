@@ -151,6 +151,31 @@ def run(
                 except Exception:  # noqa: BLE001
                     cur.execute("ROLLBACK TO SAVEPOINT cand")
                     continue
+                # A plan the planner was forbidden to build and built anyway,
+                # under a constraint it could not satisfy.
+                #
+                # `planner.plan_query` drops these from the action space (2.29)
+                # and this loop did not, so the benchmark handed the model
+                # candidates the server never offers. They are not neutral: on
+                # PG18 a disconnected four-table order costs **20.5** against
+                # the correct plan's 6990.8, so they look enormously cheap, the
+                # model picks them, `_is_unsafe` then vetoes the pick -- and the
+                # query is served native, having *lost its deviation entirely*
+                # rather than falling back to the next-best real candidate.
+                #
+                # Measured on a 65-query deploy run: 43 queries served native
+                # after a veto, and **36 of them had both gate conditions
+                # satisfied** -- predictions of 0.55x to 0.77x with pessimistic
+                # bounds under 1.0. That is the whole of the gap between the
+                # 69% deviation rate the calibration promised and the 32% the
+                # benchmark observed (2.83).
+                #
+                # Fourth place this action space has diverged from serving's,
+                # after the calibration replay (2.47), `retrain._score_bundle`
+                # and `train._evaluate_selection` (2.76) -- and the only one of
+                # the four that produces the published headline.
+                if plan.get("disabled_nodes"):
+                    continue
                 fingerprint = plan_fingerprint(plan)
                 if fingerprint in seen_plans:
                     continue
@@ -220,6 +245,24 @@ def run(
                     {"native": baseline, "served": served_plan, "oracle": best_plan},
                     paired_reps,
                 )
+                # And re-take the minimum over the arms that were re-timed.
+                #
+                # `best_plan` is the argmin of a **single** noisy pass, so its
+                # median under re-timing is not necessarily the smallest of the
+                # three. Without this the invariant `best <= native` breaks and
+                # a query can report negative headroom -- which showed up as the
+                # curated subset claiming 411 ms of headroom inside a workload
+                # total of 392, an arithmetic impossibility that is how it was
+                # found.
+                #
+                # What this is now: the best of the three arms actually
+                # re-timed, which is a *lower bound* on the true oracle rather
+                # than the oracle. Re-timing every candidate would give the real
+                # thing and costs 15 executions a query instead of 3. The
+                # single-pass oracle is not the alternative -- it is a minimum
+                # over fifteen noisy draws and biased low by construction, which
+                # is the whole reason for this protocol.
+                best = min(best, native_ms, served_ms)
 
             native_total += native_ms
             served_total += served_ms

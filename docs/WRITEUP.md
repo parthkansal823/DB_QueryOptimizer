@@ -5191,6 +5191,11 @@ running server what it would tell a browser.
 
 ## 2.55 JOB: from nothing to within 1% of the oracle
 
+> **Superseded by 2.80.** The 99.2% here was measured against a ceiling 27 ms
+> below the served plan. Re-collected under the wide action space the same model
+> serves the same plans and captures **91.0%**, because the ceiling dropped
+> 176 ms. Read that section with this one.
+
 `docs/JOB_RESULTS.md` has stood for most of this project's life as its most
 useful result and its worst one: on the real Join Order Benchmark, **75% of the
 latency provably available and none of it captured**. Every selector returned
@@ -5302,6 +5307,9 @@ candidates hit the 120 s statement timeout. Eight held-out queries is more than
 two and still few.
 
 ## 2.56 The ceiling was the problem, not the aim
+
+(2.80 re-measured this under the wide space: 91.0%, with the served latency
+unchanged. The paragraph below is what predicted it.)
 
 2.55 reports the model capturing **99.2%** of the available headroom on JOB, and
 that framing invites the wrong conclusion: that selection is finished and the
@@ -5966,6 +5974,13 @@ the model cannot yet reach it safely, which is a better problem than the one in
 
 ## 2.64 A model trained on six tables ranks plans on twenty-one
 
+> **Superseded by 2.86 — and not only the levels.** Re-run on the wide action
+> space, the carried model captures **−5.3%**: it serves JOB 4% *slower* than
+> doing nothing, against a local model's 96.5%. The comparison this section is
+> built on does not survive. What does: the carried model still beats random
+> selection by 22 points, so the structural features carry real signal — just
+> not enough to clear native.
+
 `README` claims this works on any PostgreSQL database, and the evidence has
 always been that the *pipeline* runs anywhere -- schema discovery, workload
 generation, training. Whether a trained model carries across schemas was never
@@ -6275,8 +6290,13 @@ The policy axis is decisive and the action-space axis is not. `pairwise_rank`
 is nearly **four times** `greedy` and thirty times `risk_averse`, which is
 2.43's result reproduced on a wider action space and a bigger workload.
 
-Adding `resource` or `join_method` moves the served total by **0.0 ms**. Adding
-`scan_method` costs **0.50 points**.
+Adding `resource` moves the served total by **0.0 ms**. Adding `scan_method`
+costs **0.50 points**.
+
+**The `join_method` row is not a measurement**, and 2.75 is why: the log holds
+no join-method rows, so that arm was a copy of the `none` arm and the tie was
+arithmetic rather than evidence. The sweep now says which families it could not
+score instead of scoring them as worthless.
 
 ### JOB, 8 held-out queries
 
@@ -6745,3 +6765,1356 @@ not run.
 
 They all read `learned.RANKER_POLICIES` now, and `tests/test_borda.py` asserts
 that each of the six scores `borda` *as borda* rather than as the plain ranker.
+
+### And the sweep does not recommend it
+
+That wiring is what makes the next paragraph possible, so it earned itself
+immediately. With `borda` in the grid, `app.autotune` swept 40 configurations
+and put it **second**:
+
+| policy | extra families | net | deviates | regresses | worst |
+|---|---|---|---|---|---|
+| `pairwise_rank` | `resource` | **+4.3%** | 81% | 15% | 1.19x |
+| `pairwise_rank` | none | +4.2% | 69% | 18% | 1.19x |
+| `borda` | `resource` | +2.9% | **44%** | **14%** | **1.00x** |
+| `greedy` | none | +0.0% | 6% | 0% | 1.00x |
+
+The two measurements are not in conflict; they answer different questions. The
+table above is **gated**, and the 63.0% figure is what the selector does when
+allowed to act on every query. Borda deviates on 44% where the ranker deviates
+on 81%, and every query it declines is headroom it does not collect.
+
+Which is the same trade the `consensus` arm lost on, arriving from the other
+direction -- and it says the binding constraint has moved. Borda is the better
+*selector* and the gate will not authorise it, because the gate reads the
+ensemble's point prediction for whichever candidate is put forward, and borda's
+picks are compromises: rated well by both selectors, rated extreme by neither.
+A gate thresholded on predicted gain systematically under-authorises exactly the
+candidates that aggregation was introduced to find.
+
+So `borda` ships as an option, off, with its number written down. Promoting it
+needs the gate to read something other than a point estimate, which is the item
+2.63 raised and nothing has yet done.
+
+### A tenth of a point is not a reason to widen the action space
+
+The same run recommended exporting `INCLUDE_TUNING=1`, on **4.3% against 4.2%**.
+
+`MIN_POLICY_SWITCH_POINTS` already refuses that for the policy axis -- it exists
+because this tool once recommended a policy switch on 0.8 points, two lines after
+printing that a difference that size was inside its own spread. The action space
+had no such guard, and it has the same property: turning a family on widens what
+collection must execute and what the model must score, and 2.63 measured a wider
+space raising the ceiling and the risk together. 2.67 measured this exact family
+at 0.0 ms.
+
+Same floor now applies to both, read from `planner`'s own flags so "the
+incumbent" means what runs rather than what a constant says runs.
+
+## 2.72 Eighty-five percent of a random workload has nothing to win
+
+Every capture figure this project reports is measured on a workload that was
+screened. `app.workload_generator` produced 45 candidates and 27 survived
+vetting, on three rules:
+
+    native under 8 ms       affordability -- a percentage of nothing
+    native over 900 ms      affordability -- collection becomes unaffordable
+    headroom under 8%       selection on the outcome
+
+The first two bound what is practical to measure. The third selects queries by
+the answer, and a capture ratio computed over its survivors is conditioned on
+there having been something to capture.
+
+`app.benchmark` has reported the effect for a while -- the gap between the
+screened group and the hand-written one, most recently **+14.8 points** -- but
+both of those groups were written by a person, so both carry somebody's idea of
+an interesting query and only one of them admits it. `app.selection_effect`
+removes the third rule instead: draw generated queries, keep everything
+affordable, and look at the distribution.
+
+Forty queries, all of them affordable:
+
+| group | n | mean headroom | median |
+|---|---|---|---|
+| everything | 40 | **3.2%** | **0.0%** |
+| kept by the >=8% filter | **6** | 16.0% | 13.8% |
+| rejected by it | 34 | 0.9% | 0.0% |
+
+**Six of forty.** The median generated query has *zero* headroom -- native is
+already the fastest plan the whole action space reaches. By latency rather than
+by query, 3.6% of all the generated latency is reachable against 14.8% of the
+filtered subset's.
+
+**Selection effect on generated queries: +12.8 points**, and it is not a
+correction to apply to the headline. It is the headline's population.
+
+### This is the same finding as the extended statistics
+
+2.57 measured three `CREATE STATISTICS` statements removing 98% of the
+opportunity on the queries this schema was built around. This measures 85% of a
+random draw having no opportunity to begin with. Different mechanisms, one
+conclusion: **the queries where a learned plan-picker earns anything are rare,
+and finding them is most of the work.**
+
+That is not a reason not to build one. A 40% improvement on 15% of a workload is
+a real 6%, and the queries in question are usually the slow ones -- the 3.2%
+mean is dragged down by a long tail of queries that were already fast. It is a
+reason to be exact about which number is being quoted, which is why
+`app.benchmark` leads with the figures nobody selected for.
+
+### So `data/extended_stats.sql` ships, and not in `schema.sql`
+
+The decision this leaves is whether the bundled schema should create the
+extended statistics. Both answers are defensible and they answer different
+questions:
+
+- **On a real database, run them.** Three statements beat this entire project on
+  cost, coverage and risk: they fix every query against those columns forever,
+  including ones the optimizer never sees, and they cannot regress a query the
+  way a wrong hint can. Any honest recommendation puts this first, and
+  `app.advisor` already generates them for an arbitrary schema.
+- **In the bundled demo, do not.** A layer that corrects the optimizer cannot be
+  evaluated on a workload the optimizer already gets right. With statistics on,
+  headroom is 0.4% and the benchmark measures noise.
+
+So they ship as `data/extended_stats.sql` -- one command, reversible -- with the
+trade-off written at the top of the file and in the README rather than left for
+someone to discover. The dishonest version of this project is the same code with
+that file deleted and the paragraph unwritten.
+
+## 2.73 A gate belongs to a model, not to a path
+
+`models/gate.json` has recorded its provenance since 2.50 -- the policy it was
+swept under, the action space, the moment it was applied -- and
+`app.diagnostics` compares each against what the server actually does. Those
+checks were built after 2.43, where a gate calibrated under `greedy` was served
+alongside a `pairwise_rank` selector and the two differed in *sign* on held-out
+queries.
+
+After 2.69's promotion, diagnostics reported:
+
+```
+  swept under policy  : pairwise_rank
+  server selects with : pairwise_rank
+  swept over families : cardinality, join_order, operator_toggle
+  server offers       : cardinality, join_order, operator_toggle
+=== findings ===
+  [medium] uncertainty_understated
+  [medium] error_comparable_to_headroom
+```
+
+Green on both drift checks. Two lines above, in the same output:
+
+```
+  calibrated on       : 15 queries
+```
+
+The deployed model held out **16**. The gate belonged to its predecessor.
+
+### Why every check passed
+
+`calibrated_against_bundle` records **`models/plan_selector.pkl`**. That is a
+path, and `model_store.promote()` writes a new model to the same path. The field
+was true before the promotion and true after, and it stopped describing the same
+object somewhere in between.
+
+The policy check passed because the policy did not change. The families check
+passed because the action space did not change. Nothing compared the *model*,
+because the only thing recorded about it could not change.
+
+This is 2.65's shape again -- a defensible field doing less than its name says --
+with the twist that the field was added specifically to catch this class of
+problem and was defeated by an aliasing question nobody asked.
+
+### The fix
+
+`calibrate.bundle_identity` digests the feature columns, the sorted held-out
+list and the target: the things a threshold's validity actually depends on.
+Twelve hex characters, stamped into the gate on `--apply`, compared by
+`app.diagnostics` against the bundle it is reporting on.
+
+Not the pickle bytes, which are not stable across library versions, and not a
+timestamp, which would flag a re-calibration of an unchanged model as drift.
+
+A gate file written before the field existed reports **low: this cannot be
+checked** rather than passing silently. Absent is not the same as matching, and
+reporting green on an unanswerable question is the failure this section is
+about.
+
+### And a second one fell out of it
+
+Re-running `python -m app.calibrate --apply` to fix the drift produced:
+
+```
+  swept over families : None
+```
+
+`app.autotune --apply` records `calibrated_with_families` and
+`app.calibrate --apply` did not. Two entry points write the same file, one of
+them stamps a field the other omits, and using the simpler tool erased a drift
+check that had been working -- silently, because an absent field read as "no
+information" rather than as a regression.
+
+Both routes stamp both fields now, and `tests/test_gate_provenance.py` counts
+the occurrences rather than trusting the next person to remember. The served
+gate has been re-calibrated against the model actually deployed:
+
+```
+calibrated_on_n_queries    : 16
+calibrated_with_policy     : pairwise_rank
+calibrated_with_families   : cardinality, join_order, operator_toggle
+calibrated_against_model   : 78ae980a7ab9
+```
+
+## 2.74 A flag with a paragraph of documentation and no effect
+
+Thirteen `INCLUDE_*` environment variables widen the action space. Each is two
+mentions in `planner.py` -- a definition and one read -- which is what a working
+flag and a dead one both look like from the outside.
+
+So: switch all thirteen off, switch each on alone, count what it generates.
+
+```
+all flags off: 20 hints
+
+flag                          new hints                 families they add
+INCLUDE_BUSHY                         1                      join_order:1
+INCLUDE_COST_MODEL                    7                        resource:7
+INCLUDE_DISABLE_INDEX                 0                                 —
+INCLUDE_ENABLE_SETTINGS               3                 operator_toggle:3
+...
+INCLUDE_TUNING                        6                        resource:6
+```
+
+`DisableIndex(alias index)` asks the planner to search as though an index had
+been dropped. It arrived with the PostgreSQL 18 upgrade, has a
+twenty-line docstring recording that the two-argument form is required and how
+each version fails differently, and a measurement showing a query going from an
+8.4-cost index scan to a 4,059-cost sequential scan under it.
+
+It generated nothing. Not an error, not a warning -- zero candidates.
+
+### Why
+
+Both index families need the alias-to-index catalog map, and one function builds
+it:
+
+```python
+if not INCLUDE_INDEX_PINNING or cur is None:
+    return None
+```
+
+`generate_candidates` then calls the DisableIndex generator only
+`if include_disable_index and table_indexes`. With pinning off the map was
+`None`, so the second family was silently switched off by the first flag's
+absence. The docstring even explains the guard -- "missing either the flag or
+the cursor means the family generates nothing" -- and that sentence was written
+about index *pinning*, while the code it describes governed two families.
+
+This is 2.53's shape: a setting with documentation and no effect. And it is
+worse than a dead flag, because `app.autotune` prices a family by switching it
+on and replaying (2.67). A family that generates nothing when switched on is one
+the sweep is *obliged* to report as worthless, with a number attached.
+
+### The fix has an inverted twin, and it nearly shipped
+
+Building the map for either flag is one line. It would also have introduced the
+mirror-image bug, because the pinning generator was gated on nothing at all:
+
+```python
+if table_indexes:
+    candidates += generate_index_candidates(table_indexes)
+```
+
+That was correct exactly while the map's existence *was* the pinning flag. Make
+the map available to a second family and asking for `DisableIndex` silently
+delivers index pinning too -- one flag, two families, the same class of error
+pointing the other way. `include_index_pinning` is now an explicit parameter,
+defaulting to `True` so that callers passing a map and no flag keep meaning
+"pin".
+
+### Two more fell out of it
+
+**`tests/test_family_guard.py` failed, and was right.** It compares the family
+switches serving forwards against the ones collection forwards, because a model
+trained on a family the server does not offer is 2.9's train/serve skew. The new
+parameter defaults to True, so `app.collect_data` -- which passes the map --
+would have collected a family serving gates off. A guard written for one
+specific mistake caught its recurrence in a place nobody was looking.
+
+**`app.audit_binding`'s "FULL action space" was not full.** It answers "did every
+hint the optimizer generates actually bind?", which exists because
+pg_hint_plan reports a rejected directive at `INFO` severity and the default
+`client_min_messages` discards it (2.20). Its `FULL` dict listed eleven family
+switches and not `include_disable_index` -- so the family whose keyword did not
+exist before pg_hint_plan 1.8.1, the single most likely one to be silently
+rejected, was never audited. `family_of` did not recognise `DisableIndex(`
+either, and would have labelled it a join order.
+
+Both fixed: 5,754 candidates audited before, **5,884** now, and all of them
+bind.
+
+### The pattern
+
+Three tools in this project prove a family works: the sweep prices it, the audit
+proves its hints bind, and the guard proves collection and serving agree about
+it. All three were running. All three reported success on a family that could
+not be switched on, because each was answering a narrower question than its name
+implies -- and the flag test that found it took twenty lines and had never been
+written.
+
+## 2.75 The sweep could not see two of the eight families
+
+`app.autotune`'s action-space axis is built from two lists:
+
+```python
+ALWAYS_ON         = {"join_order", "operator_toggle", "cardinality"}
+OPTIONAL_FAMILIES = ("resource", "join_method", "scan_method")
+```
+
+`hint_family` names **eight** families. `memoize` and `parallel` are in neither
+list, and `calibrate._servable(candidates, allowed=space)` drops every candidate
+whose family is not in the set it is handed.
+
+So with `INCLUDE_MEMOIZE=1`, the server offers the family, **every arm of the
+sweep silently excludes it**, and the tool recommends a gate calibrated against
+a narrower action space than the one being served.
+
+That is 2.47's finding, in the tool written after 2.47 to prevent it. The two
+lists that had to agree -- `hint_family`'s vocabulary and this tuple -- were
+four hundred lines apart in different files, and nothing compared them.
+
+### Completing the axis is not free, so it is derived instead
+
+Five optional families is 32 subsets against 8, and 32 spaces x 5 policies x the
+threshold grid is four times the work -- much of it comparing an arm against an
+identical copy of itself, because a family with no rows in the log scores
+exactly like the space without it.
+
+`available_families()` reads the families actually present in the rows being
+scored and sweeps only those. On the current log:
+
+```
+all optional families : ('resource', 'join_method', 'scan_method', 'memoize', 'parallel')
+present in the log    : ('resource', 'scan_method')
+skipped (no rows)     : ('join_method', 'memoize', 'parallel')
+spaces the axis tries : 4   (was 8)
+```
+
+Complete **and** cheaper than the incomplete version it replaces.
+
+### Which corrects 2.67
+
+That section reported, from the same sweep:
+
+| policy | extra families | net |
+|---|---|---|
+| `pairwise_rank` | none | +5.27% |
+| `pairwise_rank` | `join_method` | +5.27% |
+
+and read the identical figures as the family earning nothing. It earned nothing
+because **there were no join-method rows in the log**. The sweep was comparing
+an arm against a copy of itself and reporting the tie as a measurement.
+
+The report now says so:
+
+```
+not on the axis -- no rows in the log to score them: join_method, memoize,
+parallel. Collect with the family on before reading anything into its absence;
+a family with no rows scores identically to the space without it, which is not
+a measurement of the family.
+```
+
+"Not measured" and "measured worthless" are different answers. 2.67's verdict on
+`resource` and `scan_method` stands -- those families are in the log. Its
+verdict on `join_method` was never a verdict.
+
+### Two more, one of them mine
+
+**`families_env` covered three families.** It turns the winning action space into
+the environment variables to export, and it hardcoded the same three. A sweep
+that can recommend `memoize` and then prints instructions that leave it off is
+worse than one that never sweeps it -- which is what
+`tests/test_autotune.py::test_the_families_map_back_to_the_environment_that_produces_them`
+had been written to forbid, and it failed the moment the axis grew. A test
+written for one specific mistake, catching its recurrence two years of commits
+later.
+
+**And the new function repeated 2.70's mistake within the hour.** It began as
+
+```python
+from app.calibrate import _grouped_rows
+```
+
+which copies the function object into this module's namespace. Every test in
+`test_autotune.py` supplies its rows by replacing `calibrate._grouped_rows`, and
+so does `sweep`. The copied binding ignored both -- so the axis would have been
+derived from the real database while being scored against the stub, and the test
+suite went from 14 seconds to 99 while quietly measuring the wrong thing.
+
+The symptom was runtime. The bug was the same question 2.70 raised and this file
+had already written down: **which population is this computed over?** Calling it
+through the module fixes it, and matching `sweep`'s keyword-argument convention
+was needed too -- same function, same argument, different calling convention is
+enough to miss a substitution.
+
+## 2.76 The same rows are good training data and a false ceiling
+
+`optimizer/prefilter.py` refuses to plan candidates the baseline plan *proves*
+cannot change it -- `Set(enable_mergejoin off)` on a plan with no Merge Join
+node. `planner.candidate_hints` runs it. `app.collect_data` calls
+`generate_candidates` directly and does not.
+
+So collection has, for the project's whole history, executed and logged
+candidates serving never offers: **188 of 1,304** servable candidates on the
+synthetic log, **14.4%**.
+
+### The first reading was wrong
+
+The obvious way to find this is to ask whether the prefilter ever drops a
+*winner*, and the answer looked alarming: on **10 of 62** queries with a real
+win, the winning hint was one the prefilter would have refused to plan --
+`ctl_3w_recent` at 38.0% headroom, `gen_17_3w` at 34.2%.
+
+Read one way that says the prefilter is too aggressive and has been costing
+measured headroom. So: execute it. Plan each of the ten with and without the
+hint and compare `plan_fingerprint`.
+
+```
+query                         plan changes?  native ms  hinted ms   ratio
+gen_16_3w                                no     3561.8      787.1   0.22x
+ctl_supplier_rating                      no       26.9       20.3   0.76x
+corr_brand_band                          no      137.5      143.5   1.04x
+...
+the plan changed on 0/10 of them.
+```
+
+**Zero.** The prefilter's premise is exactly right -- `enable_X = off` only
+penalises plans containing X, so a plan without X stays cheapest and comes back
+byte-identical. What the log calls a 78% win on `gen_16_3w` is 3,561 ms and
+787 ms for **the same plan**, which is a cache effect with a hint attached.
+
+The finding inverts: the prefilter is sound, and the log's oracle is
+contaminated.
+
+### The oracle is a minimum over noisy draws
+
+`min()` is biased low even when every individual timing is unbiased, so a
+candidate that *is* native competes to be the ceiling native is measured
+against -- and wins on **11 of 65** queries, 16.9%.
+
+| ceiling | total | headroom |
+|---|---|---|
+| native | 10,206 ms | — |
+| oracle as logged | 6,815 ms | **33.2%** |
+| oracle over real candidates | 6,852 ms | **32.9%** |
+
+The aggregate is 0.4 points. The per-query effect is 78%.
+
+### And then the fix was wrong too
+
+Dropping the rows is one line, and it is the obvious conclusion: they are
+duplicate native measurements, serving never offers them, 2.9 says train on what
+you serve.
+
+Sixteen paired splits:
+
+| | mean | better on | sign test |
+|---|---|---|---|
+| typical multiplicative error | **+0.015** | **1/16** | **p = 0.001** |
+| `pairwise_rank` captured | +1.8 | 9/16 | p = 0.80 |
+| `greedy` captured | -1.2 | 7/16 | p = 0.80 |
+
+Dropping them makes the model **worse**, significantly, and does nothing legible
+to headroom captured -- the per-split swings run from -52 to +63 points, which
+is 2.66's range rather than a signal.
+
+The reading that fits: a row saying "this hint changed nothing, and the result
+was 1.0x" is real evidence about the **level**, and the level is what the safety
+gate reads. It is 2.70 again -- removing the ranker's baseline pairs cost 4.2
+points for the same reason. Both times the rows that looked like duplicates were
+anchoring the scale.
+
+### Where it actually belongs
+
+The rows are legitimate training data and an illegitimate ceiling, so the filter
+goes where the ceiling is computed and nowhere else:
+
+- `app.collect_data` keeps collecting them, with the measurement written where
+  the decision is, so the next reader does not "fix" it.
+- `train.train(drop_provable_noops=False)` -- the option exists so the claim
+  above is a paired measurement rather than a code diff.
+- `train._evaluate_selection` drops them before computing the oracle, alongside
+  the 2.47 filters it already runs.
+
+Three defaults in this project are now set *against* a good argument by a
+measurement that contradicted it: `rank_on_candidates_only`, the `has_hint`
+ablation, and this. Each carries its numbers in a comment at the point of
+decision, because the argument for changing them will look just as good next
+time.
+
+### And it was fixed in one place out of three
+
+`_evaluate_selection` got the filter. Two other functions compute a *best
+available* over the same pool:
+
+| | quantity | contaminated? |
+|---|---|---|
+| `train._evaluate_selection` | the oracle every capture ratio divides by | yes |
+| `retrain._score_bundle` | `worst_ratio_vs_best`, which rejected two challengers today | yes |
+| `calibrate.evaluate_setting` | the gate's net improvement per deviation | yes |
+
+Measured on the promotion yardstick specifically: **11 of 65** queries have a
+phantom ceiling, and the champion's worst ratio moves **1.48x to 1.45x**. Small
+enough not to have changed today's verdict, and it decided a promotion.
+
+That is 2.47 exactly -- an action-space filter present in one scorer and absent
+from the others -- found then in three places and fixed three times. So this one
+lives in a single function, `calibrate.without_provable_noops`, and
+`tests/test_oracle_noops.py` asserts each of the three calls it and that nobody
+grows a second copy.
+
+## 2.77 A block that can never lift
+
+`planner.plan_query` carries this, above the query-level block:
+
+> A blocked query never runs the learned path again, so it accumulates no
+> evidence about it. The block then lifts purely because the old evidence ages
+> out of `evidence_since()`, and the query is retried with whatever model is
+> deployed -- having learned nothing in between. **That is a timer, not a
+> decision.**
+
+Shadow execution is the fix: a sampled fraction of blocked requests plans the
+learned path anyway, executes it for measurement, and never serves it. The
+argument is exactly right and it was applied to one of the two kinds of block.
+
+### Family blocks are a ratchet
+
+The guard blocks whole *queries* and it blocks hint *families* on a query
+(`allowed_hints`). For families, the same reasoning produces a closed loop:
+
+1. a family regresses on a query, so it is blocked;
+2. `plan_query` calls `guard.allowed_hints` and the family is removed from the
+   action space -- **including on the shadow path**, which called it
+   unconditionally;
+3. so the family is never planned, by any path, so it produces no row;
+4. so nothing can ever clear it.
+
+The block lifts only when the regressing rows age out of the evidence window. A
+timer, not a decision -- twenty lines below the sentence saying so.
+
+### And the evidence would have been invisible anyway
+
+Two SQL strings decide what counts as evidence:
+
+```sql
+REGRESSION_SQL         WHERE (is_chosen OR selector_used = 'shadow')
+FAMILY_REGRESSION_SQL  WHERE is_chosen
+```
+
+So even a shadow row carrying a blocked family -- which step 2 made impossible,
+but had it not -- would not have been counted by the thing that blocks families.
+
+Two independent halves of the same mistake, and **either one alone leaves the
+ratchet intact**. That is why it survived: fixing the visible half would have
+changed nothing observable and looked like the wrong diagnosis.
+
+### Latent, and that is why it is here
+
+The guard currently holds **zero** family blocks and the log **zero** shadow
+rows inside the evidence window. Nothing has been affected.
+
+Which is the point. A block that never lifts and a block that lifts slowly are
+indistinguishable until somebody waits, and the evidence window is measured in
+days. The failure mode is a family quietly excluded from a query's action space
+forever, on evidence from one bad afternoon -- and every measurement of that
+query afterwards reporting a smaller ceiling, correctly, for a reason nobody
+would think to look for.
+
+### The fix, both halves
+
+`plan_query` skips `allowed_hints` when `bypass_block` is set, so the shadow
+path plans blocked families; `FAMILY_REGRESSION_SQL` counts shadow rows, so it
+can see them. `bypass_block` is passed by exactly one caller, asserted by a
+test, because a fix that also released the brake would be worse than the
+ratchet.
+
+Moving `SHADOW_SELECTOR` above the first query that interpolates it was needed
+too -- it had been declared beside the query that used it, which was fine while
+only one did.
+
+## 2.78 Two definitions of "which query is this", one comment saying they agree
+
+`logging_store.query_fingerprint` carried this:
+
+> Must stay in sync with `QUERY_KEY_SQL` below, which reproduces this same id in
+> SQL for rows written before ids were assigned.
+
+The two rules:
+
+```
+python:  query_template(sql) if GROUP_BY_TEMPLATE else whitespace(sql)
+sql:     regexp_replace(btrim(sql_text), '\s+', ' ', 'g')
+```
+
+The SQL reproduces the `GROUP_BY_TEMPLATE = False` branch. The setting defaults
+to **True**, and on that branch `query_template` also strips literals and
+`/*+ ... */` hints. So on the default configuration:
+
+| | python | sql |
+|---|---|---|
+| same template, different literal | same | **different** |
+| a query against its hinted form | same | **different** |
+| whitespace only | same | same |
+
+Two of three.
+
+### Latent, and it stays that way deliberately
+
+`COALESCE` prefers the recorded `query_id`, so the fallback only decides how
+rows *without* one are grouped -- and there are **0 of 33,634**. Nothing is
+affected today.
+
+The obvious fix is to implement `query_template` in SQL. That was considered and
+rejected, and the reason is the rest of this section of the writeup: 2.75 was
+two family lists that had to agree and stopped, 2.76 was one filter in three
+scorers, 2.77 was two SQL predicates deciding what counts as evidence. Adding a
+second implementation of *query identity* -- a pair of Python regexes,
+transliterated -- to close a path nothing currently takes would be buying the
+exact failure mode this night was spent removing.
+
+So the comment is corrected instead. It now says which branch the fallback
+implements, gives the three cases and their answers, records that it is
+unreachable today and what would make it reachable, and points at
+`tests/test_query_key_fallback.py`, which pins both the agreements and the
+disagreements.
+
+### The part worth generalising
+
+A wrong comment is worse than no comment, and specifically worse in a way that
+compounds: **it is the reason nobody checks.** "Must stay in sync with X" reads
+as an invariant somebody is maintaining. Four sections of this writeup were
+found by asking whether two things that must agree still do, and this one had a
+note asserting the answer.
+
+The rule that would have caught it is the one 2.70 arrived at from the other
+direction -- *which population is this computed over?* -- applied to a claim
+rather than to code.
+
+## 2.79 The recommended threshold switched off the safety mechanism
+
+2.63 left the gate's standing weakness open: it reads a point prediction, so a
+confident wrong one is exactly the input it cannot decline. Three replacements
+have now been measured.
+
+| input | signal | verdict |
+|---|---|---|
+| the ranker's margin over the runner-up | Spearman **+0.021**, worst case in the *widest* bucket | not built (2.71) |
+| the ensemble's spread | +0.212, and it understates the error 3.2x | not built |
+| **the two selectors disagreeing** | see below | built, defaulted off |
+
+### Disagreement predicts variance, which is what a gate is for
+
+2.71 found the ensemble and the ranker comparably strong within a query (+0.680
+and -0.660) and wrong in different places, which is why aggregating them beat
+either. So where they *agree*, both say the same thing; where they disagree, at
+least one is wrong and the gate cannot tell which.
+
+Bucketed by the ensemble's rank of the ranker's pick, over **384** held-out
+decisions across 24 splits:
+
+| | n | median x native | regressed | worst |
+|---|---|---|---|---|
+| agree | 129 | 0.813x | **13%** | **1.64x** |
+| middling | 126 | 0.858x | 21% | 3.22x |
+| disagree | 129 | **0.753x** | **22%** | 2.22x |
+
+Spearman against the served ratio is **-0.033** -- nothing. It does not predict
+whether the plan will be faster. It predicts *how sure you can be*: the disagree
+bucket has the **best** median and twice the regression rate. Bounding that,
+rather than maximising the mean, is the gate's entire job.
+
+Spent as `caution` rather than as a veto, because the veto form was measured in
+2.71: `consensus` bounded the worst case identically and captured **11 points
+less**, since every query it refuses is headroom left on the table.
+
+### And it does nothing, for a reason worth more than the feature
+
+Swept through the replay:
+
+```
+DISAGREEMENT_CAUTION=0.0   z=2.0 gain=0.00   69% deviate, 18% regress, +4.2%
+DISAGREEMENT_CAUTION=0.5   z=2.0 gain=0.00   69% deviate, 18% regress, +4.2%
+DISAGREEMENT_CAUTION=1.0   z=2.0 gain=0.05   62% deviate, 20% regress, +3.5%
+```
+
+Byte-identical at 0.5, worse at 1.0. The reason:
+
+```
+required = 1.0 - min_relative_gain * caution
+```
+
+The deployed gate has **`min_relative_gain = 0`**. At zero that expression is
+1.0 for *every* caution — so the whole caution mechanism is inert on the
+condition that decides whether a win is worth taking. Not just this new term:
+the regression guard's **2.0** for a query it has no history for, documented at
+length, with 2.18's 96% veto rate as the story of getting it wrong. Only the
+downside ceiling still responds to caution.
+
+`calibrate.py`'s own docstring makes exactly this argument about the other knob
+— "a gate with `z=0` also multiplies the model's uncertainty by zero, so the
+safety mechanism was, in effect, switched off" — and nobody made it for
+`min_relative_gain`. `_dominates` prefers a higher gain among *equals*, and zero
+won outright on net improvement, so the tie-break never engaged.
+
+**It was deployed earlier the same night**, by a `calibrate --apply` run in this
+session fixing 2.73's stale gate. The previous gate had `min_relative_gain =
+0.02`.
+
+### What shipped
+
+The sweep now says so when it recommends zero, in the recommendation itself
+rather than in a docstring. The disagreement term ships as a mechanism with its
+measurement attached and its default at **0**, because a term that multiplies an
+inert quantity cannot be evaluated — turning it on is a decision to make after
+`min_relative_gain` is non-zero, not before. `calibrate.evaluate_setting`
+computes the same quantity the served gate does, so the sweep is not recommending
+thresholds for a system nobody runs (2.43), and a test pins the two together.
+
+The general shape: a sweep optimises what it measures, and "this setting makes a
+different safety mechanism inert" is not in its objective. Three of the four
+knobs interact and the grid treats them as independent.
+
+## 2.80 99.2% was a statement about the action space
+
+`docs/JOB_RESULTS.md` has led with **99.2% of available headroom captured** on
+the Join Order Benchmark since the narrow-space collection. 2.56 widened the
+action space, found the ceiling moving under it on the queries collected so far,
+and left the headline flagged as stale. Re-collecting all 30 JOB queries under
+the wide space took **8h 22m** and 3,100 rows.
+
+Same model class, same 8 held-out queries, same split seed:
+
+| | old (narrow) | new (wide) | change |
+|---|---|---|---|
+| native | 3,960 ms | 2,715 ms | −1,246 |
+| oracle (ceiling) | 696 ms | **520 ms** | **−176** |
+| served by `pairwise_rank` | 723 ms | **718 ms** | **−5** |
+| served **minus** oracle | 27 ms | **198 ms** | **+171** |
+| captured | **99.2%** | **91.0%** | −8.2 |
+
+### The model did not get worse. It did not change at all.
+
+Served latency moved **5 ms**, which is nothing. The same model picks the same
+plans and delivers the same result. What moved is the ceiling: 176 ms of plan
+quality that did not previously exist, of which the model captured **none**.
+
+So 99.2% was never a measurement of how well the model chooses. It was a
+measurement of how little there was to choose between: the best plan in the
+narrow space was **27 ms** better than the one being served, and capturing 99.2%
+of 27 ms is easy. Widen the space by 176 ms and the same behaviour reads 91.0%.
+
+This is the failure mode the oracle column exists to prevent, arriving through
+the oracle column. A capture ratio is a fraction of an opportunity, and reporting
+it without the size of the opportunity lets a narrow action space masquerade as a
+good model -- which is exactly what 2.55 said about `5b` ("a query where no
+candidate beats PostgreSQL. That was true of the narrow action space") applied to
+the headline.
+
+### And native moved 31%
+
+3,960 ms to 2,715 ms for the same eight queries. Nothing about the queries or the
+database changed; this is 2.32's between-run drift, on a real benchmark, at a
+scale that dwarfs every effect this project argues about. It is why the table
+above compares *within* each run and why the served-minus-oracle row is the one
+to read: both numbers in it were measured in the same run, against each other.
+
+Any cross-run comparison of JOB latencies in this project is worth about as much
+as the 31%.
+
+### `borda` takes some of it
+
+Of the 198 ms now on the table, `borda` recovers **30 ms** -- 92.3% captured
+against `pairwise_rank`'s 91.0%, the best of the five policies, and the same
+ordering 2.71 measured on the synthetic workload. `greedy` and `risk_averse`
+land between them.
+
+That is the second independent workload on which aggregating the two selectors
+beats either, and it is still not deployed, for 2.79's reason.
+
+### What the headline should say
+
+**91.0%**, with the ceiling beside it, and the note that the previous 99.2% was
+measured against a ceiling 27 ms above the served plan. `docs/JOB_RESULTS.md`,
+`README.md` and 2.55 updated.
+
+The feature audit on the new bundle reports **75 of 142** features constant
+within a query -- more than half, consistent with the 72 of 139 the narrow-space
+bundle showed, so widening the action space did not change how much of the vector
+can separate candidates.
+
+## 2.81 The deterministic session was pinned away from what the server does
+
+`measurement.make_deterministic` pins two session settings so a measurement is
+repeatable. It is called by `app.collect_data`, `app.benchmark` and
+`app.selection_effect` — and **not** by `app.main`. Serving runs on the server's
+defaults, and every latency serving logs becomes a training label.
+
+So the two lists have to agree, and one entry did not:
+
+| | pinned | server default |
+|---|---|---|
+| `max_parallel_workers_per_gather` | 2 | 2 |
+| `geqo_seed` | **0.5** | **0** |
+
+### The reason for 0.5 was wrong
+
+The test asserting it carried the argument:
+
+> It defaults to 0, which sounds fixed and is not — GEQO reseeds per planning
+> cycle. On a large join that turns a paired A/B into a comparison of two draws
+> from a random search.
+
+If true, that is a good reason to pin a non-default value: repeatability would
+be worth the train/serve gap. Planning the same query **twelve** times at
+`geqo_seed = 0`:
+
+```
+geqo_seed = 0     distinct plans over 12 plannings: 1
+geqo_seed = 0.5   distinct plans over 12 plannings: 1
+```
+
+Zero is a fixed seed like any other, on PostgreSQL 18.6.
+
+### But the setting itself is load-bearing
+
+Worth establishing before changing it, since "probably inert" is how several
+sections of this file begin. With GEQO forced on (`geqo_threshold = 2`,
+`geqo_effort = 1`), four seeds give **four different join orders** for one query
+— `movie_companies`, `cast_info`, `name` and `title` land in a different order
+each time, each seed internally stable.
+
+So: pinning is right, and among fixed values the server's own is free.
+`geqo_seed` is now **0**, and both entries match what serving does.
+
+### And a fact this project has been getting wrong
+
+The measurement above needed a query where GEQO actually runs, which turned out
+to be harder than expected. At the default `geqo_threshold = 12`, JOB's `17c`,
+`17d` and `17e` plan identically under every seed — because **they are not
+17-table queries**. `17` is the query family's *name*. `17e` joins **seven**
+tables.
+
+JOB's 17-table queries are the `29*` family. Counted across all 113: the largest
+is 17 tables, the smallest 4, and **20 of 113** reach the GEQO threshold.
+
+This project has only ever collected the **smallest 30**, none of which do. So
+GEQO has never run on a single query in any measurement here, on either
+database. `geqo_seed` is load-bearing in principle and has never been exercised
+— which is exactly the class of latent difference the pin exists for, and the
+reason the right value is the server's rather than an arbitrary one.
+
+`PENDING.md`'s "the benchmark goes to 17-table joins" is true of JOB and was
+being read as true of the queries collected. Corrected there.
+
+## 2.82 A fresh install was slower than doing nothing
+
+`PENDING.md` has listed cold start under "untested, not broken" for months:
+
+> **Cold start.** Before a model exists, selection falls back to the cost
+> heuristic — which JOB shows can be *worse than native*.
+
+Tested. It is broken, and the obvious fix is worse than the bug.
+
+### What the no-model branch did
+
+```python
+if self.model is None or baseline_plan is None:
+    index = self.select(candidate_plans)        # cost argmin; native NOT in the pool
+    self.last_decision["fell_back_to_baseline"] = False
+    if baseline_plan is not None and self._is_unsafe(chosen, baseline_plan):
+        return baseline_plan
+    return chosen
+```
+
+Native is not among the candidates being ranked, so there is no "is this better
+than native?" test at all. The only thing in the way is `_is_unsafe`, and 2.29
+already established that its cost test **cannot fire on PostgreSQL 18** — the
+server stopped inflating disabled plans to `disable_cost` and says
+`Disabled: true` instead. Its own docstring says so.
+
+Replayed over the 65-query synthetic log:
+
+| | served | vs native | deviates | of those, regress | worst |
+|---|---|---|---|---|---|
+| **as shipped** | 10,617 ms | **1.040x** | **65/65** | 23 (35%) | **5.32x** |
+| never deviate | 10,206 ms | **1.000x** | 0/65 | — | 1.00x |
+
+A fresh deployment deviated on **every query**, made the workload **4% slower**
+than doing nothing, and ran one query at **5.3x**.
+
+### The obvious repair makes it worse
+
+Only deviate when PostgreSQL costs the candidate *below* native — use the one
+signal available. Measured:
+
+| | served | vs native | deviates | of those, regress |
+|---|---|---|---|---|
+| cheaper than native | 11,315 ms | **1.109x** | 12/65 | **10 (83%)** |
+| cheaper by 10% | 11,342 ms | 1.111x | 10/65 | 9 (90%) |
+
+Worse than the bug, and the reason is this project's own thesis turned on
+itself. **The cost model's disagreement with reality is the signal the learned
+model exists to exploit.** So "the estimate says this candidate is cheaper than
+native" selects precisely for the queries where the estimate is wrong — and 83%
+of the deviations it permits regress, against 35% for taking the argmin blindly.
+
+A filter built from the quantity you have spent the whole project proving
+unreliable will be anti-correlated with the truth, not merely uninformative.
+That is worth stating because it looked like the safe, conservative change.
+
+### What shipped
+
+With no model, serve native. `select_plan`'s docstring already said so —
+"defaulting to native unless there is *evidence* a hinted plan is better" — and
+with no model there is no evidence. The branch now agrees with the contract it
+sits under.
+
+`_select_heuristic` stays: it is the Phase 0 reference point every evaluation
+scores against, and `train._evaluate_selection` computes it directly from the
+costs rather than through `select_plan`, so no baseline moves. The only thing
+that changes is what a live query is served before the first model exists — and
+`app.benchmark` still labels those rows `heuristic`, so they stay identifiable.
+
+### Why it survived
+
+Because it is the state a running system leaves in minutes. Collect, train,
+promote, and nothing takes that branch again — the demo passes through cold
+start on the way to the interesting part, and the interesting part is what gets
+measured. It is only a user's first day that runs on it.
+
+## 2.83 The benchmark was giving the model plans the server never offers
+
+`app.diagnostics` has a section headed "is the gate keeping its promise?". On
+this deployment it read:
+
+```
+regressions   promised 0.182   observed 0.190
+deviations    promised 0.688   observed 0.323
+```
+
+The regression rate is accurate to a point. The deviation rate is out by a
+factor of two, and **nothing flagged it** — the regression check fires when
+observed exceeds promised by ten points, and the deviation check fired only when
+the observed rate was *exactly zero*.
+
+### Two hypotheses, both wrong
+
+**The candidate budget.** `planner.budget_for` caps how many candidates a live
+query is given and the replay scores every logged one, so the replay should have
+more to choose from. Measured: 1,042 candidates in the replay against at most
+965 servable, **93%**, and identical medians of 13. Not this.
+
+**The population.** The gate was calibrated on 16 held-out queries and
+diagnostics observes over everything. Measured: **28.8%** on held-out runs
+against **31.0%** overall. Not this either.
+
+### It was in the benchmark
+
+The per-query log said it plainly:
+
+```
+corr_brand_category   predicted 0.55x native (pessimistically 0.66x, needs < 1.00x)
+  -> safety veto: learned pick discarded, kept native plan
+```
+
+Both gate conditions satisfied — a predicted 45% speedup with a pessimistic
+bound of 0.66x — and the query served native. Across the run, **43 queries were
+vetoed and 36 of them looked like that**.
+
+The veto firing is `_is_unsafe` catching a plan with **disabled nodes**:
+one the planner was forbidden to build and built anyway, under a constraint it
+could not satisfy. `planner.plan_query` drops those from the action space
+outright (2.29). `app.benchmark` builds its own candidate list and never did.
+
+They are not neutral candidates. On PG18 a disconnected four-table order costs
+**20.5** against the correct plan's 6,990.8, so they look enormously cheap, the
+model picks one, the veto discards it — and the query is served native, having
+**lost its deviation entirely** rather than falling back to the next real
+candidate.
+
+Removing them: vetoes **43 → 30**. Thirteen queries got their deviation back.
+
+### The fourth place, and the one that publishes
+
+This is the same divergence as 2.47 (the calibration replay), and 2.76
+(`retrain._score_bundle` and `train._evaluate_selection`). Three of those score
+models. The fourth produces the numbers in `README.md`.
+
+The pattern by now: *every* component that assembles a candidate pool has, at
+some point, assembled a different one from the server's. The filters are
+individually reasonable and were added one at a time to whichever consumer
+someone was looking at.
+
+### And the check that should have caught it
+
+Diagnostics computed the discrepancy and printed it for months. The deviation
+comparison is now two-sided: a gate deviating **below** its promise is leaving
+headroom on the table, and it does so without producing a single regression to
+notice — which is why the one-sided check was reasonable for regressions and
+wrong here.
+
+The finding also carries the diagnosis, so the next person to see it checks the
+benchmark's action space before re-tuning a gate that was never the problem.
+
+## 2.84 Two classifications of the same hint, on purpose
+
+`PENDING.md` carried two items with the same shape for months:
+
+> **A marker for bushy join orders.** `INCLUDE_BUSHY` was the one family 2.67
+> could not price, because bushy hints are `Leading(((a b) (c d)))` and classify
+> as `join_order`, so they are indistinguishable from linear ones in the log.
+
+> **`DisableIndex` still cannot be priced separately.** 2.74 made the flag work,
+> but its hints classify as `scan_method`, which the axis already sweeps.
+
+A family the sweep cannot separate is one it cannot price. Turn the flag on and
+every arm scores the same, which 2.75 established is not a measurement of the
+family — it is the family's absence, reported as worthlessness.
+
+### The fix is not a change to `hint_family`
+
+The obvious move is to make `hint_family` return `bushy` and `disable_index`.
+That would be a behaviour change to something else: `hint_family` has a second
+consumer in `regression_guard.allowed_hints`, which blocks a whole *kind* of
+action on a query that kind has already lost on.
+
+If `Leading(a b c)` has regressed on a query, letting `Leading(((a b) (c d)))`
+through afterwards on the grounds that it is a different family is not the
+conservative reading. The coarse grouping is right there.
+
+So there are now two classifications, differing by exactly one level of one
+hierarchy:
+
+| hint | `hint_family` (what the guard blocks by) | `action_family` (what the sweep prices) |
+|---|---|---|
+| `Leading(a b c)` | `join_order` | `join_order` |
+| `Leading(((a b) (c d)))` | `join_order` | **`bushy`** |
+| `SeqScan(o)` | `scan_method` | `scan_method` |
+| `DisableIndex(o o_idx)` | `scan_method` | **`disable_index`** |
+| everything else | same | same |
+
+Two classifications is normally the bug this writeup keeps finding — 2.75, 2.77,
+2.78 are all pairs of definitions that had to agree and stopped. The difference
+is that these two are *supposed* to differ, so what has to be pinned is the
+relationship rather than the equality: every action family maps to exactly one
+hint family, and `tests/test_action_family.py` asserts it in both directions.
+
+### Detected by structure, not by a marker
+
+A bushy order is `Leading(` followed by another `(`. That is what pg_hint_plan
+parses, so reading it back is reading the thing itself — a marker comment
+attached at generation time would be one more pair that can drift, which is the
+subject of three of the last five sections.
+
+### What it unlocks
+
+`_servable`, `served_families` and the sweep axis all read `action_family` now,
+so `INCLUDE_BUSHY=1` no longer has its candidates silently folded into
+`join_order` — the 2.75 bug, one level down, which was live and unnoticed for
+exactly as long as the flag existed.
+
+The sweep reports seven optional families and, on the current log, five as **not
+scored**:
+
+```
+all optional  : resource, join_method, scan_method, memoize, parallel, bushy, disable_index
+present in log: resource, scan_method
+not scored    : join_method, memoize, parallel, bushy, disable_index
+```
+
+Which is the honest state: the tooling can now price all seven, and the data
+exists for two. Collecting with the other five switched on is the remaining
+step, and it is a cost in hours rather than a question.
+
+## 2.85 Three quarters of the measured benefit was noise
+
+`--protocol paired` (2.68) re-times native, served and oracle **alternately**
+and takes medians, so between-run drift is common-mode and the oracle stops
+being a minimum over noisy draws. It has now been run against the deploy
+protocol on the same code, the same gate and the same hour — the only
+difference is the timing.
+
+| 65 queries | `deploy` (one pass) | `paired` (5 alternated) | change |
+|---|---|---|---|
+| native | 7,426 ms | 5,680 ms | −24% |
+| served | 6,629 ms | 5,464 ms | −18% |
+| oracle | 6,122 ms | 5,232 ms | −15% |
+| **headroom** | **1,304 ms** (17.6% of native) | **448 ms** (7.9%) | **−66%** |
+| **latency actually saved** | **797 ms** | **215 ms** | **−73%** |
+| captured | 61.1% | **48.1%** |  |
+
+Held-out queries, the number that says whether the model generalises:
+
+| | `deploy` | `paired` |
+|---|---|---|
+| headroom | 213 ms | **63 ms** |
+| saved | 85 ms | **12 ms** |
+| captured | 40.0% | **18.4%** |
+
+### What moved and why
+
+**Native dropped 24%** between the two runs. Nothing about the queries or the
+database changed; that is cache warmth, and it is the same effect 2.80 found at
+31% on JOB. It cancels in a ratio, which is why the ratio is the thing to read.
+
+**Headroom dropped 66%.** This does not cancel, because it is not a ratio of two
+things measured the same way. `best_ms` is a **minimum** over candidate timings,
+and a minimum over noisy draws is biased low even when every individual timing
+is unbiased. Re-time the arms and the ceiling rises toward native. More than half
+of the "available headroom" this project has reported was that bias.
+
+**The saving dropped 73%.** 797 ms became 215 ms. This is the one that matters:
+it is not a denominator effect, it is the measured benefit of running the system
+shrinking by three quarters once each arm is timed five times instead of once.
+
+2.68 predicted exactly this at single-query scale — a query reported regressing
+at 1.273x that seven alternated repetitions put at 1.095x — and said "the
+conclusion survived and its magnitude did not". At workload scale the conclusion
+still survives: the system saves latency, on this workload, net. It saves about a
+quarter of what a single pass says.
+
+### The selection effect went to zero
+
+`deploy` puts the curated group 7.8 points **below** the whole workload; `paired`
+puts it 0.2 points **above**. The previously published figure was +14.8.
+
+Three numbers for one quantity across three protocols is not a measurement of
+anything, and the honest reading is that the selection effect is **not
+resolvable at this sample size** — 27 filtered queries against 38 unfiltered,
+with a per-query noise floor that 2.18 puts at 18.6%. 2.72's version of this
+question is the one to quote, because it was measured over 40 queries with the
+filter explicitly removed rather than inferred from two hand-written subsets.
+
+### The caveat, stated plainly
+
+One run each. `paired` prints `(single run -- spread unknown)` and means it.
+
+What is not a matter of sampling: the direction. The `min` bias is one-sided by
+construction, so re-timing can only lower the reported headroom, never raise it.
+Both fixes in this section's neighbourhood push the same way — 2.83 removed
+candidates the server never offers, this removes an optimistic ceiling — and
+both make the project's numbers smaller.
+
+That is the expected shape when measurement gets better, and it is worth saying
+that neither correction was found by looking for a smaller number.
+
+## 2.86 The transfer result was the narrow action space, not the model
+
+2.64 is the strongest external-validity claim this project makes: a model
+trained on the six-table synthetic schema, carried to JOB with **zero**
+overlapping tables and every per-table feature slot reading zero, captured
+**97.0%** of JOB's headroom against a locally-trained model's 98.4%.
+
+2.80 flagged it as measured against the narrow ceiling and said "the ratio
+between the two is the claim and it may well survive; the levels will not."
+
+Re-run on the wide-action-space collection, with 2.76's filters applied:
+
+| selector | total | of native | headroom captured |
+|---|---|---|---|
+| native (do nothing) | 104,246 ms | 100.0% | 0.0% |
+| oracle | 24,768 ms | 23.8% | 100.0% |
+| cost argmin | 100,655 ms | 96.6% | 4.5% |
+| random pick | 131,093 ms | 125.8% | −33.8% |
+| **carried synthetic model** | **108,435 ms** | **104.0%** | **−5.3%** |
+| locally-trained JOB model | 27,534 ms | 26.4% | **96.5%** |
+
+**97.0% became −5.3%.** The carried model now serves JOB 4% *slower* than doing
+nothing. The ratio did not survive either: it is not 97.0 against 98.4, it is
+−5.3 against 96.5.
+
+### The local model is fine. The transfer is not.
+
+96.5% for a model trained on this schema, so nothing about the wider action
+space broke the approach. What broke is the claim that the *structural* half of
+the feature vector is enough on its own.
+
+### Why a narrow ceiling flattered it
+
+Under the narrow action space almost every candidate was survivable — 2.80
+measured the best plan there as **27 ms** better than the one being served
+across eight held-out queries. A selector cannot do much damage choosing among
+options that barely differ, so any selector scored well, and "97% of a 27 ms
+opportunity" read as competence.
+
+The wide space contains plans that are catastrophically bad as well as plans
+that are much better. Ranking *that* needs to know something about the tables,
+and the carried model knows nothing: every per-table slot is zero, by
+construction, because the table names do not match.
+
+### It is not picking at random, and that is the interesting part
+
+Random selection lands at **125.8%** of native; the carried model at **104.0%**.
+So the schema-agnostic features — costs, tree shape, join-method counts — carry
+real signal and rank plans far better than chance. They are simply not enough to
+clear the bar that matters, which is *native*, and 2.64's framing of "the
+structural half travels" is right in direction and wrong about how far.
+
+It also picks the exact best candidate on **4 of 30** queries, which is a real
+skill and does not stop the aggregate being negative — the losses are larger
+than the wins.
+
+### What the claim should be
+
+Not "works on any PostgreSQL database". A model carried to a schema it has never
+seen ranks plans **well above chance and below native**, so deploying one is
+worse than deploying nothing, and the useful version of the finding is the
+warm-start question 2.64 never asked: does carrying a foreign model make local
+*training* faster than starting cold? That is a different experiment and it has
+not been run.
+
+`README.md` and 2.64 updated. The two rows in 2.64's table are left in place with
+a note, because the measurement was correct — it was the ceiling underneath it
+that was not.
+
+## 2.87 Under load, and the thing that made it safe was never written down
+
+`PENDING.md` listed this under "untested, not broken":
+
+> **Single-node, single-connection.** Every latency here is measured with no
+> concurrency. Nothing is known about behaviour under load.
+
+Two questions, and they are different kinds.
+
+### Correctness: shared state across requests
+
+`DecisionCache` takes a lock. `RegressionGuard` does not, and is read on every
+request while `refresh()` replaces it on every settings change, promotion and
+server start.
+
+Hammered against a live database — six threads reading `is_blocked`,
+`is_family_blocked`, `caution_multiplier` and `runtime_budget_ms` while a
+seventh refreshed — **3,141,552 reads, zero errors.**
+
+It is safe, and it is safe for a reason nothing recorded: `refresh` **rebinds**
+each attribute to a fully-built dict rather than mutating one in place. A reader
+sees the old dict or the new one, never a half-filled one.
+
+Rewrite it as `self.blocked.clear()` followed by `update()` and it reads as an
+obvious tidy-up, keeps every test passing, and introduces a genuine race — a
+reader mid-refresh sees an empty block list and a query that should be blocked
+is served its regressing plan. That is now a docstring and a test, because the
+race would not fail reliably enough to be caught any other way.
+
+**What is not protected**, stated rather than glossed: the four fields are
+assigned in sequence, so a reader landing between two of them pairs a new
+`blocked` with an old `observations`. The window is two bytecodes and the cost
+is one decision using the previous refresh's caution. Bounded, and judged not
+worth a snapshot object — but the same consistency argument the function already
+makes about its own cutoff (`one boundary for every query below, resolved once`)
+applies to readers across it, and was not made.
+
+### Behaviour: does planning stop being cheap?
+
+The economic case for the whole system is that choosing a plan costs less than
+running one. Planning is many small round trips; execution is one large query.
+Under load they could easily degrade differently.
+
+`corr_4w_full_correlated`, both arms measured in the same run:
+
+| concurrent | plan | execute | overhead | plan ×solo | exec ×solo |
+|---|---|---|---|---|---|
+| 1 | 50.1 ms | 114.1 ms | **44%** | 1.00x | 1.00x |
+| 4 | 72.4 ms | 175.3 ms | **41%** | 1.44x | 1.54x |
+| 8 | 130.3 ms | 277.1 ms | **47%** | 2.60x | 2.43x |
+
+They degrade together — 2.60x against 2.43x at eight-way — and the overhead
+ratio stays between **41% and 47%** throughout. The economic case does not get
+worse under load, which is the answer that was wanted and not the one that was
+expected.
+
+The 44% is the more uncomfortable number, and it is not new: planning this query
+costs nearly half what running it does, which is why `decision_cache.py` exists
+and why `budget_for` scales the candidate count to what the query is worth. That
+is a solo-path cost that repeat traffic pays once.
+
+### What is still untested
+
+Concurrency *of the serving path end to end* — this measured the planner and the
+executor, not FastAPI, the connection pool, or the cache under contention. And
+one machine, one PostgreSQL, no network. The claim this closes is narrow:
+**shared optimizer state survives concurrent access, and planning overhead is
+stable in proportion up to eight-way.**
+
+## 2.88 A noise floor that costs nothing to measure
+
+`PENDING.md` carried this for months, marked *free*:
+
+> Buffer counts as a **per-comparison noise floor**. Two candidates with
+> identical buffer counts did the same page work, so any latency difference
+> between them is noise. Free — it is already in the log.
+
+It is the third proposed use of buffers and the first that survives. 2.58
+rejected them as a **label** — Spearman **0.341** against latency, so they
+measure the wrong quantity. The train/serve skew rules them out as a
+**feature**: they come from `EXPLAIN ANALYZE` and the serving path plans with
+`analyze=False`, so the model would train on a column that is absent when it
+matters. Neither objection touches an *offline, pairwise* use that decides what
+a difference has to beat.
+
+### It is computable, which was not obvious
+
+`app.noise` measures the floor by re-executing one unchanged plan five times.
+That is the definition of noise and it costs a full extra workload pass — and it
+measures the **native** plan only, then applies the number to comparisons
+between candidates.
+
+Reading the log instead:
+
+```
+65 queries, 306 groups of plans doing identical page work, 1290 pairs.
+Median disagreement 12.7%, worst 110.5%.
+```
+
+**Every one of the 65 queries** has at least one group, so this is not a
+technique that works on a lucky subset.
+
+### What it says that the global floor does not
+
+The global floor is 2.18's **18.6%**. The per-query floors run from under 6% to
+over 110%:
+
+| query | floor | groups |
+|---|---|---|
+| `gen_27_5w` | **129.7%** | 6 |
+| `gen_04_4w` | 118.2% | 5 |
+| `gen_03_3w` | 109.5% | 3 |
+| … | | |
+| `shape_group_by_category` | 5.9% | 3 |
+
+On `gen_27_5w`, two plans that read and wrote **the same pages** differed by more
+than **2x**. A "2x speedup" measured on that query is indistinguishable from a
+lucky moment — and the global 18.6% would have called it real six times over.
+Meanwhile a 6% win on `shape_group_by_category` is dismissed by the global floor
+and is three times that query's own.
+
+The single number is wrong in both directions, and which direction depends on
+the query.
+
+### Why the floor is the widest group, not the average
+
+It is a bar a difference has to clear. Averaging a query's groups lets its
+noisiest pair through, which is the failure the floor exists to prevent. Stated
+in the code and pinned by a test, because "take the mean" is the change someone
+makes while tidying.
+
+### What it does not do yet
+
+`app.noise --from-buffers` reports it. Nothing consumes it: `stats.classify`
+still grades against one `recommended_material_fraction` for the whole workload.
+
+Wiring a per-query floor into the grading is a real change to what
+`held_missed` and `deviated_win` mean, and it should be made against a re-run
+benchmark rather than folded in beside eight other corrections. That is the
+honest place to stop — the measurement exists, is free, and is written down.

@@ -330,14 +330,32 @@ def budget_for(
 
 def _index_candidates_for(cur, baseline_plan: dict) -> dict[str, list[str]] | None:
     """
-    `{alias: [index, ...]}` for this query, or None if index pinning is off.
+    `{alias: [index, ...]}` for this query, or None if nothing needs it.
 
     Needs a live cursor to read `pg_index`, and `candidate_hints` is also called
     from paths that have none (tests, and any caller working from a stored
-    plan). Missing either the flag or the cursor means the family generates
-    nothing, which is the same as it was before it existed.
+    plan). Missing the cursor means the families that need this map generate
+    nothing, which is the same as it was before they existed.
+
+    ## Two families need it, and this used to check for one
+
+    `IndexScan(alias index)` and `DisableIndex(alias index)` both name an index,
+    so both need the alias-to-index map. The guard read `INCLUDE_INDEX_PINNING`
+    alone, and `generate_candidates` only calls the DisableIndex generator
+    `if include_disable_index and table_indexes` -- so with pinning off,
+    `table_indexes` was None and the second family produced **nothing at all**.
+
+    Measured by switching every action-space flag off and each one on in turn:
+    twelve of the thirteen widened the action space and `INCLUDE_DISABLE_INDEX`
+    added zero candidates. Not an error, not a warning -- a flag with a
+    documented purpose, an environment variable, and no effect unless a
+    different flag also happened to be on. 2.53 is the same shape.
+
+    It matters beyond the family itself: `app.autotune` prices a family by
+    switching it on and replaying, so a family that generates nothing when
+    switched on is one the sweep must score as worthless (2.67).
     """
-    if not INCLUDE_INDEX_PINNING or cur is None:
+    if cur is None or not (INCLUDE_INDEX_PINNING or INCLUDE_DISABLE_INDEX):
         return None
     try:
         return indexes_by_alias(baseline_plan.get("scan_relations"), index_map(cur))
@@ -389,6 +407,10 @@ def candidate_hints(
         join_graph=baseline_plan.get("join_graph"),
         include_bushy=INCLUDE_BUSHY,
         include_disable_index=INCLUDE_DISABLE_INDEX,
+        # Explicit now that the catalog map is built for either family. Passing
+        # only the map would hand `INCLUDE_DISABLE_INDEX` a second family it
+        # never asked for.
+        include_index_pinning=INCLUDE_INDEX_PINNING,
         include_scan_methods=INCLUDE_SCAN_METHODS,
         include_negative_scans=INCLUDE_NEGATIVE_SCANS,
         include_negative_joins=INCLUDE_NEGATIVE_JOINS,
@@ -536,7 +558,25 @@ def plan_query(
     # Drop the kinds of action that have already lost on this query, before the
     # budget is applied -- otherwise a blocked family eats budget that a family
     # with a chance could have used.
-    if guard is not None:
+    #
+    # **Except on the shadow path**, and for the same reason the shadow path
+    # exists at all. This ran unconditionally, which made a family block a
+    # ratchet: `allowed_hints` removes the family, so it is never planned, so it
+    # produces no row of any kind, so nothing can ever clear it. The block then
+    # lifted only when the old regressing rows aged out of `evidence_since()` --
+    # a timer, not a decision, which is the sentence twenty lines above
+    # explaining why query-level blocks are shadowed.
+    #
+    # The asymmetry went further: `REGRESSION_SQL` counts
+    # `is_chosen OR selector_used = 'shadow'` and `FAMILY_REGRESSION_SQL`
+    # counted only `is_chosen`, so even a shadow row carrying a blocked family
+    # would have been invisible to the thing that blocks families. Both halves
+    # are fixed; either alone would have left the ratchet intact.
+    #
+    # Latent so far -- the guard currently holds no family blocks and the log no
+    # shadow rows -- which is how it survived: a block that never lifts and a
+    # block that lifts slowly look identical until someone waits.
+    if guard is not None and not bypass_block:
         hints = guard.allowed_hints(query_id, hints)
 
     # The budget counts *distinct plans*, not hints tried.

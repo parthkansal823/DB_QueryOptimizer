@@ -77,7 +77,11 @@ from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
 from app.optimizer.ranker import borda_select
 from app.optimizer.bandit import POLICIES
-from app.optimizer.learned import DEFAULT_SELECTION_POLICY, RANKER_POLICIES
+from app.optimizer.learned import (
+    DEFAULT_SELECTION_POLICY,
+    DISAGREEMENT_CAUTION,
+    RANKER_POLICIES,
+)
 from app.retrain import served_policy
 from app.train import _aggregate_repetitions, _load_rows, _row_to_candidate
 
@@ -239,7 +243,6 @@ def _servable(candidates: list[dict], allowed: "set[str] | None" = None) -> list
     serving path agree about which *kinds* of plan are on the table.
     """
     from app.optimizer import planner
-    from app.optimizer.regression_guard import hint_family
 
     if allowed is None:
         # The families the *current* deployment offers. `app.autotune` passes an
@@ -270,8 +273,105 @@ def _servable(candidates: list[dict], allowed: "set[str] | None" = None) -> list
             allowed.add("memoize")
         if planner.INCLUDE_PARALLEL:
             allowed.add("parallel")
+        # The two sub-families a flag switches on independently of its parent.
+        # Without these a deployment with `INCLUDE_BUSHY=1` would have its bushy
+        # candidates dropped from every replay -- 2.75's bug, one level down.
+        if planner.INCLUDE_BUSHY:
+            allowed.add("bushy")
+        if planner.INCLUDE_DISABLE_INDEX:
+            allowed.add("disable_index")
 
-    return [c for c in candidates if hint_family(c.get("hint")) in allowed]
+    return [c for c in candidates if action_family(c.get("hint")) in allowed]
+
+
+# Sub-families the action space can switch on independently, and which
+# `hint_family` deliberately does not distinguish.
+#
+# `INCLUDE_BUSHY` emits `Leading(((a b) (c d)))` and `INCLUDE_DISABLE_INDEX`
+# emits `DisableIndex(t idx)`. Both classify as their parent family --
+# `join_order` and `scan_method` -- so the sweep could switch them on and had no
+# way to tell their candidates apart from the parent's. A family the sweep
+# cannot separate is a family it cannot price, which is what 2.67 and 2.74 both
+# ran into.
+#
+# ## Why this is not just a change to `hint_family`
+#
+# `hint_family` has a second consumer: `regression_guard.allowed_hints`, which
+# blocks a whole *kind* of action on a query that kind has already lost on. The
+# coarse grouping is correct there and splitting it would be a real behaviour
+# change -- if `Leading(a b c)` regressed, letting `Leading(((a b) (c d)))`
+# through afterwards on the grounds that it is a different family is not the
+# conservative reading.
+#
+# So the two classifications differ on purpose, and the difference is exactly
+# one level of the same hierarchy: every action family maps to exactly one hint
+# family, which `tests/test_action_family.py` pins.
+ACTION_VARIANTS: dict[str, str] = {
+    "bushy": "join_order",
+    "disable_index": "scan_method",
+}
+
+
+def action_family(hint: str | None) -> str | None:
+    """
+    Which switch in the action space this hint belongs to.
+
+    `hint_family` for everything except the two sub-families a flag can turn on
+    independently -- see `ACTION_VARIANTS` for why they are separate here and
+    joined there.
+    """
+    from app.optimizer.regression_guard import hint_family
+
+    if not hint:
+        return None
+    if "DisableIndex(" in hint:
+        return "disable_index"
+    # A bushy order nests its parentheses: `Leading(((a b) (c d)))` against a
+    # linear `Leading(a b c)`. Detected by structure rather than by a marker
+    # comment, because the hint is what pg_hint_plan sees and a comment would be
+    # one more thing that can drift from it.
+    if "Leading(" in hint:
+        inner = hint.split("Leading(", 1)[1]
+        if inner.lstrip().startswith("("):
+            return "bushy"
+    return hint_family(hint)
+
+
+def without_provable_noops(
+    candidates: list[dict], baseline_plan: dict | None
+) -> list[dict]:
+    """
+    Drop candidates the baseline plan proves cannot differ from it.
+
+    The companion to `_servable`, and it exists for the same reason: the log is
+    a record of everything ever *collected*, and collection explores wider than
+    serving does. `planner.candidate_hints` runs `optimizer/prefilter.py` and
+    `app.collect_data` does not, so 14.4% of logged candidates are plans
+    byte-identical to native -- verified, `plan_fingerprint` unchanged on 10 of
+    10 (2.76).
+
+    They must not survive into anything that computes a **best available**,
+    because `min()` over noisy draws is biased low and a candidate that *is*
+    native then competes to be the ceiling native is measured against. It won on
+    11 of 65 queries; one recorded 3,561 ms against 787 ms for the same plan.
+
+    Three places compute that quantity -- `train._evaluate_selection`,
+    `retrain._score_bundle`, and this module's `evaluate_setting` -- and 2.47 is
+    what happened the last time an action-space filter lived in one of them and
+    not the others. So it lives here once and all three call it.
+
+    Training rows are deliberately **not** filtered this way: 2.76 measured
+    dropping them making the model's error worse on 15 of 16 paired splits.
+    They are evidence about the level and a false ceiling at the same time.
+    """
+    from app.optimizer.prefilter import is_provable_noop
+
+    if not isinstance(baseline_plan, dict):
+        return candidates
+    return [
+        c for c in candidates
+        if not (c.get("hint") and is_provable_noop(c["hint"], baseline_plan))
+    ]
 
 
 # A regression smaller than this many milliseconds does not count towards the
@@ -375,6 +475,10 @@ def evaluate_setting(
         # queries while the benchmark captured 0.0%, because three of the eight
         # had the ranker's top pick vetoed for exactly this.
         candidates = [c for c in candidates if not c.get("disabled_nodes")]
+        # And the ones the baseline plan proves are the baseline. Without this
+        # the gate can be credited with a "deviation that improved" on a plan
+        # identical to native that happened to run fast (2.76).
+        candidates = without_provable_noops(candidates, baselines[0].get("raw_plan"))
         if not candidates:
             continue
         latencies = [c["actual_total_time_ms"] for c in candidates]
@@ -437,8 +541,26 @@ def evaluate_setting(
             # 1.67 x9, 1.33 x2. Sweeping at 1.0 made `min_relative_gain=0.02`
             # look right when serving would apply 0.04, and a ceiling of 1.25
             # when serving would apply 1.125.
-            required = 1.0 - min_relative_gain * caution
-            ceiling = 1.0 + (max_regression_ratio - 1.0) / max(caution, 1e-9)
+            # And the disagreement term, for the same reason and by the same
+            # rule: the served gate multiplies `caution` by
+            # `1 + DISAGREEMENT_CAUTION * disagreement` (2.79), so a sweep that
+            # omitted it would recommend thresholds for a gate nobody runs --
+            # 2.43, created by the tool written to prevent it.
+            #
+            # Only the ranker policies compute it, because for `greedy` the
+            # chosen candidate *is* the ensemble's argmin and the term is a
+            # constant zero. `learned._selector_disagreement` says the same in
+            # the same words; this is the replay's copy and
+            # `tests/test_disagreement_caution.py` pins them together.
+            local_caution = caution
+            if policy in RANKER_POLICIES and len(means) > 1:
+                by_mean = sorted(range(len(means)), key=lambda i: means[i])
+                disagreement = by_mean.index(best_i) / (len(means) - 1)
+                local_caution *= 1.0 + DISAGREEMENT_CAUTION * disagreement
+            caution_used = local_caution
+
+            required = 1.0 - min_relative_gain * caution_used
+            ceiling = 1.0 + (max_regression_ratio - 1.0) / max(caution_used, 1e-9)
             expected = math.exp(means[best_i])
             if conformal is not None:
                 # `learned._upper_bound`'s shape exactly: caution scales the
@@ -446,10 +568,12 @@ def evaluate_setting(
                 # `std` and `std * caution` would quietly drop the extra
                 # protection an unseen query is meant to get.
                 bound = conformal.upper_bound(means[best_i], stds[best_i])
-                pessimistic = math.exp(means[best_i] + (bound - means[best_i]) * caution)
+                pessimistic = math.exp(
+                    means[best_i] + (bound - means[best_i]) * caution_used
+                )
             else:
                 pessimistic = math.exp(
-                    means[best_i] + confidence_z * caution * stds[best_i]
+                    means[best_i] + confidence_z * caution_used * stds[best_i]
                 )
             deviate = expected < required and pessimistic < ceiling
         else:
@@ -901,6 +1025,63 @@ def grid_with_recommendation(grid: tuple[dict, ...], recommended: dict | None) -
     return list(grid) + [pick]
 
 
+def _servable_families() -> set[str]:
+    """The families `_servable` keeps when no explicit set is passed.
+
+    Derived from the same `planner` flags the serving path reads, so the gate
+    file records the action space it was actually swept over rather than a
+    constant that might have drifted from it.
+    """
+    from app.optimizer import planner
+
+    families = {"join_order", "operator_toggle", "cardinality"}
+    if planner.INCLUDE_TUNING:
+        families.add("resource")
+    if planner.INCLUDE_JOIN_METHODS:
+        families.add("join_method")
+    if (
+        planner.INCLUDE_SCAN_METHODS
+        or planner.INCLUDE_NEGATIVE_SCANS
+        or planner.INCLUDE_INDEX_PINNING
+    ):
+        families.add("scan_method")
+    if planner.INCLUDE_MEMOIZE:
+        families.add("memoize")
+    if planner.INCLUDE_PARALLEL:
+        families.add("parallel")
+    return families
+
+
+def bundle_identity(bundle: dict) -> str:
+    """
+    A short digest that changes whenever the model does.
+
+    `calibrated_against_bundle` records a *path*, and a path does not change
+    when the model living at it is replaced. So a gate calibrated for one model
+    and served alongside its successor looks perfectly consistent:
+    `models/plan_selector.pkl` then, `models/plan_selector.pkl` now.
+
+    Observed. A promotion replaced the served bundle and `app.diagnostics`
+    reported "swept under policy: pairwise_rank / server selects with:
+    pairwise_rank" and no finding, while `models/gate.json` said it was
+    calibrated on 15 queries and the deployed model held out 16. The two drift
+    checks that exist both passed, on a gate belonging to a different model.
+
+    Derived from the feature columns and the held-out list rather than from the
+    pickle bytes, because those are what a gate threshold actually depends on --
+    the error distribution it was measured against -- and because pickle bytes
+    are not stable across library versions.
+    """
+    import hashlib
+
+    material = "|".join([
+        ",".join(bundle.get("feature_columns") or ()),
+        ",".join(sorted(bundle.get("held_out_queries") or ())),
+        str(bundle.get("target")),
+    ])
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
+
+
 def apply_gate(setting: dict, path: str = GATE_PATH, provenance: dict | None = None) -> None:
     """
     Write the deployed gate, recording where its numbers came from.
@@ -1010,6 +1191,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--limit", type=int, default=None, help="workload queries per measured run")
     args = parser.parse_args()
+    # Loaded once here so both `--apply` paths can stamp which *model* the gate
+    # was calibrated against, not merely which path -- see `bundle_identity`.
+    bundle = _load_bundle(args.bundle)
 
     if args.measure:
         # Measure the replay's own recommendation alongside the fixed grid --
@@ -1057,6 +1241,8 @@ if __name__ == "__main__":
                         "held_out_captured_pct": best.get("held_out_captured_pct"),
                         "excluded_query_prefix": args.exclude_prefix or None,
                         "calibrated_against_bundle": args.bundle,
+                        "calibrated_against_model": bundle_identity(bundle),
+                        "calibrated_with_families": sorted(_servable_families()),
                         "calibrated_with_policy": args.policy,
                     },
                 )
@@ -1108,6 +1294,31 @@ if __name__ == "__main__":
             f"{best['regression_rate']:.0%} of those regress, "
             f"net {best['net_improvement_pct']:+.1f}%)"
         )
+        # `min_relative_gain = 0` switches the caution mechanism off, and
+        # nothing said so.
+        #
+        # `required = 1.0 - min_relative_gain * caution`, so at zero the bar is
+        # 1.0 whatever `caution` is. The regression guard hands the served gate
+        # **2.0** for a query it has no history for -- documented at length,
+        # with 2.18's 96% veto rate as the story of getting it wrong -- and at
+        # this setting that 2.0 does nothing to the condition that decides
+        # whether a win is worth taking. Only the ceiling still moves.
+        #
+        # The module docstring makes exactly this argument for `confidence_z=0`
+        # ("multiplies the model's uncertainty by zero, so the safety mechanism
+        # was, in effect, switched off") and nobody made it for the other knob.
+        # `_dominates` already prefers a higher gain among equals; this is for
+        # when zero wins outright on net improvement, which is how it got
+        # deployed (2.79).
+        if not best["min_relative_gain"]:
+            print(
+                "  note: min_relative_gain=0 makes `caution` inert on the "
+                "expected-win test -- `required = 1 - gain * caution` is 1.0 "
+                "for every caution, including the regression guard's 2.0 for "
+                "an unseen query. Only the downside ceiling still responds. "
+                "That may be the right trade on this sample; it is not a free "
+                "one, and the sweep cannot see the queries it was not run on."
+            )
         if args.apply:
             apply_gate(
                 best,
@@ -1125,6 +1336,15 @@ if __name__ == "__main__":
                     # and one calibrated against the deployed model are
                     # indistinguishable on disk.
                     "calibrated_against_bundle": args.bundle,
+                    # And which *model* was at that path -- see `bundle_identity`.
+                    "calibrated_against_model": bundle_identity(bundle),
+                    # The action space the sweep scored over. `app.autotune`
+                    # recorded this and `app.calibrate --apply` did not, so
+                    # running the simpler tool erased the field and
+                    # `app.diagnostics` went from naming the families to
+                    # printing `None` -- a drift check silently switched off by
+                    # using the other entry point.
+                    "calibrated_with_families": sorted(_servable_families()),
                 },
             )
             print(f"Written to {GATE_PATH} -- restart the backend to pick it up.")

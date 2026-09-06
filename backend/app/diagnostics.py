@@ -92,6 +92,8 @@ def gate_report(gate: dict | None, bundle: dict | None) -> dict:
             "consults_uncertainty": None,
             "calibrated_on_n_queries": None,
             "calibrated_with_policy": None,
+            "calibrated_against_model": None,
+            "served_model": _model_identity(bundle),
             "served_policy": served_policy(),
         }
 
@@ -119,8 +121,23 @@ def gate_report(gate: dict | None, bundle: dict | None) -> dict:
         # from. `app.autotune` records it; this reads back what the deployment
         # currently offers, so the two can be compared.
         "calibrated_with_families": gate.get("calibrated_with_families"),
+        "calibrated_against_model": gate.get("calibrated_against_model"),
+        "served_model": _model_identity(bundle),
         "served_families": sorted(_served_families()),
     }
+
+
+def _model_identity(bundle: dict | None) -> str | None:
+    """The identity of the bundle this report is about -- see
+    `calibrate.bundle_identity`.
+
+    Taken from the bundle the caller passed rather than read back from
+    `model_store`, because `diagnose` is asked about a specific model and a
+    check that quietly consults a different one is the bug this exists to find.
+    """
+    from app.calibrate import bundle_identity
+
+    return bundle_identity(bundle) if bundle else None
 
 
 def _served_families() -> set[str]:
@@ -281,6 +298,23 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
             ),
         })
 
+    if gate.get("min_relative_gain") == 0:
+        found.append({
+            "severity": "medium",
+            "code": "caution_inert_on_expected_win",
+            "detail": (
+                "min_relative_gain is 0, so `required = 1 - gain * caution` is "
+                "1.0 for every caution and the caution mechanism does nothing "
+                "to the test that decides whether a win is worth taking -- "
+                "including the regression guard's 2.0 for a query it has no "
+                "history for. Only the downside ceiling still responds. The "
+                "sweep may well have measured this as the best net improvement "
+                "on its held-out sample; caution exists for the queries that "
+                "sample did not contain, which is an argument the sweep cannot "
+                "make (2.79)."
+            ),
+        })
+
     swept_under = gate.get("calibrated_with_policy")
     serving = gate.get("served_policy")
     if swept_under and serving and swept_under != serving:
@@ -305,6 +339,44 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
                 "no way to tell which selection policy its thresholds were "
                 "chosen against. Re-run `python -m app.calibrate --apply` to "
                 "record it."
+            ),
+        })
+
+    # Which *model* the gate was calibrated against, not which path.
+    #
+    # The two checks above compare the policy and the action space, and both
+    # passed on a gate that belonged to a different model: a promotion replaced
+    # `models/plan_selector.pkl` and the gate file still said
+    # `calibrated_against_bundle: models/plan_selector.pkl`, which was true and
+    # useless. `models/gate.json` recorded 15 held-out queries while the served
+    # model held out 16, and nothing looked at that.
+    #
+    # A gate threshold is a property of one model's error distribution. Serving
+    # it alongside a different model is 2.43's mistake with the axis changed.
+    calibrated_model = gate.get("calibrated_against_model")
+    served_model = gate.get("served_model")
+    if calibrated_model and served_model and calibrated_model != served_model:
+        found.append({
+            "severity": "high",
+            "code": "gate_calibrated_for_another_model",
+            "detail": (
+                f"the gate was calibrated against model `{calibrated_model}` "
+                f"and the server loads `{served_model}`. A threshold describes "
+                "the error distribution it was measured against, and a retrain "
+                "changes that distribution -- the promotion in 2.70 moved the "
+                "held-out set from 15 queries to 16 and left the gate behind. "
+                "Re-run `python -m app.calibrate --apply`."
+            ),
+        })
+    elif gate.get("source") != "built-in defaults" and calibrated_model is None:
+        found.append({
+            "severity": "low",
+            "code": "gate_does_not_record_its_model",
+            "detail": (
+                "this gate file predates `calibrated_against_model`, so a "
+                "retrain since it was written would be undetectable -- the "
+                "path it records does not change when the model at it does. "
+                "Re-run `python -m app.calibrate --apply` to record it."
             ),
         })
 
@@ -424,6 +496,36 @@ def warnings_for(gate: dict, uncertainty: dict, evidence: dict, drift: dict | No
             })
 
         deviating = drift.get("observed_deviation_rate")
+        promised_dev = drift.get("promised_deviation_rate")
+        if (
+            deviating is not None
+            and promised_dev
+            and deviating > 0.0
+            and deviating < promised_dev - DRIFT_TOLERANCE
+        ):
+            found.append({
+                "severity": "medium",
+                "code": "gate_deviates_less_than_promised",
+                "detail": (
+                    f"the calibration promised the gate would deviate on "
+                    f"{promised_dev:.0%} of queries; {deviating:.0%} of the last "
+                    f"{drift['n_runs']} matched runs did. The regression rate is "
+                    "checked one-sided, because only *worse* matters there. This "
+                    "one is not symmetric either: a gate deviating far below its "
+                    "promised rate is leaving headroom on the table, and it does "
+                    "so without producing a single regression to notice. "
+                    "The first time this fired it was the *benchmark* that "
+                    "was wrong, not the gate: `app.benchmark` was offering the "
+                    "model candidates carrying disabled nodes, which "
+                    "`planner.plan_query` drops. They look 340x cheap, the "
+                    "model picks one, `_is_unsafe` vetoes it, and the query "
+                    "loses its deviation entirely instead of falling back to "
+                    "the next real candidate -- 36 of 43 vetoes with both gate "
+                    "conditions already satisfied (2.83). So check what the "
+                    "observed side was measured over before re-tuning the gate."
+                ),
+            })
+
         if deviating is not None and deviating == 0.0:
             found.append({
                 "severity": "medium",

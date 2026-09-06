@@ -1,7 +1,21 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import ExperimentPanel from "./ExperimentPanel";
+import { fetchSettings } from "../api";
+
+vi.mock("../api", () => ({ fetchSettings: vi.fn() }));
+
+// Every test in this file renders the panel, and the panel asks the backend for
+// its policy list on mount. Without a default the mock returns `undefined` and
+// the `.then` throws -- which is a mock problem masquerading as seven failures
+// in tests that have nothing to do with policies.
+beforeEach(() => {
+  fetchSettings.mockReset();
+  fetchSettings.mockResolvedValue({
+    fields: [{ name: "selection_policy", options: ["greedy", "pairwise_rank"] }],
+  });
+});
 
 // The panel exists so the *rigorous* comparison stops being the inconvenient
 // one. Every other panel reports a single sweep; this one interleaves two arms
@@ -97,5 +111,49 @@ describe("settling a comparison", () => {
     );
 
     expect(screen.getByText(/postgres went away/)).toBeInTheDocument();
+  });
+});
+
+// The policy list is the backend's, not this file's.
+//
+// It was spelled out here three times and `borda` was added to the seven backend
+// places and not to this one, so the dashboard offered an A/B over four policies
+// while the server ran five. A panel that cannot select the policy you want to
+// compare quietly decides the comparison for you.
+describe("the policies it offers", () => {
+  it("offers whatever the backend declares", async () => {
+    fetchSettings.mockResolvedValue({
+      fields: [
+        { name: "selection_policy", options: ["greedy", "pairwise_rank", "borda"] },
+      ],
+    });
+
+    render(<ExperimentPanel status={null} onStart={vi.fn()} />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "borda" })).toBeInTheDocument(),
+    );
+  });
+
+  it("falls back to a known list when the settings call fails", async () => {
+    // Stale is not the same as broken: a panel that cannot reach the API still
+    // has to render something selectable.
+    fetchSettings.mockRejectedValue(new Error("offline"));
+
+    render(<ExperimentPanel status={null} onStart={vi.fn()} />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "pairwise_rank" })).toBeInTheDocument(),
+    );
+  });
+
+  it("ignores a settings response with no policy field", async () => {
+    fetchSettings.mockResolvedValue({ fields: [{ name: "confidence_z" }] });
+
+    render(<ExperimentPanel status={null} onStart={vi.fn()} />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "greedy" })).toBeInTheDocument(),
+    );
   });
 });

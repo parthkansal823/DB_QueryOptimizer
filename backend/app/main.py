@@ -131,6 +131,7 @@ def _apply_settings(values: dict) -> None:
     planner.INCLUDE_PARALLEL = values["include_parallel"]
     planner.INCLUDE_ENABLE_SETTINGS = values["include_enable_settings"]
     planner.INCLUDE_INDEX_PINNING = values["include_index_pinning"]
+    planner.INCLUDE_DISABLE_INDEX = values["include_disable_index"]
     planner.INCLUDE_EXTENDED_TOGGLES = values["include_extended_toggles"]
     planner.INCLUDE_COST_MODEL = values["include_cost_model"]
     planner.ADAPTIVE_CANDIDATE_BUDGET = values["adaptive_candidate_budget"]

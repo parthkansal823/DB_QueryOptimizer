@@ -330,10 +330,24 @@ class TestMeasuredBloat:
 class TestDeterministicSession:
     """
     §19.7.3 on `geqo_seed`: "Varying the value changes the set of join paths
-    explored, and may result in a better or worse best path being found." It
-    defaults to 0, which sounds fixed and is not — GEQO reseeds per planning
-    cycle. On a large join that turns a paired A/B into a comparison of two draws
-    from a random search.
+    explored, and may result in a better or worse best path being found."
+
+    Both halves of that are measured on PostgreSQL 18.6 (`docs/WRITEUP.md` 2.81),
+    and one of them contradicts what this class used to assert.
+
+    **Varying it does change the plan.** With GEQO forced on
+    (`geqo_threshold=2`, `geqo_effort=1`) seeds 0, 0.25, 0.5 and 0.75 give four
+    different join orders for the same query. So pinning it is load-bearing.
+
+    **It does not reseed per planning cycle.** This docstring used to say "it
+    defaults to 0, which sounds fixed and is not", and that was the whole
+    argument for pinning a *non-default* 0.5. Planned twelve times at seed 0:
+    **one** distinct plan. Zero is a fixed seed like any other.
+
+    So the value is now **0** -- equally repeatable, and identical to what the
+    server does. `make_deterministic` is called by collection and the benchmark
+    and not by `app.main`, so a non-default value meant the labels were measured
+    under a join search the served query does not run.
     """
 
     class _Cur:
@@ -356,8 +370,25 @@ class TestDeterministicSession:
 
         cur = self._Cur()
         result = make_deterministic(cur)
-        assert result["applied"]["geqo_seed"] == "0.5"
+        assert result["applied"]["geqo_seed"] == "0"
         assert result["failed"] == {}
+
+    def test_every_pinned_value_is_the_server_default(self):
+        """
+        The point of pinning is repeatability, and any fixed value delivers it --
+        so among fixed values, the server's own is free and closes a train/serve
+        gap. Collection and the benchmark call `make_deterministic`; serving does
+        not, and every latency serving logs becomes a training label.
+
+        Both entries now match PostgreSQL 18.6's defaults, checked against
+        `pg_settings` rather than assumed.
+        """
+        from app.measurement import DETERMINISTIC_SESSION
+
+        assert dict(DETERMINISTIC_SESSION) == {
+            "geqo_seed": "0",
+            "max_parallel_workers_per_gather": "2",
+        }
 
     def test_an_unsettable_guc_is_reported_not_raised(self):
         """

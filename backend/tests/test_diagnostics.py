@@ -56,6 +56,12 @@ HEALTHY_GATE = {
     # against. For the project's whole history it did not, and the two silently
     # disagreed -- `greedy` calibrated, `pairwise_rank` served (2.43).
     "calibrated_with_policy": DEFAULT_SELECTION_POLICY,
+    # And which *model* it was calibrated against. `calibrated_against_bundle`
+    # records a path, and a path does not change when the model at it is
+    # replaced -- so a promotion left a stale gate in place with both existing
+    # drift checks reporting green (2.73). Filled in below, because it is a
+    # digest of the bundle it belongs to.
+    "calibrated_against_model": None,
 }
 HEALTHY_BUNDLE = {
     "target": "log_ratio_vs_native",
@@ -75,8 +81,21 @@ HEALTHY_EVAL = {
 # -- staying quiet when nothing is wrong ------------------------------------
 
 
+def _healthy_gate_for(bundle: dict) -> dict:
+    """A gate that records the model it belongs to, which is what healthy means
+    now."""
+    from app.calibrate import bundle_identity
+
+    return {**HEALTHY_GATE, "calibrated_against_model": bundle_identity(bundle)}
+
+
 def test_a_healthy_model_raises_nothing(tmp_path):
-    paths = _write(tmp_path, gate=HEALTHY_GATE, bundle=HEALTHY_BUNDLE, evaluation=HEALTHY_EVAL)
+    paths = _write(
+        tmp_path,
+        gate=_healthy_gate_for(HEALTHY_BUNDLE),
+        bundle=HEALTHY_BUNDLE,
+        evaluation=HEALTHY_EVAL,
+    )
 
     report = diagnostics.diagnose(paths["model"], paths["gate"], paths["eval"])
 
@@ -670,3 +689,80 @@ def test_the_served_families_match_the_ones_the_sweep_filters_on():
     kept_by_declared = {c["hint"] for c in _servable(probe, allowed=served)}
 
     assert kept == kept_by_declared
+
+
+class TestTheDeviationRateIsCheckedInBothDirections:
+    """
+    `docs/WRITEUP.md` 2.83. The regression rate is flagged when it exceeds its
+    promise by `DRIFT_TOLERANCE`, correctly one-sided -- only *worse* matters.
+    The deviation rate was flagged only when it hit **exactly zero**, so a gate
+    promising 69% and delivering 32% fell straight through.
+
+    That asymmetry hides the quieter failure: a gate deviating far below its
+    promised rate leaves headroom on the table and produces no regression to
+    notice while doing it.
+    """
+
+    def _drift(self, promised, observed, runs=200):
+        return {
+            "enough_runs_to_judge": True,
+            "n_runs": runs,
+            "promised_regression_rate": 0.2,
+            "observed_regression_rate": 0.2,
+            "promised_deviation_rate": promised,
+            "observed_deviation_rate": observed,
+            "scoped_to_gate": True,
+            "gate_applied_at": "2026-09-06T00:00:00+00:00",
+        }
+
+    def _codes(self, drift):
+        from app.diagnostics import warnings_for
+
+        gate = {
+            "confidence_z": 1.0, "min_relative_gain": 0.05,
+            "calibrated_on_n_queries": 40, "expected_regression_rate": 0.2,
+            "calibrated_with_policy": "pairwise_rank",
+        }
+        return {
+            w["code"]
+            for w in warnings_for(gate, {"uncertainty_scale": 1.0},
+                                  {"n_rows": 999}, self._drift and drift)
+        }
+
+    def test_far_below_the_promise_is_flagged(self):
+        assert "gate_deviates_less_than_promised" in self._codes(
+            self._drift(0.69, 0.32)
+        )
+
+    def test_close_to_the_promise_is_not(self):
+        assert "gate_deviates_less_than_promised" not in self._codes(
+            self._drift(0.69, 0.62)
+        )
+
+    def test_above_the_promise_is_not_flagged_here(self):
+        """Deviating *more* than promised is not this finding's business -- it
+        shows up as regressions if it is a problem at all."""
+        assert "gate_deviates_less_than_promised" not in self._codes(
+            self._drift(0.30, 0.80)
+        )
+
+    def test_a_total_no_op_keeps_its_own_stronger_finding(self):
+        """Zero is a different diagnosis from 'half', and the more severe one
+        should not be swallowed by the new check."""
+        codes = self._codes(self._drift(0.69, 0.0))
+
+        assert "optimizer_never_deviates" in codes
+        assert "gate_deviates_less_than_promised" not in codes
+
+    def test_a_gate_with_no_promise_cannot_be_judged(self):
+        """An older gate file records no expected deviation rate; inventing one
+        would be worse than saying nothing."""
+        assert "gate_deviates_less_than_promised" not in self._codes(
+            self._drift(None, 0.32)
+        )
+
+    def test_too_few_runs_says_nothing(self):
+        drift = self._drift(0.69, 0.32, runs=3)
+        drift["enough_runs_to_judge"] = False
+
+        assert "gate_deviates_less_than_promised" not in self._codes(drift)

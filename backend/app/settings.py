@@ -289,6 +289,22 @@ FIELDS: dict[str, dict] = {
         "env": "INCLUDE_INDEX_PINNING",
         "default": False,
     },
+    "include_disable_index": {
+        "type": "bool",
+        "label": "Plan as if an index were dropped",
+        "group": "Action space",
+        "help": (
+            "`DisableIndex(t idx)` makes the planner search as though that index "
+            "had already been dropped -- measured on PG18.6 taking a query from "
+            "an 8.4-cost index scan to a 4,059-cost sequential scan. Needs "
+            "pg_hint_plan 1.8+, which arrived with the PostgreSQL 18 upgrade. "
+            "Undeclared here until 2.74, so the only way to reach the family was "
+            "an environment variable -- and that did nothing either, because the "
+            "catalog map it needs was gated on the index-pinning flag."
+        ),
+        "env": "INCLUDE_DISABLE_INDEX",
+        "default": False,
+    },
     "include_extended_toggles": {
         "type": "bool",
         "label": "More operator toggles",

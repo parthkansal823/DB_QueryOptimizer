@@ -337,6 +337,56 @@ def test_every_declared_setting_is_actually_applied():
     )
 
 
+# Planner switches that deliberately have no settings-panel equivalent.
+#
+# Empty, and that is the point: every action-space family the planner can offer
+# should be reachable from the running system, not only from an environment
+# variable set before the process started.
+NOT_EXPOSED_IN_SETTINGS: set[str] = set()
+
+
+def test_every_action_space_flag_is_reachable_from_the_settings_panel():
+    """
+    The other direction of `test_every_declared_setting_is_actually_applied`,
+    and the one it cannot see.
+
+    That test walks `settings.FIELDS` and checks each is applied. A family flag
+    that was never *declared* passes it trivially -- there is nothing to walk.
+    `INCLUDE_DISABLE_INDEX` sat like that: a real family, a real environment
+    variable, no settings entry, and no way to switch it on from the dashboard
+    or the API (2.74).
+
+    Environment-variable-only is not a neutral default. It means the family
+    cannot be toggled without a restart, cannot be A/B'd by `app.experiment`,
+    and does not appear in the one place a reader looks to find out what the
+    action space contains.
+    """
+    from app.optimizer import planner
+    from app import settings
+
+    flags = {name for name in dir(planner) if name.startswith("INCLUDE_")}
+    declared = {
+        spec.get("env") for spec in settings.FIELDS.values() if spec.get("env")
+    }
+
+    missing = sorted(f for f in flags - declared if f not in NOT_EXPOSED_IN_SETTINGS)
+
+    assert missing == [], (
+        f"planner offers these families and the settings panel cannot reach "
+        f"them: {missing}. Declare them in `settings.FIELDS` or add them to "
+        f"NOT_EXPOSED_IN_SETTINGS with a reason."
+    )
+
+
+def test_the_settings_exemptions_all_name_real_flags():
+    """An exemption for a flag that no longer exists re-opens the hole silently,
+    which is the same argument as the test below."""
+    from app.optimizer import planner
+
+    flags = {name for name in dir(planner) if name.startswith("INCLUDE_")}
+    assert NOT_EXPOSED_IN_SETTINGS <= flags
+
+
 def test_the_exemptions_all_name_real_settings():
     """An exemption for a field that no longer exists would silently re-open the
     hole it was carved for."""

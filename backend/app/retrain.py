@@ -173,7 +173,7 @@ def _score_bundle(
 
     # Local import: `app.calibrate` imports `served_policy` from here, so a
     # module-level import would close the cycle.
-    from app.calibrate import _servable
+    from app.calibrate import _servable, without_provable_noops
 
     picked: list[float] = []
     worst_ratio = 1.0
@@ -200,6 +200,17 @@ def _score_bundle(
             c for c in _servable([_row_to_candidate(r) for r in rows if not r["is_baseline"]])
             if not c.get("disabled_nodes")
         ]
+        # `best = min(latencies)` below is the number that has rejected two
+        # challengers, so the pool it is taken over has to be plans a served
+        # query could actually get. 2.76: 14.4% of logged candidates are
+        # byte-identical to native, and one of them is the ceiling on 11 of 65
+        # queries. Shared with `calibrate` and `train` so the three cannot
+        # diverge again (2.47).
+        baseline_rows = [r for r in rows if r["is_baseline"]]
+        candidates = without_provable_noops(
+            candidates,
+            baseline_rows[0].get("raw_plan") if baseline_rows else None,
+        )
         if not candidates:
             continue
         latencies = [c["actual_total_time_ms"] for c in candidates]

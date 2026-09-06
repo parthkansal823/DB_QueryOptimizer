@@ -70,7 +70,31 @@ ALWAYS_ON = frozenset({"join_order", "operator_toggle", "cardinality"})
 # are queries the 30-query evaluation recorded as having "almost nothing to
 # win" (14.4 ms and 2.7 ms of headroom), which was true of the action space and
 # not of the query.
-OPTIONAL_FAMILIES = ("resource", "join_method", "scan_method")
+# Every family `hint_family` can name that is not always on.
+#
+# `memoize` and `parallel` were missing, and the consequence was not that they
+# went unpriced -- it was worse. `_servable(candidates, allowed=space)` drops
+# every candidate whose family is not in the set it is handed, and no space the
+# axis built ever contained them. So with `INCLUDE_MEMOIZE=1` the server offers
+# the family, every arm of the sweep silently excludes it, and the tool
+# recommends a gate calibrated against an action space narrower than the one
+# being served.
+#
+# That is 2.47's finding, in the tool written after 2.47 to prevent it. The
+# check that finds this class mechanically is "does this measurement agree with
+# what runs", and here the two lists that had to agree -- `hint_family`'s
+# vocabulary and this tuple -- were four hundred lines apart in different files.
+ALL_OPTIONAL_FAMILIES = (
+    "resource", "join_method", "scan_method", "memoize", "parallel",
+    # Sub-families of `join_order` and `scan_method` that a flag switches on
+    # independently. `calibrate.action_family` separates them so the sweep can
+    # price them; `hint_family` deliberately does not, because the regression
+    # guard blocks at the coarser level. Before this the sweep could turn
+    # `INCLUDE_BUSHY` on and had no way to see what it added.
+    "bushy", "disable_index",
+)
+# Kept as the name the rest of the module and its tests use.
+OPTIONAL_FAMILIES = ALL_OPTIONAL_FAMILIES
 
 # Policies whose answer is a draw rather than a value.
 #
@@ -119,6 +143,79 @@ DEFAULT_REPEATS = 5
 MIN_POLICY_SWITCH_POINTS = 2.0
 
 
+def served_families() -> set[str]:
+    """The action space the deployment currently offers.
+
+    Read from `optimizer/planner.py`'s flags -- the same ones the serving path
+    uses -- so "the incumbent" here means what actually runs rather than what a
+    constant in this file says runs.
+    """
+    from app.optimizer import planner
+
+    families = set(ALWAYS_ON)
+    if planner.INCLUDE_TUNING:
+        families.add("resource")
+    if planner.INCLUDE_JOIN_METHODS:
+        families.add("join_method")
+    if (
+        planner.INCLUDE_SCAN_METHODS
+        or planner.INCLUDE_NEGATIVE_SCANS
+        or planner.INCLUDE_INDEX_PINNING
+    ):
+        families.add("scan_method")
+    if planner.INCLUDE_BUSHY:
+        families.add("bushy")
+    if planner.INCLUDE_DISABLE_INDEX:
+        families.add("disable_index")
+    return families
+
+
+def available_families(
+    exclude_prefix: str | None = DEFAULT_EXCLUDE_PREFIX,
+    optional: tuple[str, ...] = ALL_OPTIONAL_FAMILIES,
+) -> tuple[str, ...]:
+    """
+    The optional families that actually appear in the rows being scored.
+
+    Completing the axis (adding `memoize` and `parallel`) takes it from 8 spaces
+    to 32, and 32 spaces x 5 policies x the threshold grid is four times the
+    work for families the log may hold nothing about. Sweeping a family with no
+    rows is not merely wasted: it doubles the configuration count to compare an
+    arm against an identical copy of itself, and 2.67 is what a sweep that
+    cannot separate its own arms produces -- a recommendation on a tenth of a
+    point.
+
+    So the axis is derived from the data rather than declared. A family absent
+    from the log is reported as skipped rather than silently omitted, because
+    "not measured" and "measured worthless" are different answers and the
+    previous version gave the second for both.
+    """
+    from app import calibrate
+
+    # Through the module, not a name bound at import.
+    #
+    # `from app.calibrate import _grouped_rows` copies the function object into
+    # this module's namespace, so a caller that replaces `calibrate._grouped_rows`
+    # -- which is how every test in `test_autotune.py` supplies its rows, and
+    # how `sweep` gets them -- would not affect this. The axis would then be
+    # derived from one population and scored against another, which is 2.70's
+    # question ("which population is this computed over?") answered wrongly
+    # twice in one day.
+    # Keyword, because that is how `sweep` calls it and how every stub in
+    # `test_autotune.py` is written to be called. Same function, same argument,
+    # different calling convention is enough to miss a substitution.
+    grouped = calibrate._grouped_rows(exclude_prefix=exclude_prefix)
+    seen: set[str] = set()
+    for rows in grouped.values():
+        for row in rows:
+            if row.get("is_baseline"):
+                continue
+            family = calibrate.action_family(row.get("hint"))
+            if family in optional:
+                seen.add(family)
+    return tuple(f for f in optional if f in seen)
+
+
 def action_spaces(optional: tuple[str, ...] = OPTIONAL_FAMILIES) -> list[set[str]]:
     """
     Every subset of the optional families, smallest first.
@@ -146,7 +243,9 @@ def tune(
     repeats: int = DEFAULT_REPEATS,
 ) -> dict:
     """Sweep every combination and return the best, with the runners-up."""
-    spaces = action_spaces() if spaces is None else spaces
+    available = available_families(exclude_prefix)
+    skipped = tuple(f for f in ALL_OPTIONAL_FAMILIES if f not in available)
+    spaces = action_spaces(available) if spaces is None else spaces
     results: list[dict] = []
 
     for policy in policies:
@@ -256,8 +355,57 @@ def tune(
                     best_held = row
             winner = {**best_held, "kept_incumbent_over": winner["policy"]}
 
+    # The same rule for the action space, and it was missing.
+    #
+    # `MIN_POLICY_SWITCH_POINTS` was added because this tool recommended
+    # switching the served policy on a 0.8-point difference, having printed two
+    # lines earlier that a difference that size was inside its own spread. The
+    # action space has exactly the same property and had no such guard: on the
+    # run that prompted this, `resource` won at 4.3% against the incumbent
+    # narrow space's 4.2% -- **one tenth of a point** -- and the report said to
+    # export `INCLUDE_TUNING=1`.
+    #
+    # Turning a hint family on is not free. It widens what collection has to
+    # execute, widens what the model must score, and 2.63 measured a wider
+    # action space raising the ceiling and the risk together. A tenth of a point
+    # of replayed net improvement does not pay for that, and 2.67 measured the
+    # same family at exactly 0.0 ms on the previous log.
+    #
+    # Same floor, same reasoning: the incumbent has to be beaten, not matched.
+    if winner is not None:
+        incumbent_space = served_families()
+        floor = winner["recommended"]["net_improvement_pct"] - MIN_POLICY_SWITCH_POINTS
+        if (
+            set(winner["families"]) != incumbent_space
+            and winner["policy"] == served_policy()
+        ):
+            same_space = [
+                r for r in qualified
+                if r["policy"] == winner["policy"]
+                and set(r["families"]) == incumbent_space
+                and r["recommended"]["net_improvement_pct"] >= floor
+            ]
+            if same_space:
+                best_same = None
+                for row in same_space:
+                    if _dominates(
+                        row["recommended"],
+                        best_same["recommended"] if best_same else None,
+                    ):
+                        best_same = row
+                winner = {
+                    **best_same,
+                    "kept_incumbent_over": winner.get("kept_incumbent_over"),
+                    "kept_action_space_over": sorted(
+                        set(winner["families"]) - incumbent_space
+                    ),
+                }
+
     return {
         "bundle": bundle_path,
+        # Reported, not swallowed. "Not measured" and "measured worthless" are
+        # different answers, and the axis used to give the second for both.
+        "families_skipped_for_lack_of_rows": list(skipped),
         "n_configurations": len(results),
         "n_qualified": len(qualified),
         "winner": winner,
@@ -266,12 +414,35 @@ def tune(
     }
 
 
+# One environment variable per optional family. `scan_method` has three flags
+# that all produce it, and `INCLUDE_SCAN_METHODS` is the one the sweep means:
+# the other two (`INCLUDE_NEGATIVE_SCANS`, `INCLUDE_DISABLE_INDEX`) generate the
+# same family and cannot be told apart in the log, so the axis cannot recommend
+# between them. That is the same limitation `INCLUDE_BUSHY` has under
+# `join_order`, and it is recorded here rather than left for a reader to
+# discover from a recommendation that does not do what it says.
+FAMILY_ENV = {
+    "resource": "INCLUDE_TUNING",
+    "join_method": "INCLUDE_JOIN_METHODS",
+    "scan_method": "INCLUDE_SCAN_METHODS",
+    "memoize": "INCLUDE_MEMOIZE",
+    "parallel": "INCLUDE_PARALLEL",
+    "bushy": "INCLUDE_BUSHY",
+    "disable_index": "INCLUDE_DISABLE_INDEX",
+}
+
+
 def families_env(families: list[str]) -> list[str]:
-    """The environment variables the winning action space corresponds to."""
+    """The environment variables the winning action space corresponds to.
+
+    Every optional family, not a hardcoded three. `memoize` and `parallel`
+    joined the axis in 2.75 and this list did not follow them, so the sweep
+    could recommend a family and then print instructions that left it off --
+    which `tests/test_autotune.py` had already been written to forbid.
+    """
     return [
-        f"INCLUDE_TUNING={'1' if 'resource' in families else '0'}",
-        f"INCLUDE_JOIN_METHODS={'1' if 'join_method' in families else '0'}",
-        f"INCLUDE_SCAN_METHODS={'1' if 'scan_method' in families else '0'}",
+        f"{env}={'1' if family in families else '0'}"
+        for family, env in FAMILY_ENV.items()
     ]
 
 
@@ -280,6 +451,16 @@ def format_report(report: dict, limit: int = 12) -> list[str]:
         f"swept {report['n_configurations']} configurations against "
         f"{report['bundle']}; {report['n_qualified']} produced a gate that "
         f"clears the safety bounds",
+    ]
+    skipped = report.get("families_skipped_for_lack_of_rows") or []
+    if skipped:
+        lines.append(
+            f"not on the axis -- no rows in the log to score them: "
+            f"{', '.join(skipped)}. Collect with the family on before reading "
+            f"anything into its absence; a family with no rows scores identically "
+            f"to the space without it, which is not a measurement of the family."
+        )
+    lines += [
         "",
         f"{'policy':>14} {'extra families':>24} {'z':>5} {'gain':>5} "
         f"{'dev%':>5} {'reg%':>5} {'worst':>7} {'net%':>7}  spread",
@@ -345,6 +526,15 @@ def format_report(report: dict, limit: int = 12) -> list[str]:
             f"which scored higher by less than this replay can resolve. "
             f"Switching costs a recalibration and a window where the gate and "
             f"the server disagree; the incumbent has to be beaten, not matched."
+        )
+    if winner.get("kept_action_space_over"):
+        extra = ", ".join(f"`{f}`" for f in winner["kept_action_space_over"])
+        lines.append(
+            f"  kept the running action space over one adding {extra}, which "
+            f"scored higher by less than this replay can resolve. Turning a "
+            f"family on widens what collection executes and what the model must "
+            f"score, and 2.63 measured a wider space raising the ceiling and the "
+            f"risk together -- so the same rule applies: beaten, not matched."
         )
     if winner.get("n_draws", 1) > 1:
         lo, hi = winner["net_pct_range"]

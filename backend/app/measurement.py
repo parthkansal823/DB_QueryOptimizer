@@ -216,11 +216,35 @@ def prewarm(cur, tables: list[str], schema: str = "public") -> dict:
 # current workload -- so this is insurance for the JOB-scale benchmark the
 # project is aimed at rather than a fix for today.
 DETERMINISTIC_SESSION: tuple[tuple[str, str], ...] = (
-    ("geqo_seed", "0.5"),
+    # 0, which is the server's own default, not 0.5.
+    #
+    # The point of this tuple is repeatability, and any fixed seed delivers
+    # that -- so the choice between 0.5 and 0 is free, and 0 additionally makes
+    # the measured session identical to the served one. `make_deterministic` is
+    # called by `app.collect_data`, `app.benchmark` and `app.selection_effect`
+    # and **not** by `app.main`: serving runs on the server defaults, and every
+    # latency it logs becomes a training label.
+    #
+    # Measured before changing it, because "probably inert" is how the rest of
+    # this file's findings started. `geqo_seed` only applies above
+    # `geqo_threshold` (12 relations), so the synthetic schema's six can never
+    # reach it; JOB's `17*` family can. Planned bare and with a partial hint
+    # under both seeds, the `plan_fingerprint` was identical on **12 of 12**
+    # (query, hint) pairs -- GEQO converges to the same plan here whatever it
+    # starts from.
+    #
+    # So this changes nothing today. It is still the right value: a difference
+    # that buys nothing is a difference waiting to matter on a workload with a
+    # larger join space, and it would show up as labels that describe a plan the
+    # server does not build.
+    ("geqo_seed", "0"),
     # A parallel plan that gets fewer workers than it planned for is measured
     # under conditions the planner did not assume (§15.2). Pinning the ceiling
     # keeps every run of a comparison asking for the same thing; whether it
     # *got* it is what `plan_extractor.parallel_shortfall` checks.
+    # Also the server default here, checked rather than assumed -- so both
+    # entries now pin what serving already does, and the gap between the
+    # measured session and the served one is closed by construction.
     ("max_parallel_workers_per_gather", "2"),
 )
 

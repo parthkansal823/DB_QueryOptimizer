@@ -259,9 +259,34 @@ def collect(
                 # None when the family is off or the cursor is missing, and the
                 # family then generates nothing.
                 include_disable_index=planner.INCLUDE_DISABLE_INDEX,
+                # Forwarded explicitly. `include_index_pinning` defaults to True
+                # -- the catalog map used to be the flag -- so passing the map
+                # without the flag collects a family serving does not offer.
+                # `tests/test_family_guard.py` caught exactly that.
+                include_index_pinning=planner.INCLUDE_INDEX_PINNING,
                 table_indexes=planner._index_candidates_for(cur, baseline),
             )
 
+            # Collection deliberately does **not** run `prefilter` here.
+            #
+            # It looked like an obvious bug: `planner.candidate_hints` drops
+            # candidates the baseline plan proves cannot change anything, this
+            # loop calls `generate_candidates` directly, so collection executes
+            # and logs plans byte-identical to native -- 188 of 1,304 servable
+            # candidates on the synthetic log, 14.4%, and serving never offers
+            # one of them.
+            #
+            # Measured, dropping them from training makes the model's typical
+            # error **worse on 15 of 16 paired splits** (p = 0.001). A row
+            # saying "this hint changed nothing and the result was 1.0x" is
+            # real evidence about the level the gate reads, and 2.70 found the
+            # same thing about the baseline pairs the ranker trains on.
+            #
+            # So this is 2.9's harmless direction of a train/serve difference:
+            # the model sees candidates it will never be *asked* about, which
+            # costs collection time and buys calibration. What is not harmless
+            # is letting those rows be the **oracle** -- see
+            # `train._evaluate_selection`.
             for hint in hints:
                 hinted_sql = apply_hint(sql, hint)
                 for _ in range(reps):
