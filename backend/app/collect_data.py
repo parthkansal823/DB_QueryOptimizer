@@ -78,6 +78,156 @@ def _median_latency(runs: list[dict]) -> float | None:
     return times[len(times) // 2]
 
 
+def select_workload(
+    workload: list[dict],
+    only: str | None = None,
+    held_out: bool = False,
+    bundle_path: str = "models/plan_selector.pkl",
+) -> list[dict]:
+    """
+    Narrow the workload to named queries, or to the ones the sweep can score.
+
+    ## Why `--held-out` exists
+
+    A collection run costs one execution per candidate per repetition and is
+    routinely stopped partway. `WORKLOAD` is iterated in list order, so a run
+    that dies early always covers the same alphabetical prefix -- and after the
+    run that finally turned on the five unscored families, `memoize`,
+    `parallel`, `join_method` and `disable_index` had rows on 16 of 65 queries,
+    every one of them a `corr_*`.
+
+    That is not a thin sample, it is the wrong 16. `calibrate.sweep` scores on
+    **held-out queries only** (`_held_out_queries`, and 2.2.1 for why), and
+    just **4** of those 16 were held out. Five families' worth of collection
+    bought four scoreable queries, and the deltas it produced -- -15, -7, 0,
+    0 and +2 ms -- sit well inside 2.18's 18.6% noise floor.
+
+    So the rows that can change an answer are the held-out ones, and there is
+    no reason to spend the budget in list order. This makes the collection
+    aim at them.
+
+    An unknown id raises rather than collecting nothing: a run that reports
+    "0 queries" and exits 0 is this project's whole bug class in miniature.
+    """
+    if held_out:
+        import pickle
+
+        with open(bundle_path, "rb") as fh:
+            wanted = set(pickle.load(fh).get("held_out_queries") or ())
+        if not wanted:
+            raise SystemExit(
+                f"{bundle_path} records no held-out queries, so there is "
+                "nothing to aim at. Train a model first."
+            )
+    elif only:
+        wanted = {q.strip() for q in only.split(",") if q.strip()}
+    else:
+        return workload
+
+    known = {item["id"] for item in workload}
+    missing = sorted(wanted - known)
+    if missing and not held_out:
+        raise SystemExit(f"not in this workload: {', '.join(missing)}")
+    selected = [item for item in workload if item["id"] in wanted]
+    if not selected:
+        raise SystemExit("nothing selected; refusing to run an empty collection")
+    return selected
+
+
+def families_at_risk(workload: list[dict]) -> dict[str, set[str]]:
+    """
+    Families the latest logged run has for these queries that this run will not.
+
+    `calibrate._grouped_rows` keeps only the most recent `created_at` per
+    query, for the reason its docstring gives: replaying all of history
+    compares a candidate measured in one run against a native measured in
+    another, and on this log that reported every gate setting losing 15-25%
+    while a live benchmark of the same gate captured 40.8%.
+
+    That rule is per **query**. Families live inside a query's rows, so a
+    re-collection narrower than the last one does not add to the record, it
+    replaces it, and every family the new run does not generate stops counting.
+    2.93: a `--held-out` run without `INCLUDE_SCAN_METHODS` took `scan_method`
+    from 65 queries to zero held-out ones. Nothing was deleted -- 43,327 rows
+    were still there -- and `available_families()` would have reported the
+    family as *not scored*, which reads as "never collected".
+
+    Returns `{query_id: {family, ...}}` for the queries that would lose
+    something. Empty when this run is a superset of the last, which is the
+    normal case.
+    """
+    from app import calibrate
+
+    wanted = {item["id"] for item in workload}
+    generated = _families_this_run()
+    at_risk: dict[str, set[str]] = {}
+    for query_id, rows in calibrate._grouped_rows().items():
+        if query_id not in wanted:
+            continue
+        logged = {
+            calibrate.action_family(r.get("hint"))
+            for r in rows if not r.get("is_baseline")
+        }
+        logged.discard(None)
+        missing = logged - generated
+        if missing:
+            at_risk[query_id] = missing
+    return at_risk
+
+
+def _families_this_run() -> set[str]:
+    """Which action families this process's flags will actually generate."""
+    # `collect()` defaults `include_tuning` to True regardless of the env flag,
+    # so `resource` is generated unless --no-tuning is passed. The three below
+    # it are autotune's ALWAYS_ON set.
+    families = {"join_order", "operator_toggle", "cardinality", "resource"}
+    for flag, family in (
+        ("INCLUDE_JOIN_METHODS", "join_method"),
+        ("INCLUDE_SCAN_METHODS", "scan_method"),
+        ("INCLUDE_MEMOIZE", "memoize"),
+        ("INCLUDE_PARALLEL", "parallel"),
+        ("INCLUDE_BUSHY", "bushy"),
+        ("INCLUDE_DISABLE_INDEX", "disable_index"),
+    ):
+        if getattr(planner, flag, False):
+            families.add(family)
+    return families
+
+
+def warn_if_narrower(workload: list[dict]) -> None:
+    """Print what this run is about to stop counting. Never refuses.
+
+    A deliberately narrow collection is a legitimate thing to want. What is not
+    legitimate is it happening silently, which is what 2.93 was.
+    """
+    try:
+        at_risk = families_at_risk(workload)
+    except Exception as exc:  # noqa: BLE001 - a warning must not stop a run
+        print(f"  [warn] could not check family coverage: {exc}", file=sys.stderr)
+        return
+    if not at_risk:
+        return
+
+    losing: dict[str, int] = {}
+    for families in at_risk.values():
+        for family in families:
+            losing[family] = losing.get(family, 0) + 1
+
+    print("", file=sys.stderr)
+    print("  [warn] this run generates a NARROWER family set than the latest "
+          "run already logged", file=sys.stderr)
+    print("         for these queries. Only the latest run per query counts "
+          "(calibrate._grouped_rows),", file=sys.stderr)
+    print("         so the families below will stop being scored:",
+          file=sys.stderr)
+    for family, n in sorted(losing.items(), key=lambda kv: -kv[1]):
+        print(f"           {family:<16} loses {n} of {len(workload)} queries",
+              file=sys.stderr)
+    print("         Set the matching INCLUDE_* flags if that is not what you "
+          "want. See WRITEUP 2.93.", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def collect(
     reps: int = DEFAULT_REPS,
     include_join_methods: bool | None = None,
@@ -124,6 +274,7 @@ def collect(
         include_join_methods = planner.INCLUDE_JOIN_METHODS
 
     workload = workload if workload is not None else WORKLOAD
+    warn_if_narrower(workload)
     start = time.time()
     total_rows = 0
     skipped_disabled = 0
@@ -395,8 +546,21 @@ if __name__ == "__main__":
         help="skip the resource/cost-model candidates (parallelism, work_mem, ...)",
     )
     parser.add_argument("--timeout-ms", type=int, default=30_000, help="per-candidate statement_timeout")
+    parser.add_argument(
+        "--only",
+        help="comma-separated query ids to collect, instead of the whole workload",
+    )
+    parser.add_argument(
+        "--held-out",
+        action="store_true",
+        help=(
+            "collect only the queries the trained model held out -- the ones "
+            "app.calibrate.sweep actually scores on. See select_workload()"
+        ),
+    )
     args = parser.parse_args()
     collect(
+        workload=select_workload(WORKLOAD, only=args.only, held_out=args.held_out),
         reps=args.reps,
         # `False` when the flag is given, otherwise `None` -- which lets
         # `collect()` read `planner.INCLUDE_JOIN_METHODS`, the flag serving

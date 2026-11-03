@@ -78,6 +78,13 @@ def row(
     )
 
 
+# Spelled out here rather than inline: a test for "the source does not
+# contain a backspace" must not contain one either.
+BOUNDARY = chr(92) + "y"
+BACKSPACE_ESCAPE = chr(92) + "b"
+WHITESPACE_CLASS = chr(92) + "s"
+
+
 # -- graceful absence --------------------------------------------------------
 
 
@@ -251,3 +258,76 @@ def test_spilling_is_still_reported_for_sweep_traffic():
     """
     sweep = row(query="EXPLAIN (FORMAT JSON, ANALYZE) SELECT ...", temp=8148)
     assert query_stats.report(_Cursor([sweep]))["spilling"]
+
+
+# -- the utility-statement filter --------------------------------------------
+
+
+class _SqlCapturingCursor(_Cursor):
+    """Keeps the statement text so the WHERE clause can be inspected."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.statements = []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        super().execute(sql, params)
+
+    @classmethod
+    def main_query(cls):
+        """The statement `report` actually sends, not one retyped here."""
+        cur = cls()
+        query_stats.report(cur)
+        return next(s for s in cur.statements if "pg_stat_statements" in s
+                    and "SELECT query," in s)
+
+
+class TestUtilityStatementsAreActuallyExcluded:
+    r"""2.91. The clause reads
+
+        AND query !~* '^\s*(BEGIN|COMMIT|...)\y'
+
+    and had `\b` where the `\y` is, inside a **non-raw** f-string. Two
+    separate defects with one appearance:
+
+    1. Python read `\b` as a backspace byte, so the pattern demanded a control
+       character after the keyword. It matched nothing, `!~*` was therefore
+       always true, and the filter had never excluded a single row.
+    2. Making the string raw -- which is exactly what the `SyntaxWarning`
+       asks for -- fixes nothing. A POSIX ARE reads `\b` as backspace too.
+       Postgres spells the word boundary `\y`.
+
+    Verified on the live server: as shipped and raw-with-`\b`, all of `BEGIN`,
+    `COMMIT` and `SET work_mem` were kept; with `\y` all three are excluded and
+    `BEGINNING_OF_TIME` is still kept.
+
+    The tests below are about the *statement text*, because the fake cursor
+    cannot run a regex -- but that is also where both bugs lived.
+    """
+
+    def test_the_pattern_uses_a_word_boundary(self):
+        sql = _SqlCapturingCursor.main_query()
+
+        assert "BEGIN|COMMIT" in sql, "the filter is gone entirely"
+        assert BOUNDARY in sql, (
+            f"the word boundary in a POSIX ARE is {BOUNDARY}; "
+            f"{BACKSPACE_ESCAPE} is a backspace character and the clause "
+            "silently matches nothing"
+        )
+
+    def test_no_control_character_reached_the_sql(self):
+        """The Python half. A non-raw string turns the escape into chr(8)
+        before Postgres ever sees it, and it is invisible in a diff."""
+        sql = _SqlCapturingCursor.main_query()
+
+        assert chr(8) not in sql
+        assert BACKSPACE_ESCAPE not in sql
+
+    def test_the_regex_metacharacters_survived_as_text(self):
+        r"""`\s` is not a Python escape so it passes through even unraw --
+        which is why only half the pattern was broken and the whole thing
+        looked fine."""
+        sql = _SqlCapturingCursor.main_query()
+
+        assert WHITESPACE_CLASS in sql

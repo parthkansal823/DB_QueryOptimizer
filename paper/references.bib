@@ -1,0 +1,357 @@
+% ---------------------------------------------------------------------------
+% Bibliography for main.tex (IEEEtran, IEEE reference style).
+%
+% Every entry now has a full author list. Status comments:
+%
+%   OK        checked against DBLP, Crossref, DataCite (arXiv), or the
+%             publisher.
+%   OK-ARXIV  checked against the arXiv record (DataCite); no peer-reviewed
+%             version confirmed, so it is cited as a preprint.
+%   STANDARD  a standard reference that was not looked up again in the
+%             2026-11-03 pass.
+%
+% arXiv identifiers are in `howpublished` rather than `eprint`, because
+% IEEEtran.bst ignores the eprint/archivePrefix fields and would print the
+% entry with no identifier at all.
+%
+% Journal and proceedings names use IEEE-style abbreviations.
+% ---------------------------------------------------------------------------
+
+
+% ==== learned query optimizers ============================================
+
+% VERIFY: OK
+@article{neo,
+  author  = {Marcus, Ryan and Negi, Parimarjan and Mao, Hongzi and
+             Zhang, Chi and Alizadeh, Mohammad and Kraska, Tim and
+             Papaemmanouil, Olga and Tatbul, Nesime},
+  title   = {Neo: A Learned Query Optimizer},
+  journal = {Proc. VLDB Endowment},
+  volume  = {12},
+  number  = {11},
+  pages   = {1705--1718},
+  year    = {2019}
+}
+
+% VERIFY: OK
+@inproceedings{bao,
+  author    = {Marcus, Ryan and Negi, Parimarjan and Mao, Hongzi and
+               Tatbul, Nesime and Alizadeh, Mohammad and Kraska, Tim},
+  title     = {Bao: Making Learned Query Optimization Practical},
+  booktitle = {Proc. ACM SIGMOD Int. Conf. Manage. Data},
+  pages     = {1275--1288},
+  year      = {2021}
+}
+
+% VERIFY: OK
+@inproceedings{balsa,
+  author    = {Yang, Zongheng and Chiang, Wei-Lin and Luan, Sifei and
+               Mittal, Gautam and Luo, Michael and Stoica, Ion},
+  title     = {Balsa: Learning a Query Optimizer Without Expert
+               Demonstrations},
+  booktitle = {Proc. ACM SIGMOD Int. Conf. Manage. Data},
+  pages     = {931--944},
+  year      = {2022}
+}
+
+% VERIFY: OK
+@article{lero,
+  author  = {Zhu, Rong and Chen, Wei and Ding, Bolin and Chen, Xingguang and
+             Pfadler, Andreas and Wu, Ziniu and Zhou, Jingren},
+  title   = {Lero: A Learning-to-Rank Query Optimizer},
+  journal = {Proc. VLDB Endowment},
+  volume  = {16},
+  number  = {6},
+  pages   = {1466--1479},
+  year    = {2023}
+}
+
+% VERIFY: OK -- Crossref, doi 10.1007/s00778-024-00850-3.
+@article{lerojournal,
+  author  = {Chen, Xingguang and Zhu, Rong and Ding, Bolin and Wang, Sibo and
+             Zhou, Jingren},
+  title   = {Lero: Applying Learning-to-Rank in Query Optimizer},
+  journal = {VLDB J.},
+  volume  = {33},
+  number  = {5},
+  pages   = {1307--1331},
+  year    = {2024},
+  doi     = {10.1007/s00778-024-00850-3}
+}
+
+% VERIFY: OK -- Crossref, doi 10.1145/3588963. The published title drops the
+% word "Faster" that the arXiv version (2306.06798) carries.
+@article{kepler,
+  author  = {Doshi, Lyric and Zhuang, Vincent and Jain, Gaurav and
+             Marcus, Ryan and Huang, Haoyu and Altinb\"{u}ken, Deniz and
+             Brevdo, Eugene and Fraser, Campbell},
+  title   = {Kepler: Robust Learning for Parametric Query Optimization},
+  journal = {Proc. ACM Manage. Data},
+  volume  = {1},
+  number  = {1},
+  pages   = {1--25},
+  year    = {2023},
+  doi     = {10.1145/3588963}
+}
+
+% VERIFY: OK-ARXIV
+@misc{limao,
+  author       = {Zhang, Qihan and Xie, Shaolin and Sabek, Ibrahim},
+  title        = {{LIMAO}: A Framework for Lifelong Modular Learned Query
+                  Optimization},
+  howpublished = {arXiv:2507.00188},
+  year         = {2025}
+}
+
+% VERIFY: OK-ARXIV -- authors from DataCite.
+@misc{bite,
+  author       = {Kim, Yuri and Choi, Yewon and Gil, Yujung and Lee, Sanghee and
+                  Shin, Heesik and Chong, Jaehyok},
+  title        = {{BitE}: Accelerating Learned Query Optimization in a
+                  Mixed-Workload Environment},
+  howpublished = {arXiv:2306.00845},
+  year         = {2023}
+}
+
+% VERIFY: OK -- Crossref, doi 10.1145/3725316 (SIGMOD 2025, PACMMOD).
+@article{bayesopt,
+  author  = {Tao, Jeffrey and Maus, Natalie and Jones, Haydn and Zeng, Yimeng
+             and Gardner, Jacob R. and Marcus, Ryan},
+  title   = {Learned Offline Query Planning via {B}ayesian Optimization},
+  journal = {Proc. ACM Manage. Data},
+  volume  = {3},
+  number  = {3},
+  pages   = {1--29},
+  year    = {2025},
+  doi     = {10.1145/3725316}
+}
+
+
+% ==== robustness and per-query regression =================================
+
+% VERIFY: OK-ARXIV
+@misc{reload,
+  author       = {Lee, Seokwon and Sim, Jaeyoung and Kim, Sihyun and
+                  Li, Yuhsing and Zhu, Yiwen and Park, Kwanghyun},
+  title        = {{RELOAD}: A Robust and Efficient Learned Query Optimizer for
+                  Database Systems},
+  howpublished = {arXiv:2604.14725},
+  year         = {2026}
+}
+
+% VERIFY: OK -- Crossref, doi 10.1007/s00778-026-00973-9 (article 21).
+@article{leonplus,
+  author  = {Chen, Xu and Zeng, Ximu and Wang, Yuze and Liang, Zibo and
+             Zeng, Kai and Su, Han and Zheng, Kai},
+  title   = {{LEON+}: Towards Robust {ML}-Aided Query Optimization},
+  journal = {VLDB J.},
+  volume  = {35},
+  number  = {3},
+  note    = {Art. no. 21},
+  year    = {2026},
+  doi     = {10.1007/s00778-026-00973-9}
+}
+
+% VERIFY: OK -- Crossref, doi 10.1109/ICDE60146.2024.00408.
+@inproceedings{robustsurvey,
+  author    = {Kamali, Amin and Kantere, Verena and Zuzarte, Calisto},
+  title     = {Robust Query Optimization in the Era of Machine Learning:
+               State-of-the-Art and Future Directions},
+  booktitle = {Proc. IEEE 40th Int. Conf. Data Eng. (ICDE)},
+  pages     = {5371--5375},
+  year      = {2024},
+  doi       = {10.1109/ICDE60146.2024.00408}
+}
+
+% VERIFY: OK -- Crossref, doi 10.14778/3704965.3704971.
+@article{parqo,
+  author  = {Xiu, Haibo and Agarwal, Pankaj K. and Yang, Jun},
+  title   = {{PARQO}: Penalty-Aware Robust Plan Selection in Query
+             Optimization},
+  journal = {Proc. VLDB Endowment},
+  volume  = {17},
+  number  = {13},
+  pages   = {4627--4640},
+  year    = {2024},
+  doi     = {10.14778/3704965.3704971}
+}
+
+
+% ==== verification and uncertainty ========================================
+
+% VERIFY: OK -- Crossref, doi 10.14778/3742728.3742755.
+@article{conformallqo,
+  author  = {Liu, Hanwen and Giridhara, Shashank and Sabek, Ibrahim},
+  title   = {Conformal Prediction for Verifiable Learned Query Optimization},
+  journal = {Proc. VLDB Endowment},
+  volume  = {18},
+  number  = {8},
+  pages   = {2653--2666},
+  year    = {2025},
+  doi     = {10.14778/3742728.3742755}
+}
+
+% VERIFY: STANDARD -- first edition, Springer, 2005.
+@book{vovk,
+  author    = {Vovk, Vladimir and Gammerman, Alexander and Shafer, Glenn},
+  title     = {Algorithmic Learning in a Random World},
+  publisher = {Springer},
+  address   = {New York, NY, USA},
+  year      = {2005}
+}
+
+% VERIFY: OK -- confirmed against the NeurIPS proceedings.
+@inproceedings{lightgbm,
+  author    = {Ke, Guolin and Meng, Qi and Finley, Thomas and Wang, Taifeng and
+               Chen, Wei and Ma, Weidong and Ye, Qiwei and Liu, Tie-Yan},
+  title     = {{LightGBM}: A Highly Efficient Gradient Boosting Decision Tree},
+  booktitle = {Proc. Adv. Neural Inf. Process. Syst. (NeurIPS)},
+  pages     = {3146--3154},
+  year      = {2017}
+}
+
+
+% ==== evaluation, benchmarking, measurement validity ======================
+
+% VERIFY: OK -- the closest prior work to this paper.
+@article{lehmann,
+  author  = {Lehmann, Claude and Sulimov, Pavel and Stockinger, Kurt},
+  title   = {Is Your Learned Query Optimizer Behaving As You Expect?
+             {A} Machine Learning Perspective},
+  journal = {Proc. VLDB Endowment},
+  volume  = {17},
+  number  = {7},
+  pages   = {1565--1577},
+  year    = {2024}
+}
+
+% VERIFY: OK -- VLDB 2021 Best EA&B Paper.
+@article{ready,
+  author  = {Wang, Xiaoying and Qu, Changbo and Wu, Weiyuan and
+             Wang, Jiannan and Zhou, Qingqing},
+  title   = {Are We Ready for Learned Cardinality Estimation?},
+  journal = {Proc. VLDB Endowment},
+  volume  = {14},
+  number  = {9},
+  pages   = {1640--1654},
+  year    = {2021}
+}
+
+% VERIFY: OK
+@article{cardbench,
+  author  = {Han, Yuxing and Wu, Ziniu and Wu, Peizhi and Zhu, Rong and
+             Yang, Jingyi and Tan, Liang Wei and Zeng, Kai and Cong, Gao and
+             Qin, Yanzhao and Pfadler, Andreas and Qian, Zhengping and
+             Zhou, Jingren and Li, Jiangneng and Cui, Bin},
+  title   = {Cardinality Estimation in {DBMS}: A Comprehensive Benchmark
+             Evaluation},
+  journal = {Proc. VLDB Endowment},
+  volume  = {15},
+  number  = {4},
+  pages   = {752--765},
+  year    = {2022}
+}
+
+% VERIFY: OK
+@article{leis,
+  author  = {Leis, Viktor and Gubichev, Andrey and Mirchev, Atanas and
+             Boncz, Peter and Kemper, Alfons and Neumann, Thomas},
+  title   = {How Good Are Query Optimizers, Really?},
+  journal = {Proc. VLDB Endowment},
+  volume  = {9},
+  number  = {3},
+  pages   = {204--215},
+  year    = {2015}
+}
+
+% VERIFY: OK -- DBLP journals/vldb/LeisRGMBKN18.
+@article{lookingglass,
+  author  = {Leis, Viktor and Radke, Bernhard and Gubichev, Andrey and
+             Mirchev, Atanas and Boncz, Peter and Kemper, Alfons and
+             Neumann, Thomas},
+  title   = {Query Optimization Through the Looking Glass, and What We Found
+             Running the {J}oin {O}rder {B}enchmark},
+  journal = {VLDB J.},
+  volume  = {27},
+  number  = {5},
+  pages   = {643--668},
+  year    = {2018}
+}
+
+% VERIFY: OK -- DBLP journals/pvldb/LeisGMBKN25.
+@article{stillasking,
+  author  = {Leis, Viktor and Gubichev, Andrey and Mirchev, Atanas and
+             Boncz, Peter and Kemper, Alfons and Neumann, Thomas},
+  title   = {Still Asking: How Good Are Query Optimizers, Really?},
+  journal = {Proc. VLDB Endowment},
+  volume  = {18},
+  number  = {12},
+  pages   = {5531--5536},
+  year    = {2025}
+}
+
+% VERIFY: OK-ARXIV -- authors from DataCite. A published version exists
+% (doi 10.1145/3735403.3735998); its venue was not confirmed, so the preprint
+% is cited.
+@misc{redbench,
+  author       = {Krid, Skander and Stoian, Mihail and Kipf, Andreas},
+  title        = {Redbench: A Benchmark Reflecting Real Workloads},
+  howpublished = {arXiv:2506.12488},
+  year         = {2025}
+}
+
+% VERIFY: OK -- Crossref, doi 10.1145/3597503.3639076 (ICSE 2024).
+@inproceedings{cert,
+  author    = {Ba, Jinsheng and Rigger, Manuel},
+  title     = {{CERT}: Finding Performance Issues in Database Systems Through
+               the Lens of Cardinality Estimation},
+  booktitle = {Proc. IEEE/ACM 46th Int. Conf. Softw. Eng. (ICSE)},
+  pages     = {1--13},
+  year      = {2024},
+  doi       = {10.1145/3597503.3639076}
+}
+
+% VERIFY: OK -- DBLP conf/asplos/MytkowiczDHS09.
+@inproceedings{wrongdata,
+  author    = {Mytkowicz, Todd and Diwan, Amer and Hauswirth, Matthias and
+               Sweeney, Peter F.},
+  title     = {Producing Wrong Data Without Doing Anything Obviously Wrong!},
+  booktitle = {Proc. 14th Int. Conf. Archit. Support Program. Lang. Oper.
+               Syst. (ASPLOS)},
+  pages     = {265--276},
+  year      = {2009}
+}
+
+% VERIFY: OK -- ACM DL, doi 10.1145/5666.5673.
+@article{fleming,
+  author  = {Fleming, Philip J. and Wallace, John J.},
+  title   = {How Not to Lie with Statistics: The Correct Way to Summarize
+             Benchmark Results},
+  journal = {Commun. ACM},
+  volume  = {29},
+  number  = {3},
+  pages   = {218--221},
+  year    = {1986},
+  doi     = {10.1145/5666.5673}
+}
+
+
+% ==== artefacts ===========================================================
+
+% VERIFY: OK
+@misc{pghint,
+  author       = {{NTT OSS Center}},
+  title        = {pg\_hint\_plan: Controlling Execution Plans with Hints},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/ossc-db/pg_hint_plan},
+  note         = {Accessed: 2026}
+}
+
+% VERIFY: OK
+@misc{jobrepo,
+  author       = {Rahn, Greg},
+  title        = {Join Order Benchmark ({JOB})},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/gregrahn/join-order-benchmark},
+  note         = {Accessed: 2026}
+}

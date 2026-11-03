@@ -34,10 +34,10 @@ path outright.
 from __future__ import annotations
 
 import logging
-import os
 import random
 import time
 
+from app.env import env_flag, env_float
 from app.optimizer.catalog import index_map, indexes_by_alias
 from app.optimizer.decision_cache import STOCHASTIC_POLICIES
 from app.optimizer.prefilter import prefilter
@@ -61,7 +61,35 @@ log = logging.getLogger("lqo.planner")
 # where the action space is a random sample of millions of orderings and cannot
 # cover the space -- there, correcting the estimate and letting the planner
 # search is the only route to plans no hint enumerates. Set to "0" to turn off.
-ENABLE_ROWS_CORRECTION = os.getenv("ENABLE_ROWS_CORRECTION", "1") != "0"
+# What counts as "on" in an environment variable.
+#
+# There were two answers, and they disagreed on every natural way of writing
+# "off". This module read `os.getenv(NAME, "0") != "0"` -- true for *anything*
+# but the literal "0" -- while `settings._coerce` accepted only
+# {"1", "true", "yes", "on"}. So:
+#
+#     INCLUDE_BUSHY=false   planner: True    settings: False
+#     INCLUDE_BUSHY=no      planner: True    settings: False
+#     INCLUDE_BUSHY=off     planner: True    settings: False
+#     INCLUDE_BUSHY=        planner: True    settings: False
+#
+# Five of ten plausible values, and every one of them a way someone writes
+# "off". The consequence is not symmetric: `app.main` calls `_apply_settings`
+# at import, so the *server* ends up with settings' answer, while the CLI tools
+# -- `app.collect_data`, `app.benchmark`, `app.autotune` -- only ever see this
+# module's. `INCLUDE_BUSHY=false` therefore collects a family the server does
+# not serve, silently, which is 2.56's train/serve gap reachable by a typo.
+#
+# One rule now, shared with `settings._coerce`. An empty variable is off, which
+# is the only sane reading of `export INCLUDE_BUSHY=`.
+# `env_flag` is imported from `app.env` at the top of this file, and the
+# `TRUTHY` set with it -- `settings._coerce` now reads it from there directly.
+# They started here, and moved when 2.90 found the same defect in the float
+# reads: three modules would have grown three parsers, which is the shape the
+# finding is about. `app.db` needs them and cannot import this module.
+
+
+ENABLE_ROWS_CORRECTION = env_flag("ENABLE_ROWS_CORRECTION", "1")
 
 # Whether the forced join-*method* family (`HashJoin`/`NestLoop`/`MergeJoin`
 # per join-order prefix, from `hints.generate_join_method_candidates`) is part
@@ -80,7 +108,7 @@ ENABLE_ROWS_CORRECTION = os.getenv("ENABLE_ROWS_CORRECTION", "1") != "0"
 # the number the production path lives or dies by. Turn it on and settle it
 # with `python -m app.experiment`, which is what this project does with
 # questions of this shape, rather than assuming a wider action space is better.
-INCLUDE_JOIN_METHODS = os.getenv("INCLUDE_JOIN_METHODS", "0") != "0"
+INCLUDE_JOIN_METHODS = env_flag("INCLUDE_JOIN_METHODS", "0")
 
 # Resource and cost-model candidates (`hints.TUNING_SETTINGS`): parallel worker
 # counts, work_mem, random_page_cost, join_collapse_limit.
@@ -109,7 +137,7 @@ INCLUDE_JOIN_METHODS = os.getenv("INCLUDE_JOIN_METHODS", "0") != "0"
 # `INCLUDE_TUNING=1` restores the old behaviour, and `app.diagnostics` will then
 # report that the deployed action space no longer matches the one the gate in
 # models/gate.json was swept over.
-INCLUDE_TUNING = os.getenv("INCLUDE_TUNING", "0") != "0"
+INCLUDE_TUNING = env_flag("INCLUDE_TUNING", "0")
 
 # The families read off the pg_hint_plan reference and verified to bind against
 # this server (`Leading(((a b) (c d)))`, per-table scan methods and their
@@ -140,27 +168,27 @@ INCLUDE_TUNING = os.getenv("INCLUDE_TUNING", "0") != "0"
 # than broken -- `plan_fingerprint` deduplication drops them before they cost a
 # model evaluation. They still cost a planning round trip to discover, which is
 # why they are not on for free.
-INCLUDE_BUSHY = os.getenv("INCLUDE_BUSHY", "0") != "0"
-INCLUDE_SCAN_METHODS = os.getenv("INCLUDE_SCAN_METHODS", "0") != "0"
-INCLUDE_NEGATIVE_SCANS = os.getenv("INCLUDE_NEGATIVE_SCANS", "0") != "0"
-INCLUDE_NEGATIVE_JOINS = os.getenv("INCLUDE_NEGATIVE_JOINS", "0") != "0"
-INCLUDE_MEMOIZE = os.getenv("INCLUDE_MEMOIZE", "0") != "0"
-INCLUDE_PARALLEL = os.getenv("INCLUDE_PARALLEL", "0") != "0"
-INCLUDE_ENABLE_SETTINGS = os.getenv("INCLUDE_ENABLE_SETTINGS", "0") != "0"
-INCLUDE_INDEX_PINNING = os.getenv("INCLUDE_INDEX_PINNING", "0") != "0"
+INCLUDE_BUSHY = env_flag("INCLUDE_BUSHY", "0")
+INCLUDE_SCAN_METHODS = env_flag("INCLUDE_SCAN_METHODS", "0")
+INCLUDE_NEGATIVE_SCANS = env_flag("INCLUDE_NEGATIVE_SCANS", "0")
+INCLUDE_NEGATIVE_JOINS = env_flag("INCLUDE_NEGATIVE_JOINS", "0")
+INCLUDE_MEMOIZE = env_flag("INCLUDE_MEMOIZE", "0")
+INCLUDE_PARALLEL = env_flag("INCLUDE_PARALLEL", "0")
+INCLUDE_ENABLE_SETTINGS = env_flag("INCLUDE_ENABLE_SETTINGS", "0")
+INCLUDE_INDEX_PINNING = env_flag("INCLUDE_INDEX_PINNING", "0")
 # `DisableIndex(alias index)`: plan as if the index had already been dropped.
 # Unavailable until the PostgreSQL 18 upgrade brought pg_hint_plan 1.8.1 -- on
 # 1.6.3 the keyword did not exist, and the rejection arrived at INFO severity,
 # which the default client_min_messages discards. Needs the catalog map for the
 # same reason index pinning does.
-INCLUDE_DISABLE_INDEX = os.getenv("INCLUDE_DISABLE_INDEX", "0") != "0"
+INCLUDE_DISABLE_INDEX = env_flag("INCLUDE_DISABLE_INDEX", "0")
 # Six more `enable_*` toggles, and the cost-model constants the manual names as
 # what actually gates a parallel plan (`parallel_setup_cost`,
 # `min_parallel_table_scan_size`) rather than the ceiling TUNING_SETTINGS varies.
 # Measured on the four-table join: seq_page_cost 7870.2 -> 6422.7,
 # min_parallel_table_scan_size -> 6637.5, parallel_setup_cost -> 6870.2.
-INCLUDE_EXTENDED_TOGGLES = os.getenv("INCLUDE_EXTENDED_TOGGLES", "0") != "0"
-INCLUDE_COST_MODEL = os.getenv("INCLUDE_COST_MODEL", "0") != "0"
+INCLUDE_EXTENDED_TOGGLES = env_flag("INCLUDE_EXTENDED_TOGGLES", "0")
+INCLUDE_COST_MODEL = env_flag("INCLUDE_COST_MODEL", "0")
 
 # Scale the candidate count to how much the query is worth optimising.
 #
@@ -185,7 +213,7 @@ INCLUDE_COST_MODEL = os.getenv("INCLUDE_COST_MODEL", "0") != "0"
 # train/serve difference: the model is never asked to score a plan family it
 # has not seen (contrast docs/WRITEUP.md 2.9). Truncation of a deterministic
 # list is deterministic, so a query's action space is still stable across runs.
-ADAPTIVE_CANDIDATE_BUDGET = os.getenv("ADAPTIVE_CANDIDATE_BUDGET", "1") != "0"
+ADAPTIVE_CANDIDATE_BUDGET = env_flag("ADAPTIVE_CANDIDATE_BUDGET", "1")
 
 # (estimated total cost below which, candidates allowed)
 CANDIDATE_BUDGET_TIERS: tuple[tuple[float, int], ...] = (
@@ -698,7 +726,7 @@ def plan_query(
 
 # How many times a query's known native latency a deviation may run for before
 # it is abandoned. 0 disables the deadline.
-RUNTIME_TIMEOUT_FACTOR = float(os.getenv("RUNTIME_TIMEOUT_FACTOR", "3.0"))
+RUNTIME_TIMEOUT_FACTOR = env_float("RUNTIME_TIMEOUT_FACTOR", "3.0")
 
 # How often a deviating production query also runs PostgreSQL's plan, purely to
 # measure it.
@@ -721,7 +749,7 @@ RUNTIME_TIMEOUT_FACTOR = float(os.getenv("RUNTIME_TIMEOUT_FACTOR", "3.0"))
 #
 # 0 disables it. Kept low by default because the point is a representative
 # sample, not a second benchmark.
-SHADOW_SAMPLE_RATE = float(os.getenv("SHADOW_SAMPLE_RATE", "0.1"))
+SHADOW_SAMPLE_RATE = env_float("SHADOW_SAMPLE_RATE", "0.1")
 
 
 def execute_chosen(cur, sql: str, hint: str | None, budget_ms: int | None = None) -> dict:

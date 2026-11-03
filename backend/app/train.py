@@ -30,6 +30,7 @@ import pickle
 import random
 
 from app.db import get_cursor
+from app.env import env_float
 from app.logging_store import ADHOC_PREFIX
 from app.optimizer.bandit import POLICIES, BootstrappedEnsemble, select_index
 from app.optimizer.cardinality import JoinCardinalityCorrector
@@ -730,7 +731,7 @@ def _evaluate_selection(
 # Risk level for the conformal safety gate: at most this share of served
 # decisions should have a true log-ratio above the bound. 0.1 mirrors the
 # regression tolerance the guard already runs at.
-DEFAULT_CONFORMAL_ALPHA = float(os.getenv("CONFORMAL_ALPHA", "0.1"))
+DEFAULT_CONFORMAL_ALPHA = env_float("CONFORMAL_ALPHA", "0.1")
 
 
 def train(

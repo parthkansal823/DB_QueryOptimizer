@@ -154,8 +154,17 @@ def report(cur, schema: str = "public", limit: int = 200) -> dict:
         else ("blk_read_time" if "blk_read_time" in columns else "0")
     )
 
+    # A raw f-string, and \y rather than \b.
+    #
+    # Both halves matter and only one of them is a Python question. In a
+    # non-raw string Python turns \b into a backspace byte, so the
+    # pattern asked for a control character after the keyword and matched
+    # nothing -- the filter had never excluded a row. Making the string raw
+    # is what the SyntaxWarning asks for and it fixes nothing, because a
+    # POSIX ARE reads \b as backspace too: Postgres spells the word
+    # boundary \y. See docs/WRITEUP.md 2.91.
     cur.execute(
-        f"""
+        rf"""
         SELECT query,
                calls,
                total_plan_time,
@@ -174,7 +183,7 @@ def report(cur, schema: str = "public", limit: int = 200) -> dict:
           AND query NOT ILIKE '%%pg_stat_statements%%'
           AND query NOT ILIKE '%%plan_execution_log%%'
           -- Utility statements carry no plan and no lesson.
-          AND query !~* '^\s*(BEGIN|COMMIT|ROLLBACK|SET|SHOW|LOAD|DISCARD|ANALYZE|VACUUM)\b'
+          AND query !~* '^\s*(BEGIN|COMMIT|ROLLBACK|SET|SHOW|LOAD|DISCARD|ANALYZE|VACUUM)\y'
         ORDER BY total_exec_time DESC
         LIMIT %s
         """,

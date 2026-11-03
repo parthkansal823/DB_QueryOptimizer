@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 from psycopg2 import pool
 
+from app.env import env_int
+
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/lqo",
@@ -25,8 +27,13 @@ DATABASE_URL = os.getenv(
 _pool: pool.SimpleConnectionPool | None = None
 _pool_lock = threading.Lock()
 
-MIN_CONNECTIONS = int(os.getenv("DB_POOL_MIN", "1"))
-MAX_CONNECTIONS = int(os.getenv("DB_POOL_MAX", "10"))
+# Parsed through `app.env` rather than a bare `int()`. This module already
+# defers *connecting* until first use so that importing it does not require a
+# running Postgres (see above) -- and then reintroduced an import-time crash
+# from the other direction, since `DB_POOL_MAX=ten` raised before any of that
+# care could matter. 2.90.
+MIN_CONNECTIONS = env_int("DB_POOL_MIN", "1")
+MAX_CONNECTIONS = env_int("DB_POOL_MAX", "10")
 
 
 def get_pool() -> pool.SimpleConnectionPool:

@@ -44,6 +44,7 @@ import os
 import pickle
 import random
 
+from app.env import env_float
 from app.optimizer.bandit import select_index
 from app.optimizer.features import featurize, to_vector
 from app.optimizer.ranker import borda_select
@@ -73,6 +74,10 @@ from app.optimizer.ranker import borda_select
 # than to synchronise it. The compose override is gone; this is the decision.
 DEFAULT_SELECTION_POLICY = "pairwise_rank"
 
+# `env_float` lives in `app.env`, imported at the top of this file. It was
+# written here, for the six reads below that 2.90 was about, and moved as soon
+# as the second module needed it -- a per-module copy of a parser is exactly
+# the defect 2.89 and 2.90 are two instances of.
 # How much the two selectors disagreeing raises the bar for deviating.
 #
 # `caution` is multiplied by `1 + DISAGREEMENT_CAUTION * disagreement`, so at
@@ -97,7 +102,7 @@ DEFAULT_SELECTION_POLICY = "pairwise_rank"
 # So this ships as a mechanism with its measurement attached and its default at
 # zero. Turning it on is a decision to make after `min_relative_gain` is
 # non-zero, not before, and `app.calibrate` now says so when it recommends zero.
-DISAGREEMENT_CAUTION = float(os.getenv("DISAGREEMENT_CAUTION", "0"))
+DISAGREEMENT_CAUTION = env_float("DISAGREEMENT_CAUTION", "0")
 
 # Policies that live on the ranker rather than on the ensemble, so they are not
 # in `bandit.POLICIES` and every tool that offers a `--policy` has to know about
@@ -121,7 +126,7 @@ DEFAULT_MIN_GAIN_MS = 2.0
 
 # In ratio space: require a predicted speedup of at least this fraction
 # before deviating from native. 0.05 = "must look at least 5% faster".
-DEFAULT_MIN_RELATIVE_GAIN = float(os.getenv("MIN_RELATIVE_GAIN", "0.05"))
+DEFAULT_MIN_RELATIVE_GAIN = env_float("MIN_RELATIVE_GAIN", "0.05")
 
 # How much slower than native the *pessimistic* case may be and still be worth
 # betting on. 1.25 = "even if the model is wrong by its own uncertainty, this
@@ -129,7 +134,7 @@ DEFAULT_MIN_RELATIVE_GAIN = float(os.getenv("MIN_RELATIVE_GAIN", "0.05"))
 #
 # This is the second half of a rule that used to have only one. See
 # `_select_against_native` for what the single-condition version threw away.
-DEFAULT_MAX_REGRESSION_RATIO = float(os.getenv("MAX_REGRESSION_RATIO", "1.25"))
+DEFAULT_MAX_REGRESSION_RATIO = env_float("MAX_REGRESSION_RATIO", "1.25")
 
 # Distinguishes "caller passed nothing" from "caller passed the default".
 _UNSET = object()
@@ -151,10 +156,10 @@ class LearnedOptimizer:
         self,
         model_path: str = "models/plan_selector.pkl",
         policy: str = os.getenv("SELECTION_POLICY", DEFAULT_SELECTION_POLICY),
-        risk_lambda: float = float(os.getenv("RISK_LAMBDA", "1.0")),
+        risk_lambda: float = env_float("RISK_LAMBDA", "1.0"),
         safety_margin: float = DEFAULT_SAFETY_MARGIN,
         confidence_z: float = _UNSET,
-        min_gain_ms: float = float(os.getenv("MIN_GAIN_MS", DEFAULT_MIN_GAIN_MS)),
+        min_gain_ms: float = env_float("MIN_GAIN_MS", DEFAULT_MIN_GAIN_MS),
         min_relative_gain: float = _UNSET,
         max_regression_ratio: float = DEFAULT_MAX_REGRESSION_RATIO,
         gate_mode: str = _UNSET,
@@ -169,7 +174,7 @@ class LearnedOptimizer:
         self.risk_lambda = risk_lambda
         self.safety_margin = safety_margin
         self.confidence_z = (
-            float(os.getenv("CONFIDENCE_Z", DEFAULT_CONFIDENCE_Z))
+            env_float("CONFIDENCE_Z", DEFAULT_CONFIDENCE_Z)
             if confidence_z is _UNSET else confidence_z
         )
         self.min_gain_ms = min_gain_ms

@@ -337,9 +337,10 @@ which works with no model at all:
 
 ```bash
 docker compose exec backend python -m app.collect_data   # gather training data
+docker compose exec backend python -m app.collect_data --held-out   # only the queries the sweep scores
 docker compose exec backend python -m app.train          # train models/plan_selector.pkl
 docker compose exec backend python -m app.benchmark      # native vs. learned, full workload
-docker compose exec backend pytest                       # 1,090 unit tests, no database needed
+docker compose exec backend pytest                       # 1,611 unit tests, no database needed
 docker compose exec backend pytest -m integration        # 17 more: hints must actually bind
 docker compose exec backend ruff check app tests         # lint, same rules CI runs
 ```
@@ -517,7 +518,7 @@ learned-query-optimizer/
 │   │                        headroom -- opt-in, and the file says why
 │   └── job/                  JOB/IMDB stretch goal: loader + docs
 ├── backend/
-│   ├── tests/                 pytest suite (1,090 unit + 17 integration)
+│   ├── tests/                 pytest suite (1,611 unit + 18 integration)
 │   ├── native/                optional compiled encoder; falls back to Python
 │   │   ├── plan_tree_native.cpp   C++ port of encode_plan_tree
 │   │   └── setup.py               build_ext --inplace
@@ -541,6 +542,8 @@ learned-query-optimizer/
 │       ├── experiment_job.py     paired A/B comparisons, run from the dashboard
 │       ├── workload.py           the 32-query benchmark workload
 │       ├── collect_data.py       offline collection -> plan_execution_log
+│       │                         --held-out / --only aim it at named queries
+│       ├── env.py               one parser per environment variable type
 │       ├── train.py              trains and evaluates the model
 │       ├── benchmark.py          CLI: native vs. learned; --protocol compare|deploy
 │       ├── retrain.py            learning loop: champion/challenger gate

@@ -79,6 +79,62 @@ def test_the_arms_are_interleaved_not_batched(monkeypatch):
     )
 
 
+class TestRandomisedArmOrder:
+    """A fixed order puts native first in every repetition, so a position effect
+    lands on one arm every time instead of cancelling. Shuffling each repetition
+    is what turns it back into noise."""
+
+    def test_every_repetition_times_each_arm_exactly_once(self, monkeypatch):
+        import random
+
+        cur = _Cur({"native": [100.0], "A": [80.0], "B": [70.0]})
+        _patch(monkeypatch, cur)
+
+        _paired_medians(cur, "SELECT 1", _plans(), 20, rng=random.Random(7))
+
+        triples = [cur.order[i:i + 3] for i in range(0, len(cur.order), 3)]
+        assert len(triples) == 20
+        assert all(sorted(t) == ["A", "B", "native"] for t in triples)
+
+    def test_the_order_actually_varies(self, monkeypatch):
+        import random
+
+        cur = _Cur({"native": [100.0], "A": [80.0], "B": [70.0]})
+        _patch(monkeypatch, cur)
+
+        _paired_medians(cur, "SELECT 1", _plans(), 20, rng=random.Random(7))
+
+        firsts = {cur.order[i] for i in range(0, len(cur.order), 3)}
+        assert len(firsts) > 1, "native must not open every repetition"
+
+    def test_shuffling_does_not_change_which_median_belongs_to_which_arm(
+        self, monkeypatch
+    ):
+        import random
+
+        cur = _Cur({"native": [90.0, 100.0, 110.0],
+                    "A": [70.0, 80.0, 90.0],
+                    "B": [60.0, 70.0, 80.0]})
+        _patch(monkeypatch, cur)
+
+        assert _paired_medians(
+            cur, "SELECT 1", _plans(), 3, rng=random.Random(3)
+        ) == (100.0, 80.0, 70.0)
+
+    def test_the_paired_protocol_randomises_by_default(self):
+        assert PROTOCOLS["paired"]["default_arm_order"] == "random"
+
+    def test_the_cli_passes_it_through(self):
+        import inspect
+
+        from app import benchmark
+
+        source = inspect.getsource(benchmark)
+        assert "--arm-order" in source
+        assert "arm_order=arm_order" in source
+        assert "rng=arm_rng" in source
+
+
 def test_a_failing_arm_keeps_its_original_timing(monkeypatch):
     """Dropping it would silently turn a paired comparison back into an unpaired
     one -- two arms re-timed under new conditions and the third under old."""

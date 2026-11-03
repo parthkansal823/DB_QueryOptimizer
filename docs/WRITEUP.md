@@ -8118,3 +8118,552 @@ Wiring a per-query floor into the grading is a real change to what
 `held_missed` and `deviated_win` mean, and it should be made against a re-run
 benchmark rather than folded in beside eight other corrections. That is the
 honest place to stop — the measurement exists, is free, and is written down.
+
+## 2.89 Two parsers for one environment variable
+
+Every action-space flag has two readers. `planner` reads it at import:
+
+```python
+INCLUDE_BUSHY = os.getenv("INCLUDE_BUSHY", "0") != "0"
+```
+
+and `settings.defaults()` reads the same variable through `_from_env`, whose
+`_coerce` accepted `{"1", "true", "yes", "on"}`.
+
+That is two rules, and they disagreed on five of ten plausible values:
+
+| `INCLUDE_BUSHY=` | planner | settings |
+|---|---|---|
+| `1`, `true`, `yes`, `on` | True | True |
+| `0` | False | False |
+| **`false`** | **True** | False |
+| **`no`** | **True** | False |
+| **`off`** | **True** | False |
+| **`` (empty)** | **True** | False |
+| **`2`** | **True** | False |
+
+Every disagreement is a way someone writes *off*, and `export INCLUDE_BUSHY=`
+meant **on**.
+
+### The consequence is asymmetric, which is what makes it a bug
+
+`app.main` calls `_apply_settings` at import, which pushes settings' answer back
+onto `planner`. So the **server** gets `False` — the intended meaning.
+
+The CLI tools never call it. `app.collect_data`, `app.benchmark` and
+`app.autotune` see only `planner`'s own import-time read, and get `True`.
+
+So `INCLUDE_BUSHY=false` collects a family the server does not serve. That is
+2.56's train/serve gap, reachable by writing a boolean the obvious way, with
+nothing to indicate it — the collection log simply contains a family that never
+appears at serving, which is precisely the divergence 2.75 and 2.84 spent this
+session closing from the other end.
+
+### The fix
+
+`planner.env_flag` and `planner.TRUTHY`, used by both. Nine values now agree and
+the tenth (`2`) is false on both sides rather than true on one.
+
+The narrower point is that this was not a *disagreement about a default* — those
+match, and `tests/test_settings_defaults.py` was written an hour earlier to check
+exactly that and found nothing. It was a disagreement about how to *read* the
+value, one level below where anybody looked. The test that found it was written
+because the first one passed too easily.
+
+### The pattern, again
+
+That makes it the seventh pair in this section that had to agree and did not:
+family lists (2.75), the two regression queries (2.77), query identity (2.78),
+`_servable` across three scorers (2.76), the policy list across eight files
+(2.71 and the frontend), outcome names across three (2.88's neighbours), and now
+a boolean parser.
+
+The generalisable version is not "check your pairs". It is that **a value with
+two readers has two meanings until something forces otherwise**, and the forcing
+has to be a shared function rather than a shared intention — every one of these
+had a comment somewhere asserting the two were kept in step.
+
+## 2.90 The module that documented the policy was the one that broke it
+
+2.89 was two parsers for one boolean. This is the same shape one type over, and
+it is worse, because here the policy was written down and the module that wrote
+it down is the module that violated it.
+
+`settings._from_env` says it plainly:
+
+```python
+    except ValueError:
+        # A malformed environment variable should not stop the server booting;
+        # fall back to the declared default.
+```
+
+That is the right call for input nobody is watching. A typo in a `.env` file or
+a stray unit (`MIN_GAIN_MS=5ms`) should degrade to the default and log, not take
+the process down at boot on a machine with no operator attached.
+
+`learned` parsed six floats with a bare `float(os.getenv(...))`, and **five of
+them ran at import**: three module constants (`DISAGREEMENT_CAUTION`,
+`DEFAULT_MIN_RELATIVE_GAIN`, `DEFAULT_MAX_REGRESSION_RATIO`) and two signature
+defaults (`risk_lambda`, `min_gain_ms`), which Python evaluates once when the
+`def` executes, not per call.
+
+So the failure happened before `_from_env` could run:
+
+```
+$ RISK_LAMBDA=abc python -m app.benchmark --help
+ValueError: could not convert string to float: 'abc'
+```
+
+Not a bad benchmark run — no benchmark at all, and the same for the server,
+because `settings` imports `learned`. The module holding the fallback could not
+itself be imported to apply it. Every tool in the project died on one character.
+
+### What made it invisible
+
+A signature default is the same trap as 2.35's mutable default, in the readable
+direction. `min_gain_ms: float = float(os.getenv("MIN_GAIN_MS", "50"))` reads as
+"look this up when called" and means "look it up once, at import". Nothing in
+the call site, the tests, or the type annotation distinguishes the two. The unit
+tests all constructed `LearnedOptimizer` with explicit arguments, so the default
+expression was never the thing under test — and it could not be, since by the
+time a test ran, it had already been evaluated.
+
+The reach came from the import graph rather than from the code: `settings`
+imports `learned` for `DEFAULT_SELECTION_POLICY` and `RANKER_POLICIES` — a
+dependency added for good reasons in 2.43 and again this session — so one
+module's boot-time parse became every entrypoint's boot-time parse.
+
+### The fix, and the line it does not cross
+
+`learned.env_float(name, default)` — warns and falls back, matching
+`_from_env`'s policy value for value on `abc`, `1,5`, `""`, `2ms` and `None`.
+
+What it deliberately does **not** do is relax the API. `settings._coerce` still
+raises on a bad `confidence_z` from a settings POST, and
+`tests/test_env_parsing.py::TestApiInputStillRejects` pins that. The two are not
+inconsistent: environment input is read at boot with nobody watching, so it
+degrades; API input was typed by a person a moment ago into a form that can show
+them an error, so it rejects. The distinction is the point, and writing it as
+one rule in either direction would be the actual bug.
+
+### The test that had to be a subprocess
+
+The first version of the test used `importlib.reload(learned)`, and turned 14
+unrelated tests red. Reloading the module mints a **new** `_UNSET` sentinel
+object, and every optimizer already holding a reference to the old one stops
+matching `confidence_z is _UNSET` — so the sentinel falls through as if it were
+a value and the gate computes `self.confidence_z * combined_sigma`:
+
+```
+TypeError: unsupported operand type(s) for *: 'object' and 'float'
+```
+
+An identity sentinel is fine until two copies of it exist, which is the same
+"two readers, one value" shape as 2.89, arrived at from inside my own test. The
+fix is that import-time behaviour is only testable in a fresh interpreter, so
+the test now shells out and asserts on the exit code.
+
+### The audit, and a correction to it
+
+Written first as "the remaining reads worth auditing are `GUARD_MIN_OBSERVATIONS`
+and `DECISION_CACHE_SECONDS`". Both are wrong: they have no bare parse anywhere.
+They are declared in `settings.FIELDS` and reach the code only through
+`_from_env`, which is the module that had the policy right all along.
+
+What the audit actually found was seven more, and the two I had named were not
+among them:
+
+| module | variable | parsed at |
+|---|---|---|
+| `app/db.py` | `DB_POOL_MIN`, `DB_POOL_MAX` | import |
+| `app/main.py` | `AUTO_RETRAIN_SECONDS`, `ANALYZE_EXECUTE_LIMIT` | import |
+| `app/optimizer/planner.py` | `RUNTIME_TIMEOUT_FACTOR`, `SHADOW_SAMPLE_RATE` | import |
+| `app/train.py` | `CONFORMAL_ALPHA` | import |
+
+Four integers and three floats, every one at import, and `app/db.py` is the
+sharpest of them. That module already carries a long comment explaining that it
+builds the connection pool lazily *precisely so that importing it does not
+require a running Postgres* — and then parsed two integers at import, which
+reintroduces the import-time crash it was written to avoid, from a direction the
+comment does not cover.
+
+### One module, not three helpers
+
+The fix is `app/env.py`: `TRUTHY`, `env_flag`, `env_float`, `env_int`, importing
+nothing from `app` so that `db` — the bottom of the graph — can use it.
+`planner` and `learned` re-export the names they used to define.
+
+That structure is the finding applied to itself. Left alone, this session would
+have produced `planner.env_flag`, `learned.env_float` and a third helper
+wherever the integers landed: three parsers in three modules, which is precisely
+what 2.89 was. `tests/test_env_parsing.py` now asserts
+`planner.env_flag is env.env_flag` — the same object, not two that agree today —
+and walks the AST of every module in the package for a `float(os.getenv(...))`
+or a second truthy set.
+
+The AST matters. The first version grepped source text and was failed by
+`planner.py`'s own comment *narrating* the old set, which is 2.84's mistake
+repeated: a rule about code, asked of prose. Twice now the instrument has been
+the defect, and both times inside a test written to catch a defect of exactly
+that shape.
+
+
+## 2.91 The compiler warned about the wrong half
+
+Found by the test written for 2.90 rather than by looking: the AST walk over
+every module in the package emitted a `DeprecationWarning` on the way past
+`app/dbadvisor/query_stats.py`, which had nothing to do with what it was
+checking.
+
+The line is the utility-statement filter in the `pg_stat_statements` query:
+
+```sql
+-- Utility statements carry no plan and no lesson.
+AND query !~* '^\s*(BEGIN|COMMIT|ROLLBACK|SET|SHOW|LOAD|DISCARD|ANALYZE|VACUUM)\b'
+```
+
+inside an f-string that was not raw. Python says:
+
+```
+SyntaxWarning: invalid escape sequence '\s'
+```
+
+and it is pointing at the harmless half. `\s` is *not* a Python escape, so it
+survives untouched and Postgres receives the character class it was meant to
+get. `\b` **is** a Python escape — backspace, `chr(8)` — so it does not
+survive:
+
+```
+'^\s*(BEGIN|COMMIT|ROLLBACK|SET|SHOW|LOAD|DISCARD|ANALYZE|VACUUM)\x08'
+```
+
+The pattern asks for a control character immediately after the keyword. No
+query text contains one, so it never matches, so `!~*` is always true, so the
+clause has never excluded a row. The comment above it describes an intent the
+code has never carried out.
+
+### The interesting part
+
+The obvious fix is what the warning asks for: make the string raw. It changes
+nothing.
+
+| pattern | `BEGIN` | `COMMIT` | `SET work_mem` | `BEGINNING_OF_TIME` |
+|---|---|---|---|---|
+| as shipped (`\b` to `chr(8)`) | kept | kept | kept | kept |
+| raw string, still `\b` | kept | kept | kept | kept |
+| raw string, `\y` | **excluded** | **excluded** | **excluded** | kept |
+
+Measured on the live server. A POSIX ARE reads `\b` as backspace too —
+Postgres spells the word boundary `\y`, and `\b` is listed in its manual
+under the same escapes Python has. So the string being non-raw was not the bug;
+it was a second, independent bug that happened to sit on the same character and
+that produced the same wrong behaviour, which is why fixing one of them looks
+like a fix and is not.
+
+Two layers with the same syntax and different meanings, and a warning that
+fires on the layer where nothing is wrong. Had the string been raw from the
+start there would have been no warning at all, and the filter would still have
+been dead.
+
+### What it cost, and what it says
+
+Nothing measured — `query_stats` is an advisory panel, so the effect was
+`BEGIN`, `COMMIT` and `SET` competing for slots in a "heaviest queries" list
+against real statements, and a few findings computed over a population that
+included them. It never touched the optimizer.
+
+The transferable part is the audit question, which is new and is not the "two
+readers" shape the rest of this section keeps finding:
+
+> When a string is written in one language and executed in another, **every
+> escape has two readings, and a warning from the outer language tells you
+> nothing about the inner one.**
+
+The same applies to the `LIKE` patterns elsewhere in this file (`'%%pg_stat_statements%%'`),
+which are fine, and it is the reason the regression test in
+`tests/test_query_stats.py` asserts on the *statement text the module actually
+sends* rather than on a pattern retyped in the test — a retyped pattern would
+have been retyped correctly and passed against the broken code.
+
+Ruff has a rule for the Python half, `D301`, and it was already enabled. It
+covers docstrings only, so it never saw this line — though it did fire on the
+docstrings of the test I wrote *about* the finding, which needed the `r` prefix
+for the same reason.
+
+
+## 2.92 Five families of collection bought four queries
+
+`PENDING.md`'s top "not started" item, finally actionable: the collection run
+with `INCLUDE_MEMOIZE`, `INCLUDE_PARALLEL`, `INCLUDE_JOIN_METHODS`,
+`INCLUDE_BUSHY` and `INCLUDE_DISABLE_INDEX` all on had finished, and
+`available_families()` reported all seven optional families present in the log
+for the first time. So `python -m app.autotune` could at last price them.
+
+I started the sweep and then, while it ran, asked the fourth standing question
+about it — **which population is this computed over?** The answer stopped the
+sweep.
+
+### Coverage
+
+| family | queries with rows | of 65 |
+|---|---|---|
+| `resource` | 65 | 100% |
+| `scan_method` | 65 | 100% |
+| `join_method` | 16 | 25% |
+| `memoize` | 16 | 25% |
+| `parallel` | 16 | 25% |
+| `disable_index` | 16 | 25% |
+| `bushy` | 7 | 11% |
+
+The run was stopped partway, which was known. What was not: the 16 are not a
+sample. They are every `corr_*` query and nothing else — because `WORKLOAD`
+lists its 18 correlated-predicate queries first and is iterated in list order.
+An interrupted collection always covers the same prefix of the same workload
+family, so re-running it collects the same queries again.
+
+(Not alphabetical, which is what this section first said. `WORKLOAD` groups by
+query family and `corr_*` is simply the first group; the mechanism is list
+order, and the fix below would be the same either way.)
+
+### The number that matters is not 16
+
+`calibrate.sweep` scores **held-out queries only** — `_held_out_queries`, for
+the reason 2.2.1 documents: a gate tuned on queries the model memorised is
+tuned against memorised predictions. The bundle holds out 16 of the 65.
+
+Four of those 16 carry any newly collected family.
+
+```
+queries in the log                     : 65
+held out by the model                  : 16
+queries with a new family              : 17
+...of those, held out (what is scored) :  4
+```
+
+So a 2^7 = 128-space sweep, several hours of it, would have distinguished five
+families on the evidence of four queries. Measured directly, restricted to the
+queries that have each family, best achievable net improvement with the family
+against without:
+
+| family | held-out queries | delta |
+|---|---|---|
+| `join_method` | 4 | −15 ms |
+| `parallel` | 4 | −7 ms |
+| `memoize` | 4 | 0 ms |
+| `disable_index` | 4 | +2 ms |
+| `bushy` | 8 | 0 ms |
+
+Every one of those is inside 2.18's 18.6% run-to-run noise floor on totals this
+small. The honest reading is not "these families are worthless" — it is **that
+the experiment has not been run yet**, and that the sweep would have reported a
+ranking of five families anyway, with a `net_improvement_ms` to the millisecond
+and no indication that four queries produced it.
+
+### Two different mistakes, and only one of them was mine to make twice
+
+The dilution — a family that can only act on 16 of 65 queries scoring its
+effect over all 65 — is not a bug. Every arm scores the same queries because
+the always-on families cover all of them, and a query where the family cannot
+act genuinely contributes nothing, which is what the server would do.
+
+The selection is the bug: the collection budget was spent in list order, and
+list order is uncorrelated with which queries the sweep can score. Spending it
+on 16 queries of which 4 are scoreable is a 75% waste that nothing reports,
+because "16 of 65 collected" and "4 of 16 held out" live in different modules
+and were never multiplied together.
+
+### The fix is a flag
+
+`app.collect_data --held-out` reads `held_out_queries` from the bundle and
+collects exactly those; `--only a,b,c` names them by hand. Both refuse an empty
+selection, and `--only` refuses an unknown id rather than collecting nothing and
+exiting 0 — a run that reports a total of zero and succeeds is this project's
+entire bug class in one line.
+
+The re-collection is running as of this section. What it changes is not the
+answer but whether there is one: 16 held-out queries with all five families
+instead of four.
+
+### The question this adds
+
+Not a new one, but a sharper edge on the fourth. "Which population is this
+computed over?" has an operational corollary when the answer is *collected*
+rather than given:
+
+> **The budget and the population must be the same choice.** A measurement
+> spends its cost on one set of things and draws its conclusion from another,
+> and nothing checks that those two sets are related unless someone multiplies
+> the fractions.
+
+
+## 2.93 The fix for 2.92 deleted a family nobody asked about
+
+2.92 added `app.collect_data --held-out` so a collection run spends its budget
+on the queries `calibrate.sweep` can actually score. It worked. Four families
+went from 4 held-out queries to 16:
+
+| family | before | after |
+|---|---|---|
+| `join_method` | 4/16 | **16/16** |
+| `memoize` | 4/16 | **16/16** |
+| `parallel` | 4/16 | **16/16** |
+| `disable_index` | 4/16 | **16/16** |
+| `bushy` | 4/16 | 8/16 |
+| `scan_method` | 16/16 | **0/16** |
+
+The last row is the finding. `scan_method` had rows on all 65 queries before
+this run and has none on any held-out query after it. Nothing was deleted from
+the log; 43,327 rows are still there. What changed is which of them count.
+
+### Why
+
+`calibrate._grouped_rows` keeps only the most recent `created_at` per query,
+and its docstring gives the reason at length: the log accumulates across every
+collection the database has ever seen, the same native query has ranged from
+2.4 ms to 13.7 ms between runs, and replaying all of history compares a
+candidate measured in one run against a native measured in another. The
+all-history replay reported every gate setting losing 15--25% while a live
+benchmark of the same gate captured 40.8%. Keeping one run is correct and it is
+load-bearing.
+
+The rule is **per query**. Families live inside a query's row set, so
+superseding a query supersedes every family in it. My re-collection ran with
+`INCLUDE_JOIN_METHODS`, `INCLUDE_MEMOIZE`, `INCLUDE_PARALLEL`, `INCLUDE_BUSHY`
+and `INCLUDE_DISABLE_INDEX` set, and without `INCLUDE_SCAN_METHODS`, because I
+was thinking about the five families that were unscored and not about the two
+that were fine. Those sixteen queries now have a latest run with no
+`scan_method` candidates in it, so the family is invisible to the sweep.
+
+`available_families()` derives the sweep axis from the data, which was 2.75's
+fix. It would have reported `scan_method` as *not scored*, the sweep would have
+run six arms instead of seven, and the output would have looked exactly like a
+successful run. The wording is what makes it invisible: *not scored* reads as
+"never collected", and this family had been collected on all 65 queries an hour
+earlier.
+
+### The shape
+
+This is not the section's usual defect. Nothing has two readers here, and no
+two components disagree. One rule is applied at one granularity and quietly
+inherited by everything nested inside it:
+
+> **A conflict-resolution rule chosen at one granularity applies to everything
+> below it.** "Latest run wins" was a decision about *runs*, taken to stop
+> comparing machine states. It is also, unavoidably and unmentioned, a decision
+> about *families*, and it makes a narrow collection destructive rather than
+> additive.
+
+The two properties that made it costly are worth separating. Being *narrower*
+than the previous run is what deleted coverage. Being *targeted* -- the thing
+2.92 added on purpose -- is what concentrated the damage on exactly the sixteen
+queries the sweep reads.
+
+### The fix
+
+Collect with every family the axis knows about, not merely the ones under
+investigation:
+
+```
+INCLUDE_JOIN_METHODS=1 INCLUDE_MEMOIZE=1 INCLUDE_PARALLEL=1 INCLUDE_BUSHY=1 INCLUDE_DISABLE_INDEX=1 INCLUDE_SCAN_METHODS=1 python -m app.collect_data --held-out
+```
+
+and `collect_data` now warns before it starts when the flags it was given would
+produce a narrower family set than the latest run already in the log for those
+queries. The warning names the families about to disappear. It does not refuse,
+because a deliberately narrow collection is a legitimate thing to want; it
+refuses only to let it happen silently.
+
+### A note on how this was caught
+
+By the arithmetic disagreeing with itself. `_load_rows()` said `scan_method`
+covered 65 queries and `_grouped_rows()` said 33, of which none were held out,
+and both were being used in the same session to answer the same question. That
+is 2.70's fourth question -- *which population is this computed over?* -- and
+the answer here was that one function reads all of history and the other reads
+the latest run, which is exactly the difference that mattered.
+
+
+## 2.94 Seven families priced, and the answer is none of them
+
+`PENDING.md` has carried "collect the unscored families, then price them" since
+2.75. Three collection runs and two defects later (2.92, 2.93) the axis was
+finally complete: all seven optional families present on the held-out queries
+the sweep actually scores. `app.autotune --policy pairwise_rank` swept all
+$2^7 = 128$ action spaces under the served policy.
+
+**Thirteen of the 128 produced a gate that clears the safety bounds.** Here they
+are, in full:
+
+| extra families | z | min gain | deviates | regress | worst | net |
+|---|---|---|---|---|---|---|
+| *none* | 1.00 | 0.00 | 94% | 20% | 1.15x | **8.7%** |
+| `bushy` | 1.00 | 0.00 | 94% | 20% | 1.15x | **8.7%** |
+| `memoize` | 1.50 | 0.05 | 75% | 17% | 1.15x | 8.1% |
+| `bushy,memoize` | 1.50 | 0.05 | 75% | 17% | 1.15x | 8.1% |
+| `resource` | 2.00 | 0.05 | 62% | 20% | 1.15x | 6.1% |
+| `memoize,resource` | 2.00 | 0.05 | 62% | 20% | 1.15x | 6.1% |
+| `bushy,resource` | 2.00 | 0.05 | 62% | 20% | 1.15x | 6.1% |
+| `bushy,memoize,resource` | 2.00 | 0.05 | 62% | 20% | 1.15x | 6.1% |
+| `join_method` | 2.00 | 0.05 | 62% | 20% | 1.00x | 6.0% |
+| `join_method,memoize` | 2.00 | 0.05 | 62% | 20% | 1.00x | 6.0% |
+| `bushy,join_method` | 2.00 | 0.05 | 62% | 20% | 1.00x | 6.0% |
+| `bushy,join_method,memoize` | 2.00 | 0.05 | 62% | 20% | 1.00x | 6.0% |
+
+The winning action space is `{join_order, operator_toggle, cardinality}` --
+the three that are always on. **Not one optional family earns its place**, and
+the ordering is monotone downward as families are added: 8.7% with none, 8.1%
+with `memoize`, 6.1% with `resource`, 6.0% with `join_method`.
+
+`scan_method`, `parallel` and `disable_index` appear in none of the thirteen.
+Every space containing them failed the regression bounds outright.
+
+### What is resolvable here and what is not
+
+The spread across all thirteen survivors is 8.7% to 6.0%, which is **2.7
+points**. 2.32 measured two independent 3-run benchmarks of an *identical*
+configuration landing **8 points apart**, and the latest run's own floor is 7.7
+points. So the entire spread of this table is roughly a third of the
+instrument's resolution.
+
+That has to be said plainly: **this replay cannot distinguish any of these
+thirteen arms from each other.** "Adding `memoize` costs 0.6 points" is not a
+finding, it is a number smaller than the noise. The tool says as much about its
+own top two, and the same objection applies down the column.
+
+Two things *are* resolvable, because they do not depend on separating small
+differences:
+
+1. **`bushy` changes nothing at all.** Every arm containing it is
+   *bit-identical* to the same arm without it -- same z, same gain, same
+   deviation rate, same regression rate, same worst case, same net. That is not
+   a small difference inside noise; it is exact equality across four pairs,
+   which means no bushy candidate was ever selected. 2.84 separated `bushy`
+   from `join_order` so the sweep could price it. Priced: zero.
+2. **Three families cannot clear the safety bounds at all.** `scan_method`,
+   `parallel` and `disable_index` survive in none of the 128 arms. Failing a
+   bound is a categorical outcome, not a marginal one.
+
+### The result this actually produces
+
+The recommendation is to serve the narrow space, which is what the deployment
+already does. Every `INCLUDE_*` flag stays at 0. After three collection runs,
+roughly two hours of wall clock and two defects found on the way, the action
+space does not move.
+
+That is worth having. 2.75 recorded five families as *not scored*, which is an
+open question sitting in a file; this replaces it with an answer. And it lands
+where 2.68 already pointed: on six six-table queries carrying 23.6% headroom,
+the model was allowed to act twice and lost both times, and **neither losing
+pick came from an optional family** -- both were `operator_toggle` and
+`cardinality`, always on. The action space was not the binding constraint then
+and it is not now.
+
+### The caveat the tool prints itself
+
+> then confirm by execution -- this was a replay, and 2.32 measured two
+> identical 3-run benchmarks landing 8 points apart
+
+A replay scores logged rows against a model. It is not an execution, and 2.83
+is the section about a replay handing the model candidates the server would
+never offer. The +8.7% is a replay number and stays one until
+`app.benchmark --protocol paired` says otherwise on the same gate.

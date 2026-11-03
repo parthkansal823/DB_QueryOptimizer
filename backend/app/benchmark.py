@@ -18,6 +18,8 @@ Usage (from backend/, with the stack running via docker compose):
 from __future__ import annotations
 
 import argparse
+import json
+import random
 
 from app.db import get_cursor
 from app.logging_store import log_execution
@@ -70,6 +72,8 @@ def run(
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
     gate: dict | None = None,
     paired_reps: int = 1,
+    arm_order: str = "fixed",
+    seed: int = 0,
 ) -> dict:
     """Run the workload and return the run's metrics.
 
@@ -109,6 +113,11 @@ def run(
     # populations.
     held_out = _held_out_ids(optimizer)
     held_native = held_served = held_oracle = 0.0
+    if arm_order not in ("fixed", "random"):
+        raise ValueError(f"arm_order must be 'fixed' or 'random', got {arm_order!r}")
+    # Seeded, so a run can be repeated exactly; each repeat of a multi-run
+    # benchmark is given its own seed by the caller.
+    arm_rng = random.Random(seed) if arm_order == "random" else None
     n_held_out = 0
     n_curated = 0
     cur_native = cur_served = cur_oracle = 0.0
@@ -244,6 +253,7 @@ def run(
                     cur, sql,
                     {"native": baseline, "served": served_plan, "oracle": best_plan},
                     paired_reps,
+                    rng=arm_rng,
                 )
                 # And re-take the minimum over the arms that were re-timed.
                 #
@@ -363,6 +373,10 @@ def run(
     return {
         "policy": policy,
         "guard": use_guard,
+        "paired_reps": paired_reps,
+        "arm_order": arm_order,
+        "seed": seed,
+        "saved_ms": native_total - served_total,
         # Curated = hand-written traps and controls, never filtered on whether
         # the optimizer could win them.
         "n_curated": n_curated,
@@ -417,9 +431,18 @@ def run(
 # `deploy` leaves the guard on and does one pass. Its number is a point on a
 # trend, and it must never be compared against a `compare` number -- different
 # question, different system.
-def _paired_medians(cur, sql: str, plans: dict[str, dict], reps: int) -> tuple:
+def _paired_medians(
+    cur, sql: str, plans: dict[str, dict], reps: int, rng: random.Random | None = None
+) -> tuple:
     """
     Re-time native, served and oracle **alternately**, and return their medians.
+
+    With `rng`, the order of the arms is shuffled independently in every
+    repetition. A fixed order always runs native first and oracle last, so any
+    effect of position -- the first execution after the enumeration pass being
+    colder, the last one warmer -- lands on the same arm every time and does not
+    cancel. Randomising it turns that systematic effect into noise, which the
+    median and the repetitions can then absorb.
 
     Alternating is the whole design. 2.32 measured two independent three-run
     benchmarks of an identical configuration landing 8 points apart, which is
@@ -439,7 +462,11 @@ def _paired_medians(cur, sql: str, plans: dict[str, dict], reps: int) -> tuple:
 
     samples: dict[str, list[float]] = {k: [] for k in plans}
     for _ in range(reps):
-        for name, plan in plans.items():
+        order = list(plans)
+        if rng is not None:
+            rng.shuffle(order)
+        for name in order:
+            plan = plans[name]
             hint = plan.get("hint")
             cur.execute("SAVEPOINT paired")
             try:
@@ -507,6 +534,10 @@ PROTOCOLS = {
         "use_guard": True,
         "default_repeat": 1,
         "default_paired_reps": 5,
+        # A fixed native/served/oracle order puts the same arm first in every
+        # repetition, so a position effect never cancels. The first external
+        # review of the paper raised it; randomising costs nothing.
+        "default_arm_order": "random",
         "question": "how big is the effect, not just its sign?",
         "note": (
             "guard on, and native/served/oracle re-timed alternately so "
@@ -575,6 +606,49 @@ def _summarise(results: list[dict], protocol: str, repeat: int) -> None:
             f"\nA difference smaller than {spread:.1f} points is inside this "
             f"sample's own spread and should not be argued about."
         )
+        _print_intervals(results)
+
+
+def _print_intervals(results: list[dict], confidence: float = 0.95) -> dict:
+    """
+    Mean and bootstrap interval of each total across independent runs.
+
+    The interval is over *runs*, so it describes how much the whole measurement
+    moves when it is repeated -- the quantity the paper's single-run figures
+    could not report. With a handful of runs the percentile bootstrap is coarse,
+    and the run count is printed beside it so nobody reads more into it than it
+    holds.
+    """
+    from app.experiment import bootstrap_ci
+
+    # `.get`, because callers such as `app.experiment` and the tests pass
+    # results carrying only the fields they care about.
+    def column(key: str) -> list[float]:
+        return [r[key] for r in results if r.get(key) is not None]
+
+    def pct_saved(r: dict) -> float | None:
+        native, saved = r.get("native_ms"), r.get("saved_ms")
+        return saved / native * 100 if native and saved is not None else None
+
+    fields = {
+        "native (ms)": column("native_ms"),
+        "served (ms)": column("served_ms"),
+        "oracle estimate (ms)": column("oracle_ms"),
+        "headroom (ms)": column("headroom_ms"),
+        "saved (ms)": column("saved_ms"),
+        "saved (% of native)": [v for v in map(pct_saved, results) if v is not None],
+        "captured (%)": column("captured_pct"),
+    }
+    print(f"\n{int(confidence * 100)}% bootstrap intervals over {len(results)} runs:")
+    summary = {}
+    for label, values in fields.items():
+        if len(values) < 2:
+            continue
+        mean = sum(values) / len(values)
+        lo, hi = bootstrap_ci(values, confidence=confidence)
+        summary[label] = {"mean": mean, "ci_low": lo, "ci_high": hi, "n": len(values)}
+        print(f"  {label:24s} mean {mean:9.1f}   [{lo:9.1f}, {hi:9.1f}]")
+    return summary
 
 
 if __name__ == "__main__":
@@ -607,6 +681,24 @@ if __name__ == "__main__":
              "than by repeating the whole workload",
     )
     parser.add_argument(
+        "--arm-order",
+        choices=["fixed", "random"],
+        default=None,
+        help="order of native/served/oracle within each paired repetition; "
+             "defaults to the protocol's own (paired: random, otherwise fixed)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="base seed for --arm-order random; run i of a --repeat uses seed + i",
+    )
+    parser.add_argument(
+        "--json-out",
+        default=None,
+        help="write every run's metrics to this file as JSON",
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=None,
@@ -632,6 +724,7 @@ if __name__ == "__main__":
         else spec.get("default_paired_reps", 1)
     )
     use_guard = spec["use_guard"] and not args.no_guard
+    arm_order = args.arm_order or spec.get("default_arm_order", "fixed")
 
     results = []
     for i in range(max(repeat, 1)):
@@ -644,8 +737,18 @@ if __name__ == "__main__":
                 use_guard=use_guard,
                 statement_timeout_ms=args.timeout_ms,
                 paired_reps=paired_reps,
+                arm_order=arm_order,
+                seed=args.seed + i,
                 quiet=repeat > 1,
             )
         )
 
     _summarise(results, args.protocol, max(repeat, 1))
+
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(
+                {"protocol": args.protocol, "repeat": repeat, "runs": results},
+                f, indent=2,
+            )
+        print(f"\nwrote {len(results)} run(s) to {args.json_out}")

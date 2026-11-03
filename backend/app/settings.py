@@ -450,7 +450,13 @@ def _coerce(name: str, value):
     kind = field["type"]
     if kind == "bool":
         if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
+            # The same rule `planner.env_flag` uses, shared rather than
+            # repeated. The two used to differ and disagreed on every natural
+            # way of writing "off" -- `false`, `no`, `off` and the empty string
+            # were all *true* to the planner (2.89).
+            from app.env import TRUTHY
+
+            return value.strip().lower() in TRUTHY
         return bool(value)
 
     if kind == "enum":

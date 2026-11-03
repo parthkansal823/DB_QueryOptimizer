@@ -22,6 +22,7 @@ from app.index_advice import (
     database_is_c_locale,
 )
 from app.db import get_cursor
+from app.env import env_int
 from app import logging_store
 from app.logging_store import log_execution, query_fingerprint
 from app.optimizer.decision_cache import DecisionCache
@@ -189,7 +190,7 @@ _apply_settings(app_settings.current())
 # non-reproducible while it's on. `retrain_if_needed` still gates every
 # promotion on the champion/challenger comparison, so the worst case is a
 # wasted retrain, not a regression.
-AUTO_RETRAIN_SECONDS = int(os.getenv("AUTO_RETRAIN_SECONDS", "0"))
+AUTO_RETRAIN_SECONDS = env_int("AUTO_RETRAIN_SECONDS", "0")
 
 
 class QueryRequest(BaseModel):
@@ -303,7 +304,7 @@ def health():
 # latency from the plan tree. Only the side-by-side comparison the dashboard
 # renders needs real numbers, and four rows make that comparison as well as
 # nineteen do.
-ANALYZE_EXECUTE_LIMIT = int(os.getenv("ANALYZE_EXECUTE_LIMIT", "4"))
+ANALYZE_EXECUTE_LIMIT = env_int("ANALYZE_EXECUTE_LIMIT", "4")
 
 
 def _execution_order(

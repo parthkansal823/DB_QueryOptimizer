@@ -4,7 +4,7 @@ Everything still unfinished, with the measurement that says why it matters.
 Ordered by what would change the project's claims most, not by effort.
 
 Closed items are **removed** rather than struck through — what each one found is
-written up in `docs/WRITEUP.md`, which is the record. §2.55–2.88 cover the work
+written up in `docs/WRITEUP.md`, which is the record. §2.55–2.94 cover the work
 that emptied most of this file.
 
 `docs/ROADMAP.md` is the same list with the reasoning; this is the checklist.
@@ -143,19 +143,27 @@ extra workload pass.
 
 ## Not started
 
-- **Collect with the unscored families on, then price them.** §2.75 and §2.84
-  between them took the sweep axis to all **seven** optional families —
-  `bushy` and `disable_index` are now separable from their parent families —
-  and derived it from the data, so it reports five as **not scored**: the log
-  has no rows for any of them. Collecting is the only way to turn that into an
-  answer, and it is now a cost rather than a question:
+- **Confirm the family sweep by execution, not replay.** §2.94 swept all 128
+  action spaces under the served policy and recommends the narrow one: not one
+  of the seven optional families earns its place, `bushy` is bit-identical to
+  omitting it, and `scan_method`/`parallel`/`disable_index` clear the safety
+  bounds in none of the 128 arms. The winning arm reads **+8.7% net** on 16
+  held-out queries.
+
+  Two reasons that is not finished. It is a **replay** — logged rows scored
+  against a model, which is the thing §2.83 found handing the model candidates
+  the server never offers. And the whole spread of the thirteen surviving arms
+  is **2.7 points**, against §2.32's 8-point between-run drift, so the replay
+  cannot separate any of them from each other.
 
   ```bash
-  INCLUDE_JOIN_METHODS=1 INCLUDE_MEMOIZE=1 INCLUDE_PARALLEL=1     INCLUDE_BUSHY=1 INCLUDE_DISABLE_INDEX=1 python -m app.collect_data
-  python -m app.autotune
+  python -m app.benchmark --protocol paired
   ```
 
-  Budget for it: each family widens what every query has to execute.
+  What is already resolvable without that: `bushy` earns exactly zero (four
+  exact ties, not a small difference), and three families fail the bounds
+  outright. Those do not need re-measuring.
+
 - **Features from the query beyond predicate shape** — but read §2.69 first.
   §2.60's three were measured to change **zero** ranker decisions, because
   anything derived from the SQL text takes one value per query and the ranker
@@ -182,27 +190,6 @@ extra workload pass.
   planner.
   (Note the naming trap: `17c` is a query *name*, not a table count. It joins
   seven.)
-- ~~**Cold start.**~~ Tested, and it *was* broken — §2.82. A fresh install
-  deviated on **every** query and ran 1.040x native with a 5.32x worst case.
-  Fixed by serving native until a model exists; the obvious repair (deviate
-  only when the cost estimate says cheaper) measured **worse**, 1.109x with
-  83% of its deviations regressing.
-- ~~**Single-node, single-connection.**~~ Partly tested — §2.87. The regression
-  guard survives concurrent refresh (**3.1M reads, zero errors**), and it is
-  safe because `refresh` rebinds rather than mutates, which nothing had written
-  down; that is now a docstring and a test. Planning overhead holds at
-  **41–47%** of execution from 1 to 8 concurrent planners — both degrade ~2.5x
-  together, so the economic case does not worsen under load.
-  **Still untested**: the serving path end to end (FastAPI, the connection
-  pool, the decision cache under contention), and anything beyond one machine.
-- ~~**Synthetic skew is synthetic.**~~ Re-run — §2.86, and the claim did not
-  survive. The carried model captures **−5.3%** on the wide action space
-  (97.0% before, against a narrow ceiling), serving JOB 4% *slower* than doing
-  nothing, against a local model's 96.5%. It still beats random by 22 points, so
-  the structural features rank well above chance and not above native.
-  **The open question it leaves**: does a carried model make local training
-  converge faster than a cold start? That is the useful version of transfer and
-  it has never been asked.
 
 ---
 
@@ -211,92 +198,34 @@ extra workload pass.
 **Thirty-plus silent bugs found, and the rate is not falling.** Every failure
 catalogued in section 2 produced a plausible number as its only symptom.
 
-The two questions that keep finding them, and should keep being asked:
+The audit questions that keep finding them — with the sections that earned each
+one — now live in `docs/WRITEUP.md` under the section-2 summary rather than
+here, because they are a record of what was learned, not work outstanding:
 
-1. **"Is this code reached?"** — found `pg_stat_statements` never created
-   (§2.36), two hint families never re-measured (§2.27), a conformal gate fitted
-   every run and consulted on none (§2.42), a swept `gate_mode` the API ignored
-   (§2.50), a setting with six lines of help text and no effect (§2.53), and 39%
-   of the action space classified as `other` and dropped from every replay
-   (§2.56), the calibration sweep scoring 117 of 513 candidates because
-   running the benchmark hid the collection run behind it (§2.65), and
-   `INCLUDE_DISABLE_INDEX` generating **zero** candidates because the catalog
-   map its family needs was gated on a *different* flag (§2.74), and the sweep's
-   family axis covering six of the eight families `hint_family` names, so
-   `memoize` and `parallel` were dropped from every arm (§2.75), and a
-   recommended threshold of `min_relative_gain = 0` making the whole caution
-   mechanism inert on the test that decides whether a win is worth taking —
-   including the guard's 2.0 for an unseen query — with the module's own
-   docstring making exactly that argument about the *other* knob (§2.79).
-2. **"Does this measurement agree with what runs?"** — found the policy (§2.43),
-   the action space (§2.50), the candidate pool (§2.47), the promotion yardstick
-   (§2.45), the drift window (§2.49), collection being narrower than serving
-   (§2.56), and the conformal coverage check reading uncalibrated means while
-   the gate is fitted and consulted on calibrated ones (§2.66 — real, and worth
-   under a point, which is itself worth knowing), `has_hint` separating the 65
-   baseline rows from 2,257 candidate rows in training while being constant at
-   serving (§2.70 — 255 splits, and deleting it was the largest single model
-   improvement found this year), and a gate calibrated for the *previous* model
-   passing both drift checks because the only thing recorded about the model was
-   a path that had not changed (§2.73), and collection skipping the prefilter
-   serving runs, so **14.4%** of logged candidates are plans byte-identical to
-   native and one of them is the oracle on 11 of 65 queries — in all three
-   functions that compute a best-available, fixed in one of them first (§2.76),
-   and a hint family blocked on a query being unable to produce the evidence
-   that would unblock it — the shadow path applied the family filter, and the
-   family query ignored shadow rows, so either half alone left the ratchet
-   intact (§2.77), and a comment asserting that two definitions of query
-   identity stay in sync when they disagree on two of three cases (§2.78 — a
-   wrong comment is worse than none, because it is the reason nobody checks),
-   and the deterministic measurement session pinning `geqo_seed` away from the
-   value serving uses, on a premise about that setting that turned out to be
-   false (§2.81), a cold-start path that deviated on **every** query with no
-   comparison against native at all, contradicting the docstring it sat under
-   (§2.82), and `app.benchmark` handing the model candidates carrying disabled
-   nodes that `plan_query` drops — so 36 of 43 vetoes had both gate conditions
-   satisfied and the query lost its deviation entirely (§2.83).
+1. **Is this code reached?** (§2.36, 2.42, 2.50, 2.56, 2.65, 2.74, 2.75, 2.79,
+   2.90, 2.91)
+2. **Does this measurement agree with what runs?** (§2.43, 2.45, 2.47, 2.49,
+   2.66, 2.70, 2.73, 2.76, 2.77, 2.78, 2.81, 2.82, 2.83, 2.89)
+3. **Is this worth building?**, asked *before* building (§2.58, 2.60, 2.61)
+   — and its second half, **measured against what the component actually
+   decides?** (§2.69)
+4. **Which population is this computed over?** (§2.70) — with the corollary
+   that when the population is *collected*, **the budget and the population
+   must be the same choice** (§2.92)
+5. **At what granularity does this rule resolve conflicts?** (§2.93) — "latest
+   run wins" was a decision about *runs* and is unavoidably also a decision
+   about every family nested inside one, which makes a narrow collection
+   destructive rather than additive
+6. **Is the *tool* wrong, or the thing it measures?** (§2.76, 2.83, 2.86)
+7. **Which language reads this string?** (§2.91)
 
-A third has started earning its keep: **"is this worth building?"**, asked
-*before* building. §2.60's feature was measured monotone (16.9% → 25.3% →
-31.4%) before a line was written; §2.61's was measured at +0.04 and never built;
-§2.58's label was rejected on a 0.341 correlation; per-join-width models were
-rejected on 96 rows across 3 queries. The cost of asking first is one script
-each, and it is the cheapest thing in this file.
-
-**And §2.69 is the refinement it needed.** §2.60 asked "is this worth building?"
-properly, measured `max_same_table_equalities` monotone against headroom
-(16.9% → 25.3% → 31.4%), and built it on that evidence. The measurement was
-real and the *axis* was wrong: it showed the feature predicts which **queries**
-have headroom, and the ranker compares **plans within one query**. Ablated, all
-three of §2.60's features changed the pick on 0 of 16 queries.
-
-So the question has a second half: **"measured against what the component
-actually decides?"** For anything feeding `pairwise_rank` that is now
-`app.feature_audit`, which is one command.
-
-A fourth question, earned the hard way in §2.70: **"which population is this
-computed over?"** `app.feature_audit` and `app.train --drop-constant-features`
-answered "is this feature constant?" over different row sets, written an hour
-apart — candidates only, and candidates plus baselines — and the one that
-*acted* was blind to the only feature worth acting on. They share
-`features.within_query_variance` now.
-
-A fifth, and it is the one this stretch kept needing: **"is the *tool* wrong,
-or the thing it measures?"** §2.83's deviation gap read as a mis-calibrated
-gate and was a benchmark handing out candidates the server never offers. §2.76's
-prefilter looked too aggressive and was correct, with the log's oracle
-contaminated instead. §2.86's transfer collapse was not the model changing —
-nothing about it changed — but the ceiling it was scored against. Three times
-in one night the instrument was the defect, and each time the first reading
-blamed the system.
-
-Checks now exist for the ones that are checkable: `models/gate.json` records
-the policy, the action space and the moment it was applied; `app.diagnostics`
-compares each against reality; `app.coverage_sweep` reports a held-out figure as
-a range over splits rather than a number; `app.feature_audit` names every
-feature that cannot separate the things being compared;
-`app.selection_effect` says how much of the headline is the workload having been
-chosen; `app.benchmark --protocol paired` re-times the arms alternately, so a
-regression has to survive the noise before it gets reported; and
-`app.noise --from-buffers` gives every query its own noise floor for free, from
-pairs of plans that provably did the same page work.
+The checks that exist for the ones that are checkable: `models/gate.json`
+records the policy, the action space and the moment it was applied;
+`app.diagnostics` compares each against reality; `app.coverage_sweep` reports a
+held-out figure as a range over splits; `app.feature_audit` names every feature
+that cannot separate the things being compared; `app.selection_effect` says how
+much of the headline is the workload having been chosen; `app.benchmark
+--protocol paired` re-times the arms alternately; `app.noise --from-buffers`
+gives every query its own noise floor; `app/env.py` holds one parser per type,
+enforced by an AST walk over every module; and `app.collect_data --held-out`
+aims a collection run at the queries the sweep can score.

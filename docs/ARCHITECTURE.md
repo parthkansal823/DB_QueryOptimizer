@@ -502,7 +502,7 @@ not for PostgreSQL to accept connections.
 ## 12. Testing
 
 ```bash
-pytest -m "not integration"   # 1,090 tests, no database required
+pytest -m "not integration"   # 1,611 tests, no database required
 pytest -m integration         # 17 tests, needs a live PostgreSQL
 ```
 
