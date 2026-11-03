@@ -25,7 +25,7 @@ from app.db import get_cursor
 from app.logging_store import log_execution
 from app.optimizer.bandit import POLICIES
 from app.optimizer.hints import apply_hint, plan_fingerprint
-from app.optimizer.planner import candidate_hints
+from app.optimizer.planner import candidate_hints, plan_query
 from app.optimizer.learned import (
     DEFAULT_SELECTION_POLICY,
     RANKER_POLICIES,
@@ -140,7 +140,10 @@ def run(
 
             candidates = []
             seen_plans = {plan_fingerprint(baseline)}
-            hints = candidate_hints(optimizer, baseline, tables)
+            # `cur` as `planner.plan_query` passes it: without one, the families
+            # that need the query's index map generate nothing, so the oracle
+            # was taken over a narrower space than the server can serve from.
+            hints = candidate_hints(optimizer, baseline, tables, cur=cur)
             # Drop the hint families that have already regressed on this query,
             # exactly as `planner.plan_query` does before serving.
             #
@@ -200,11 +203,41 @@ def run(
                 chosen_index = None
                 n_guarded += 1
             else:
-                served_plan = optimizer.select_plan(candidates, baseline_plan=baseline)
-                decision = optimizer.last_decision
-                chosen_index = decision.get("chosen_index")
-                vetoed = decision.get("fell_back_to_baseline", False)
-                n_vetoed += bool(vetoed and candidates)
+                # The server's decision, made by the server's own function.
+                #
+                # This called `optimizer.select_plan` on `candidates` directly, which
+                # is not what serving does in two ways: it omitted the guard's
+                # `caution` (2.0 on a query with no served history, so the
+                # benchmark's gate was looser than the deployed one on exactly
+                # the queries nothing is watching), and it chose among every
+                # candidate enumerated here instead of the budgeted set
+                # `plan_query` plans. The "served" arm was therefore a third
+                # decision procedure, neither the oracle's nor the server's.
+                # Found when five paired runs from one snapshot (-340 ms saved)
+                # and `app.e2e_latency`, which does call `plan_query` (+468 ms
+                # with a warm cache), disagreed in sign on the same model.
+                choice = plan_query(
+                    cur, sql, optimizer, query_id=query_id,
+                    guard=guard if use_guard else None,
+                )
+                decision = choice.get("decision") or {}
+                vetoed = choice.get("reason") == "safety_veto"
+                n_vetoed += bool(vetoed)
+                served_plan, chosen_index = baseline, None
+                if choice.get("hint"):
+                    chosen_index = next(
+                        (i for i, p in enumerate(candidates) if p["hint"] == choice["hint"]),
+                        None,
+                    )
+                    if chosen_index is None:
+                        # Planned by the server but collapsed into another hint's
+                        # fingerprint here; it still has to be timed as served.
+                        plan = get_plan(cur, apply_hint(sql, choice["hint"]))
+                        plan["hint"] = choice["hint"]
+                        plan["sql_text"] = sql
+                        candidates.append(plan)
+                        chosen_index = len(candidates) - 1
+                    served_plan = candidates[chosen_index]
 
             # Logged after the decision so the baseline row can record whether
             # it was also the plan that got served. A run that keeps native is
@@ -457,22 +490,34 @@ def _paired_medians(
     A plan that fails to re-execute keeps its original timing rather than
     dropping out, because a missing arm would silently turn a paired comparison
     back into an unpaired one.
+
+    Arms that are the *same plan* are timed once per repetition and share the
+    sample. Served is native whenever the gate declines, and oracle is native
+    whenever no candidate beat it; timing those separately measured nothing but
+    noise between two executions of one plan, and the `min` the caller takes
+    over the three medians then turned that noise into headroom. The candidate
+    loop has already dropped any hint whose plan matches native's fingerprint,
+    so two arms are the same plan exactly when they carry the same hint (or
+    both carry none).
     """
     import statistics as _stats
 
     samples: dict[str, list[float]] = {k: [] for k in plans}
+    arms_by_hint: dict[str | None, list[str]] = {}
+    for name, plan in plans.items():
+        arms_by_hint.setdefault(plan.get("hint") or None, []).append(name)
+
     for _ in range(reps):
-        order = list(plans)
+        order = list(arms_by_hint)
         if rng is not None:
             rng.shuffle(order)
-        for name in order:
-            plan = plans[name]
-            hint = plan.get("hint")
+        for hint in order:
             cur.execute("SAVEPOINT paired")
             try:
                 got = get_plan(cur, apply_hint(sql, hint) if hint else sql)
                 cur.execute("RELEASE SAVEPOINT paired")
-                samples[name].append(got["actual_total_time_ms"])
+                for name in arms_by_hint[hint]:
+                    samples[name].append(got["actual_total_time_ms"])
             except Exception:  # noqa: BLE001
                 cur.execute("ROLLBACK TO SAVEPOINT paired")
 

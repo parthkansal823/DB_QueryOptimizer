@@ -24,10 +24,7 @@
 
 \begin{document}
 
-%% ICDE requires EAB submissions to start the title with this tag. Remove it
-%% for the camera-ready version, or if submitting to the regular research track.
-\title{[Experiment, Analysis, and Benchmark]\\
-When the Instrument Is the Defect:\\
+\title{When the Instrument Is the Defect:\\
 Silent Measurement Failures in a Learned Query Optimizer}
 
 \author{\IEEEauthorblockN{Parth Kansal}
@@ -38,9 +35,9 @@ parth.kansal823@gmail.com}}
 \maketitle
 
 \begin{abstract}
-Learned query optimizers are usually evaluated by a single ratio: the share of
-the available latency headroom that a model captures, relative to an oracle
-that executes every candidate plan. We built a hint-based plan selector for
+A common way to evaluate a learned query optimizer is by the share of the
+available latency headroom that it captures, relative to an oracle that
+executes every candidate plan. We built a hint-based plan selector for
 PostgreSQL~18 and then spent considerably longer auditing its measurements than
 building it. The audit found more than thirty defects, almost all of them
 silent: they raised no error and yielded believable numbers that described
@@ -51,11 +48,10 @@ fell from 97.0\% to $-5.3$\%. The latency saved on a synthetic workload fell
 from 797\,ms to 215\,ms under alternated, repeated timing, and five further
 randomized runs put it at 84\,ms, with a 95\% confidence interval that includes
 zero. No model was retrained between the original and corrected figures. End
-to end, choosing plans without a cache made the workload 22.5\% slower than
-PostgreSQL alone; with a warm decision cache it was 3.1\% faster. The
-ensemble's spread also understated its own error about fourfold, which we
-attribute to bias that an ensemble cannot observe. We group the failures under
-seven audit questions and argue that a capture ratio should be reported with
+to end, choosing plans without a cache made the workload 32.7\% slower than
+PostgreSQL alone; with a warm decision cache it was 4.0\% faster. We group the
+failures under six audit questions and argue that a capture ratio should be
+reported with
 the action space that defines its ceiling, with a ceiling estimate that is not
 a minimum over noisy runs, and with repeated, randomized timing.
 \end{abstract}
@@ -90,11 +86,12 @@ execution was real, the evaluation queries were held out, and the code under
 test was the code we deployed. Even so, the figure said less than it seemed to,
 because the set of plans the oracle could choose from was narrower than the set
 the server actually offered. Within that narrow set, the best plans were only
-27\,ms faster in total than the ones our model served. When we widened the set
-to match the server, the oracle's total latency fell by 176\,ms while the
-latency of the plans our model served changed by 5\,ms, so the gap the model
-left uncaptured grew from 27\,ms to 198\,ms. The same model on the same queries
-now scored 91.0\%.
+27\,ms faster in total than the ones our model served. When we re-collected
+with the set widened to match the server, the oracle's total latency was
+176\,ms lower while the plans our model served changed by 5\,ms, so the gap the
+model left uncaptured grew from 27\,ms to 198\,ms. The same model on the same
+queries now scored 91.0\%, although part of that change reflects drift between
+the two collection runs (Section~\ref{sec:corrections}).
 
 This pattern recurred throughout the project. We eventually recorded more than
 thirty defects of the same character. Almost none caused a crash or an error;
@@ -103,15 +100,12 @@ asked a specific question about the measurement. Those questions are the main su
 of this paper, which makes the following contributions:
 
 \begin{itemize}
-  \item We describe a minimal learned plan-selection layer for PostgreSQL,
-  including which of its components turned out to matter
-  (Section~\ref{sec:system}).
   \item We give a measurement protocol that combines alternated re-timing of the
   measurement arms with an oracle ceiling reported beside every ratio, together
   with the action space that defines it (Section~\ref{sec:method}).
-  \item We present a taxonomy of more than thirty silent failures, organized by
-  the seven audit questions that exposed them, with the measured cost of
-  representative examples (Section~\ref{sec:failures}).
+  \item We present a retrospective taxonomy of more than thirty defects in our
+  own system, organized by the six audit questions that exposed them, with
+  the measured cost of representative examples (Section~\ref{sec:failures}).
   \item We report three corrected headline results, replicate the timing
   correction with five randomized runs, and argue that the corrections are more
   useful to other researchers than the original figures
@@ -119,15 +113,6 @@ of this paper, which makes the following contributions:
   \item We measure end-to-end latency, planning included, with and without the
   decision cache, and find that the system helps only when its decisions are
   reused (Section~\ref{sec:survives}).
-  \item We report a negative result on uncertainty estimation. Ensemble
-  disagreement understates this model's error about fourfold, two plausible
-  repairs make it worse, and we argue that the cause is that ensemble spread
-  measures variance while the error is dominated by bias
-  (Section~\ref{sec:sigma}).
-  \item We sweep all 128 combinations of our optional hint families in replay,
-  find that none improves on the always-on core, and state which of the
-  sweep's comparisons our instrument cannot resolve
-  (Section~\ref{sec:actionspace}).
 \end{itemize}
 
 %% ===========================================================================
@@ -140,89 +125,48 @@ PostgreSQL offers no interface for supplying a complete execution plan. The
 \texttt{pg\_hint\_plan} extension~\cite{pghint} is the closest substitute: a
 comment placed before a statement can fix the join order, the join method, the
 scan method for a relation, or a planner setting for the session. The planner
-still runs, but within a constrained search space. Alternatives can therefore be
-enumerated without modifying the server, and this is the mechanism used by our
-system and by several of the systems discussed below.
-
-The constraint has a consequence for everything that follows. A hint narrows
-the planner's search; it cannot express an arbitrary plan, so some plans that a
-full plan-injection interface could reach are unreachable through hints. A
-capture ratio reported by a hint-based system is therefore a fraction of the
-opportunity reachable through hints, which may be quite different from the
-true opportunity.
+still runs, but within a constrained search space, so some plans that a full
+plan-injection interface could reach are unreachable through hints. A capture
+ratio reported by a hint-based system is therefore a fraction of the
+opportunity reachable through hints, not of the true opportunity.
 
 \subsection{Learned Optimizers}
 
 Neo~\cite{neo} learns a value network over partial plans and uses it to guide
-plan search. Bao~\cite{bao} takes a coarser and more practical approach,
-choosing among a small set of planner hint sets for each query, which is close
-to what we do. Balsa~\cite{balsa} first learns from a cost-model simulator so
-that it does not have to execute very poor plans early in training.
-Lero~\cite{lero,lerojournal} learns a pairwise comparator in place of a latency
-regressor, on the grounds that ranking plans is the real task and that
-predicting absolute latency is harder than necessary. We adopted this argument.
-On held-out queries in our system, pairwise ranking was the only selection
-policy whose plans were faster than PostgreSQL's (92.7\% and 95.1\% of native
-latency on two held-out sets), while the three policies built on the
-ensemble's latency predictions were all slower than native. Later work has
-extended learned optimization to parametric queries~\cite{kepler}, mixed
-workloads~\cite{bite}, lifelong learning~\cite{limao} and offline
-planning~\cite{bayesopt}.
+plan search. Bao~\cite{bao} chooses among a small set of planner hint sets for
+each query, which is close to what we do. Balsa~\cite{balsa} first learns from
+a cost-model simulator so that it does not have to execute very poor plans
+early in training. Lero~\cite{lero,lerojournal} learns a pairwise comparator in
+place of a latency regressor, and we adopted that choice. Kepler~\cite{kepler}
+and LIMAO~\cite{limao} extend learned optimization to parametric queries and to
+lifelong learning. A further line of work targets per-query regressions that
+workload averages hide~\cite{reload,leonplus,parqo,robustsurvey}, and Liu et
+al.~\cite{conformallqo} bound a learned plan's latency with conformal
+prediction. That work asks whether a model behaves consistently from one query
+to the next. We ask whether the measurement of that behavior means what it
+appears to mean.
 
-\subsection{Robustness and Per-Query Regressions}
+\subsection{Evaluation Methodology}
 
-A body of recent work argues that workload-level averages hide per-query
-regressions and addresses the problem directly. RELOAD~\cite{reload} optimizes
-explicitly for query-level robustness, LEON+~\cite{leonplus} targets stable
-ML-aided optimization, PARQO~\cite{parqo} performs penalty-aware robust plan
-selection, and Kamali et al.~\cite{robustsurvey} survey robustness as a central
-open problem for learned optimizers. Liu et al.~\cite{conformallqo} use
-conformal prediction to place a user-controlled bound on a learned plan's
-latency before the plan runs. Our gate's optional residual-based bound borrows
-the same idea, but not the guarantees their procedure is designed to provide.
-
-Our argument is related to this literature but distinct from it. That work asks
-whether a model behaves consistently from one query to the next. We ask whether
-the measurement of that behavior means what it appears to mean. A system can be
-robust in their sense and still report an uninformative capture ratio, if the
-ceiling the ratio is computed against was chosen badly.
-
-\subsection{Evaluation Methodology and Measurement Validity}
-
-The work closest to ours is that of Lehmann et al.~\cite{lehmann}. They observe
-that learned optimizers each impose their own restrictions on how training data
-is generated, use arbitrary train/validation splits, and evaluate on
-self-selected subsets of benchmark queries, and they respond with a
-standardized end-to-end benchmarking framework. We agree with their diagnosis
-but address a different part of it. Their framework standardizes how a model is
-trained and how data is split. We are concerned with the quantity that the
-result is divided by, and with a class of implementation defects that make a
-reported number describe something other than the deployed system. The two
-concerns complement each other: a standardized split does not help if the
-action space that defines the oracle is narrower during measurement than in
-deployment, which is exactly the failure described in
+The work closest to ours is that of Lehmann et al.~\cite{lehmann}, who examine
+how learned optimizers are evaluated, including how training data is
+generated, how data is split and which benchmark queries are used, and who
+propose a standardized end-to-end benchmarking framework. Our focus is
+narrower: the dependence of a capture ratio on the action space that defines
+its ceiling, and implementation defects that make a reported number describe
+something other than the deployed system. A standardized framework does not by
+itself prevent the oracle's action space from being narrower during
+measurement than in deployment, which is the failure described in
 Section~\ref{sec:corrections}.
 
-The database community has a tradition of such papers. Leis et
-al.~\cite{leis,lookingglass} introduced JOB to show that claims about optimizer
-quality depend on the workload, and revisited the question a decade
-later~\cite{stillasking}. Wang et al.~\cite{ready} found learned cardinality
-estimators accurate but expensive and unpredictable, and Han et
-al.~\cite{cardbench} reached similar conclusions on a harder benchmark.
-Redbench~\cite{redbench} argues that benchmark workloads do not resemble real
-ones, and CERT~\cite{cert} uses cardinality estimation to find performance bugs.
-Outside databases, Mytkowicz et al.~\cite{wrongdata} showed that unreported
-environmental details can reverse a conclusion in compiler evaluation, and
-Fleming and Wallace~\cite{fleming} that summarizing with the wrong mean can
-produce the wrong ranking.
-
-Our case differs from these in where the bias comes from. It is neither
-environmental nor a matter of which workload was chosen. The denominator of the
-reported ratio is under the experimenter's direct control, and narrowing it
-raises the reported ratio without making the deployed system any better. Our
-contribution is correspondingly narrow: a worked demonstration, on one system,
-of how a capture ratio depends on the action space and on the timing protocol,
-together with executable checks for the defects we found.
+Leis et al.~\cite{leis,lookingglass,stillasking} showed that claims about
+optimizer quality depend on the workload, Wang et al.~\cite{ready} and Han et
+al.~\cite{cardbench} that learned cardinality estimators are less dependable
+than their accuracy suggests, Mytkowicz et al.~\cite{wrongdata} that unreported
+environmental details can reverse a conclusion, and Fleming and
+Wallace~\cite{fleming} that the wrong mean can produce the wrong ranking. In
+our case the bias comes from neither the environment nor the workload: the
+denominator of the reported ratio is under the experimenter's direct control.
 
 \subsection{How Existing Systems Report Results}
 \label{sec:survey}
@@ -239,7 +183,11 @@ does not simply omit the ceiling. Kepler also states the dependence we care
 about explicitly, by defining the optimum over a plan set~$P$. What the table
 does show is that the two columns vary independently of each other. A
 well-defined ceiling and a careful timing protocol are separate practices, and
-no system in the sample combines a ceiling with median-based repetition. RELOAD
+no system in the sample combines a ceiling with median-based repetition. The
+repetitions are also of different kinds: whole model runs for Neo, whole
+experiments for Balsa, and timings of a single plan for Kepler, which are not
+interchangeable. Where a paper does not describe its repetition, we write ``not
+reported'' rather than infer that none was done. RELOAD
 has the most careful timing protocol and no ceiling, while Kepler has the most
 clearly defined ceiling and estimates each plan's latency as the minimum of
 three runs. We return to the consequences in Section~\ref{sec:discussion}.
@@ -253,60 +201,59 @@ three runs. We return to the consequences in Section~\ref{sec:discussion}.
 \begin{tabular}{|l|l|l|l|l|}
 \hline
 \textbf{System} & \textbf{What Is Learned} & \textbf{Plan Interface} &
-  \textbf{Best-Possible Baseline} & \textbf{Timing Repetition} \\
+  \textbf{Best-Possible Baseline} & \textbf{Repetition (Unit)} \\
 \hline
 Neo~\cite{neo} & \makecell[l]{value model over\\partial plans} &
   plan construction &
   \makecell[l]{no oracle; approximated by ``the best\\
                query latency seen so far''} &
-  \makecell[l]{median over 50 network\\initializations} \\
+  \makecell[l]{50 network initializations\\(model runs), median} \\
 \hline
 Bao~\cite{bao} & \makecell[l]{choice among\\hint sets} & planner hint sets &
   \makecell[l]{yes: ``the optimal hint set \dots\ computed\\
                by exhaustively executing all query plans''} &
-  \makecell[l]{cold-cache isolation;\\no per-query repetition stated} \\
+  \makecell[l]{per-plan repetition not\\reported; cold-cache isolation} \\
 \hline
 Balsa~\cite{balsa} & \makecell[l]{value model,\\simulator first} &
   plan construction &
   \makecell[l]{no; compared with PostgreSQL and a\\
                commercial optimizer} &
-  \makecell[l]{``repeat each experiment 8 times\\and report the median''} \\
+  \makecell[l]{8 repetitions of each\\experiment, median} \\
 \hline
 Lero~\cite{lero} & \makecell[l]{pairwise plan\\comparison} & plan candidates &
   \makecell[l]{yes: ``Fastest Found Plan'', the fastest\\
                plan found by exhaustive search} &
-  none stated \\
+  not reported \\
 \hline
 Kepler~\cite{kepler} & \makecell[l]{fastest plan\\per template} &
   hint-forced plans &
   \makecell[l]{yes, parameterized: ``the optimal plan\\
                over some plan set $P$''} &
-  \makecell[l]{``execute the resulting plan three\\
-               times \dots\ take the minimum''} \\
+  \makecell[l]{3 executions per plan\\(plan timings), minimum} \\
 \hline
 RELOAD~\cite{reload} & \makecell[l]{reinforcement\\learning} &
   plan construction &
   \makecell[l]{no; the reference is the ``expert plan''\\
                from the cost-based optimizer} &
-  \makecell[l]{``median as the metric after 6\\
-               repetitions'', plus a $2\sigma$ band} \\
+  \makecell[l]{6 repetitions, median,\\plus a $2\sigma$ band} \\
 \hline
 LIMAO~\cite{limao} & \makecell[l]{lifelong modular\\learned optimizer} &
   plan construction &
   \makecell[l]{no; compared with Balsa, Bao\\
                and PostgreSQL} &
-  none stated \\
+  not reported \\
 \hline\hline
 \makecell[l]{This work,\\before the audit} &
   \makecell[l]{pairwise rank\\+ ensemble} & \texttt{pg\_hint\_plan} &
   \makecell[l]{yes, but over an action space narrower\\
-               than the one served} & single pass per arm \\
+               than the one served} &
+  \makecell[l]{1 execution per arm\\(plan timings)} \\
 \hline
 \makecell[l]{This work,\\after the audit} &
   \makecell[l]{pairwise rank\\+ ensemble} & \texttt{pg\_hint\_plan} &
   \makecell[l]{yes, over the served action space, with\\
                the space reported beside the ratio} &
-  \makecell[l]{randomized arm order, medians,\\repeated runs with intervals} \\
+  \makecell[l]{5 timings per plan, median;\\5 independent runs} \\
 \hline
 \end{tabular}
 \end{table*}
@@ -322,23 +269,19 @@ performs five steps:
 
 \begin{enumerate}
   \item it extracts the join graph from the join conditions in PostgreSQL's
-  baseline plan;
+  baseline plan, so that only connected join orders are generated;
   \item it generates candidate hint strings from eight families: join order,
   join method, scan method, cardinality correction, resource settings, operator
   toggles, memoization and parallelism;
   \item it plans each candidate with \texttt{EXPLAIN}, without executing it, and
-  derives a feature vector from the plan;
+  derives a fixed-length feature vector from the plan (per-table slots plus
+  tree-level aggregates and the planner's cost estimate);
   \item it ranks the candidates with a learned model; and
   \item it applies a confidence gate that decides whether to depart from
   PostgreSQL's own plan at all.
 \end{enumerate}
 
-Only the last two steps involve learning. The first three are plain
-enumeration, and for a reason we had not anticipated they took most of our
-early effort. When the action space is priced (Section~\ref{sec:actionspace}),
-two sub-families are counted separately: bushy join orders, split out of join
-order, and index disabling, split out of scan method. That gives three
-always-on families and seven optional ones. Figure~\ref{fig:pipeline} shows the
+Only the last two steps involve learning. Figure~\ref{fig:pipeline} shows the
 offline and online paths.
 
 \begin{figure}[t]
@@ -352,85 +295,74 @@ offline and online paths.
   arr/.style={-{Latex[length=1.3mm]}, semithick},
   lane/.style={draw=gray!55, dashed, rounded corners=4pt, fill=gray!5,
                inner sep=0.16cm},
-  lanelabel/.style={font=\scriptsize\bfseries, anchor=south, inner sep=2pt}
+  lanelabel/.style={font=\scriptsize\bfseries, anchor=south, inner sep=2pt},
+  lbl/.style={font=\scriptsize, inner sep=1pt}
 ]
 \def\dy{0.62}
-\def\xb{4.2}
+\def\xb{4.1}
 % offline path
-\node[box]     (a1) at (0,0)        {workload queries};
-\node[box]     (a2) at (0,-1*\dy)   {\ding{182}\ generate candidates};
-\node[box]     (a3) at (0,-2*\dy)   {execute all (3 repetitions)};
-\node[store]   (a4) at (0,-3.5*\dy) {plan execution log};
-\node[box]     (a5) at (0,-5*\dy)   {\ding{183}\ featurize};
-\node[learned] (a6) at (0,-6*\dy)   {train ensemble + ranker};
-\node[learned] (a7) at (0,-7*\dy)   {calibrate gate};
-\node[box]     (a8) at (0,-8*\dy)   {champion/challenger};
-% online path
-\node[box]     (b1)  at (\xb,0)      {incoming query};
-\node[box]     (b2)  at (\xb,-1*\dy) {\texttt{EXPLAIN}: baseline plan};
-\node[box]     (b3)  at (\xb,-2*\dy) {extract join graph};
-\node[box]     (b4)  at (\xb,-3*\dy) {\ding{182}\ generate candidates};
-\node[box]     (b5)  at (\xb,-4*\dy) {plan each, no execution};
-\node[box]     (b6)  at (\xb,-5*\dy) {\ding{183}\ featurize};
-\node[learned] (b7)  at (\xb,-6*\dy) {rank candidates};
-\node[learned] (b8)  at (\xb,-7*\dy) {confidence gate};
-\node[box]     (b9)  at (\xb,-8*\dy) {regression guard};
-\node[box]     (b10) at (\xb,-9*\dy) {decision cache};
-\node[box, text width=1.35cm] (b11) at ({\xb-0.85},-10.5*\dy) {hinted plan};
-\node[box, text width=1.35cm] (b12) at ({\xb+0.85},-10.5*\dy) {native plan};
+\node[box]     (a1) at (0,0)          {workload queries};
+\node[box]     (a2) at (0,-1.5*\dy)   {\ding{182}\ generate candidates};
+\node[box]     (a3) at (0,-3*\dy)     {execute all (3 repetitions)};
+\node[store]   (a4) at (0,-4.6*\dy)   {plan execution log};
+\node[box]     (a5) at (0,-6.3*\dy)   {\ding{183}\ featurize};
+\node[learned] (a6) at (0,-8*\dy)     {train ensemble + ranker};
+\node[learned] (a7) at (0,-9*\dy)     {calibrate gate};
+\node[box]     (a8) at (0,-10.4*\dy)  {champion/challenger};
+% online path, in the order plan_query runs it
+\node[box]     (b1)  at (\xb,0)         {incoming query};
+\node[box]     (b2)  at (\xb,-1*\dy)    {regression guard};
+\node[box]     (b3)  at (\xb,-2*\dy)    {decision cache lookup};
+\node[box]     (b4)  at (\xb,-3*\dy)    {\texttt{EXPLAIN}: baseline plan};
+\node[box]     (b5)  at (\xb,-4*\dy)    {extract join graph};
+\node[box]     (b6)  at (\xb,-5*\dy)    {\ding{182}\ generate candidates};
+\node[box]     (b7)  at (\xb,-6*\dy)    {plan each, no execution};
+\node[box]     (b8)  at (\xb,-7*\dy)    {\ding{183}\ featurize};
+\node[learned] (b9)  at (\xb,-8*\dy)    {rank candidates};
+\node[learned] (b10) at (\xb,-9*\dy)    {confidence gate};
+\node[box]     (b11) at (\xb,-10.4*\dy) {serve hinted or native plan};
 % flow within each path
 \foreach \u/\v in {a1/a2,a2/a3,a3/a4,a4/a5,a5/a6,a6/a7,a7/a8}
   \draw[arr] (\u) -- (\v);
-\foreach \u/\v in {b1/b2,b2/b3,b3/b4,b4/b5,b5/b6,b6/b7,b7/b8,b8/b9,b9/b10}
+\foreach \u/\v in {b1/b2,b4/b5,b5/b6,b6/b7,b7/b8,b8/b9,b9/b10}
   \draw[arr] (\u) -- (\v);
-\draw[arr] (b10.south) -- node[left, font=\tiny] {cleared} (b11.north);
-\draw[arr] (b10.south) -- node[right, font=\tiny] {declined} (b12.north);
+\draw[arr] (b2) -- node[left, lbl] {not blocked} (b3);
+\draw[arr] (b3) -- node[left, lbl] {miss} (b4);
+\draw[arr] (b10) -- node[left, lbl] {decide, store in cache} (b11);
+% the two bypasses that skip all planning
+\coordinate (s1) at ($(b11.east)+(0,0.09)$);
+\coordinate (s2) at ($(b11.east)+(0,-0.09)$);
+\draw[arr] (b2.east) -- ++(0.3,0) coordinate (g1)
+  -- node[sloped, above, lbl] {blocked: native} (g1 |- s1) -- (s1);
+\draw[arr] (b3.east) -- ++(0.62,0) coordinate (g2)
+  -- node[sloped, above, lbl] {hit: stored decision} (g2 |- s2) -- (s2);
 % artifacts handed from offline to online
-\draw[arr] (a6.east) -- node[above, font=\tiny, inner sep=1pt] {model} (b7.west);
-\draw[arr] (a7.east) -- node[above, font=\tiny, inner sep=1pt] {gate} (b8.west);
+\draw[arr] (a6.east) -- node[above, lbl] {model} (b9.west);
+\draw[arr] (a7.east) -- node[above, lbl] {gate} (b10.west);
 % feedback
 \draw[arr, dashed, gray] (b11.south) -- ++(0,-0.3)
-  -| node[pos=0.25, below, font=\tiny, text=black!70] {served runs are logged}
+  -| node[pos=0.25, below, lbl, text=black!70] {served runs are logged}
   ($(a4.west)+(-0.38,0)$) -- (a4.west);
 % lanes
 \begin{scope}[on background layer]
   \node[lane, fit=(a1)(a8)] (laneA) {};
-  \node[lane, fit=(b1)(b11)(b12)] (laneB) {};
+  \node[lane, fit=(b1)(b11)] (laneB) {};
 \end{scope}
 \node[lanelabel] at (laneA.north) {Offline};
 \node[lanelabel] at (laneB.north) {Online (per query)};
 \end{tikzpicture}
 \caption{Offline training and online serving paths. Shaded boxes are learned or
-calibrated; the others perform enumeration and bookkeeping. The offline path
-produces the model and the gate configuration consumed online. The steps marked
-\protect\ding{182} (candidate generation) and \protect\ding{183} (featurization) are implemented
-separately on each path and were never compared automatically. Both diverged:
-collection explored a wider candidate space than serving offered, and a
-\texttt{has\_hint} feature that separated baselines from candidates offline was
-constant online (Section~\ref{sec:q2}).}
+calibrated. Online, the regression guard and then the decision cache are
+consulted before any planning: a blocked query is served its native plan, and a
+cache hit reuses the stored decision without generating, planning or ranking
+candidates. The steps marked \protect\ding{182} (candidate generation) and
+\protect\ding{183} (featurization) are implemented separately on each path and
+were never compared automatically. Both diverged: collection explored a wider
+candidate space than serving offered, and a \texttt{has\_hint} feature that
+separated baselines from candidates offline was constant online
+(Section~\ref{sec:q2}).}
 \label{fig:pipeline}
 \end{figure}
-
-\subsection{Candidate Generation}
-
-Our first generator sampled join orders uniformly from all permutations, and
-most of what it produced was useless. An order that introduces a table sharing
-no join predicate with those already joined forces a Cartesian product, which
-PostgreSQL costs at around $10^{10}$ and never chooses. Reading the join graph
-from the \texttt{Hash Cond}, \texttt{Merge Cond} and \texttt{Index Cond} entries
-of the baseline plan and generating only connected orders raised the usable
-fraction on our three- and four-table queries from 23 of 48 (48\%) to 40 of 40.
-On one query the blind generator had produced a single usable candidate out of
-eight, leaving it with effectively no action space.
-
-\subsection{Features}
-
-Each candidate is a fixed-length vector: per-table slots recording join
-position, estimated selectivity and whether the table is read through an index
-scan, plus tree-level aggregates and the planner's cost estimate. Slots are
-indexed by table rather than by alias and aggregate over repeated occurrences.
-Our first implementation assigned them instead, so in a self-join, which JOB
-uses routinely, the second occurrence of a table silently overwrote the first.
 
 \subsection{Model and Gate}
 \label{sec:gate}
@@ -450,7 +382,9 @@ e^{\mu + z\kappa\sigma} < 1 + \frac{\rho - 1}{\kappa},
 \end{equation}
 where $g$ is the minimum relative gain, $z$ the confidence multiplier, $\rho$
 the largest tolerated slowdown relative to native (1.25 by default) and
-$\kappa \ge 1$ a caution factor supplied by the regression guard. The first test
+$\kappa \ge 1$ a caution factor supplied by the regression guard. Here $e^{\mu}$
+is the predicted latency ratio to native, obtained by exponentiating the mean
+predicted log-ratio; it is not the expected arithmetic ratio. The first test
 asks whether there is an expected win, and the second whether the plausible
 downside is bounded. In an alternative mode, the bound replaces $z\sigma$ with
 a quantile of the ensemble's out-of-bag residuals, an idea borrowed from
@@ -459,10 +393,22 @@ bound and claim no coverage guarantee for it: our procedure does not meet the
 conditions such guarantees require, and across ten splits its measured coverage
 ranged from 62.5\% to 92.6\% against a nominal 90\%.
 
-Four selection policies are implemented (greedy, Thompson sampling, risk-averse
-and pairwise ranking), along with a Borda aggregation of the orderings produced
-by the ensemble and the ranker. Pairwise ranking is the default because it
-measured best, not for any reason of principle.
+The served policy is pairwise ranking, the only one of the implemented
+policies whose plans were faster in total than PostgreSQL's in an offline
+replay on held-out queries. The gate's $z$ and $g$ are chosen by a grid sweep
+over replayed held-out decisions; the deployed values are $z = 2.0$, $g = 0$
+and $\rho = 1.25$. The artifact manifest gives the hyperparameters, the
+calibration grid and the candidate budget.
+
+The $\sigma$ in~\eqref{eq:gate} turned out to understate the model's error
+about fourfold: on out-of-bag predictions, the mean standard deviation across
+members was 0.026 and the mean absolute residual 0.106, both in natural-log
+ratio units. Giving the members different LightGBM seeds changed nothing, because
+LightGBM without row or column sampling is deterministic; enabling sampling
+made the understatement worse ($4.04\times$ to $4.41\times$). We read this,
+without a formal bias--variance decomposition, as error shared by all members,
+which their disagreement cannot reveal. The residual-based bound is meant to
+address that, but its coverage fell short of nominal on most splits.
 
 \subsection{Deployment Machinery}
 
@@ -470,7 +416,12 @@ New models enter service through a champion/challenger comparison on a
 held-out split and can be rolled back. A regression guard blocks a hint family on any query where that
 family has repeatedly regressed. For a query with no served history it also
 sets the caution factor $\kappa$ in~\eqref{eq:gate} to 2.0, which tightens both
-tests, and eases it toward 1.0 as history accumulates. Served decisions are cached per query template. We describe
+tests, and eases it toward 1.0 as history accumulates. Before any planning, the
+serving path checks the guard and then a decision cache keyed by the query
+template (the text with literals and hints removed), with a 300\,s lifetime, at
+most 512 entries, and invalidation whenever the model or the settings change. A
+hit skips candidate generation, planning and ranking, and different literal
+values of one template therefore share a decision. We describe
 this machinery because it shaped the rest of the paper. Several of the defects
 in Section~\ref{sec:failures} arose because one component was written for the
 offline path and a second, slightly different one for the serving path.
@@ -485,61 +436,65 @@ All experiments run on a single machine (Intel Core Ultra~7 155H with 16 cores
 and 22 hardware threads, 32\,GB of RAM, NVMe SSD, Windows~11), with
 PostgreSQL and \texttt{pg\_hint\_plan} built from source inside a Docker
 Desktop container; the current versions are PostgreSQL~18.6 and
-\texttt{pg\_hint\_plan}~1.8.1. Apart from the preloaded extensions described below
-and the \texttt{compute\_query\_id} and \texttt{track\_io\_timing} settings,
-the server runs with its default configuration. The optimizer is written in
-Python (FastAPI, psycopg2 and LightGBM) and connects to the database as an
-ordinary client. Both \texttt{pg\_hint\_plan} and
-\texttt{pg\_stat\_statements} are preloaded at server start. This detail is
-itself an instance of the failures studied here: if \texttt{pg\_hint\_plan} is
-only installed with \texttt{CREATE EXTENSION}, hints are accepted and silently
-ignored, and every candidate collapses to the default plan. Candidate plans are
-executed one at a time, never concurrently, so that they do not compete for CPU
-time and shared buffers. The project moved from PostgreSQL~16 to~18 partway
-through. Figures from its early history, including the synthetic and TPC-H
-ceilings in Table~\ref{tab:ceiling}, the 18.6\% noise figure of
-Section~\ref{sec:noise} and the candidate-generation counts of
-Section~\ref{sec:system}, were measured before the upgrade. The corrections of
-Section~\ref{sec:corrections}, the action-space sweep and the cold-start replay
-were measured on PostgreSQL~18.
+\texttt{pg\_hint\_plan}~1.8.1. Apart from preloading \texttt{pg\_hint\_plan}
+and \texttt{pg\_stat\_statements} and enabling \texttt{compute\_query\_id} and
+\texttt{track\_io\_timing}, the server runs with its default configuration. The optimizer, written in
+Python, connects as an ordinary client, and candidate plans are executed one
+at a time, never concurrently. The project moved from PostgreSQL~16 to~18
+partway through. The synthetic ceilings in Table~\ref{tab:ceiling} predate the
+upgrade; the corrections of Section~\ref{sec:corrections} were measured on
+PostgreSQL~18, and the new measurements of this paper on PostgreSQL~18.6.
 
 JOB figures, including the transfer results, are computed from logged
 collection runs, in which each candidate is executed three times and the median
 is kept. The synthetic-workload timing results (Table~\ref{tab:paired}) use
 the live protocols of Section~\ref{sec:timing}, and the end-to-end measurement
-of
-Section~\ref{sec:survives} times live requests from the client.
+of Section~\ref{sec:survives} times live requests from the client. The
+artifact's manifest lists, for every table and figure, its source, PostgreSQL
+version, query population and timing protocol.
 
 \subsection{Workloads}
 
-We use three workloads.
+We use two workloads.
 
 \subsubsection{Synthetic Workload}
 We use a six-table e-commerce schema with about 755k rows, built
 deliberately with correlated columns (city determines country, brand determines
 category, and price band and channel are correlated with category and order
 status) so that PostgreSQL's independence assumption misestimates conjunctive
-predicates. An earlier version of the schema without these correlations (v1,
-25 queries) offered almost no headroom, as Section~\ref{sec:ceiling} shows. The
-current workload has 65 queries joining two to six tables, including
-aggregation, \texttt{DISTINCT}, top-$N$, window-function and semi- and
-anti-join shapes. Sixteen queries are held out from training.
+predicates. Two earlier versions appear in Table~\ref{tab:ceiling}: v1, a
+four-table schema without these correlations and a 25-query workload, and v2, an
+intermediate 23-query version of the current workload. The current workload has
+65 queries joining two to six tables, including aggregation, \texttt{DISTINCT},
+top-$N$, window-function and semi- and anti-join shapes. Sixteen queries are
+held out from training.
 
 \subsubsection{Join Order Benchmark}
 We also use JOB~\cite{leis,jobrepo} on the IMDB dataset
 (21 tables, about 73M rows). We collect the 30 smallest of its 113 queries, the
 largest of which joins seven tables, and hold out eight.
 
-\subsubsection{TPC-H}
-In this paper we use TPC-H only for its oracle ceiling.
+\subsection{Data Splits and Their Reuse}
+\label{sec:splits}
+
+Held-out queries are held out at the query level: no row from them is used to
+fit the ensemble or the ranker. They are not, however, an untouched test set.
+Gate calibration, the comparison of selection policies, champion/challenger
+promotion and the action-space sweep of Section~\ref{sec:q4} all score
+on the synthetic model's 16 held-out queries, and the feature ablations of
+Section~\ref{sec:q2} use 16 other query-level splits. Results on held-out
+queries are therefore validation results. JOB uses the same kind of split, with
+8 of its 30 queries held out. We have no third, untouched split, and we make no
+claim about performance on unseen test queries.
 
 \subsection{Metrics}
 
 For a query $q$, let $\mathcal{A}(q)$ be the action space, i.e., the set of
 candidate plans the system may choose from, including PostgreSQL's native plan
-$p_{\mathrm{nat}}(q)$. Let $t(q,p)$ be the measured latency of plan $p$ and
-$p_{\mathrm{srv}}(q)$ the plan actually served. Over a set of queries $Q$ we
-define the native, served and oracle totals
+$p_{\mathrm{nat}}(q)$. Let $t(q,p)$ be the recorded latency of plan $p$ (one
+execution, or the median of the logged repetitions) and $p_{\mathrm{srv}}(q)$
+the plan actually served. Over a set of queries $Q$ we define the native, served
+and oracle totals
 \begin{align}
 T_{\mathrm{nat}} &= \textstyle\sum_{q\in Q} t\bigl(q, p_{\mathrm{nat}}(q)\bigr),
 \qquad
@@ -556,8 +511,27 @@ We call $T_{\mathrm{nat}} - T_{\mathrm{orc}}$ the \emph{headroom} and
 $T_{\mathrm{nat}} - T_{\mathrm{srv}}$ the latency \emph{saved}. The notation
 makes the central point of this paper explicit: $T_{\mathrm{orc}}$, and with it
 $C$, depends on $\mathcal{A}$, which the experimenter chooses. A negative $C$
-means the served plans are slower in total than the native ones. Where we report
-latencies relative to native, a value above $1.0\times$ is a slowdown.
+means the served plans are slower in total than the native ones. $C$ is
+undefined when the headroom is zero and unstable when it is small, so we always
+report the headroom beside it. When we average over $R$ independent runs we
+report the mean of the per-run ratios, $\overline{C} = \frac{1}{R}\sum_r C_r$,
+which is not the same as the ratio of the mean saving to the mean headroom.
+Where we report latencies relative to native, a value above $1.0\times$ is a
+slowdown.
+
+$T_{\mathrm{orc}}$ is the minimum over the whole collected action space. The
+\texttt{paired} protocol of Section~\ref{sec:timing} reports a different
+quantity, $\widehat{T}_{\mathrm{orc}}$, which re-times only one candidate per
+query; we write the two differently throughout.
+
+Candidates are deduplicated by physical plan before anything is timed. A plan's
+fingerprint is its tree of node types, relations and join types, and the native
+plan's fingerprint is included, so a hint that reproduces the native plan is
+not a separate candidate; plans the planner built with disabled nodes are
+dropped. Because the fingerprint ignores index choice and planner settings, a
+hint that changes only those is treated as a duplicate. Replays over logged
+collections, which include such duplicates, filter out the hints that provably
+cannot change the native plan.
 
 %% ===========================================================================
 \section{Measurement Methodology}
@@ -572,16 +546,12 @@ within the action space, and we report it beside every ratio. Section~\ref{sec:c
 ratio is a fraction of an opportunity, and without the size of that
 opportunity, a narrow action space cannot be told apart from a good model.
 
-Table~\ref{tab:ceiling} gives the ceilings for our workloads. The 6.5\% ceiling
-of the first synthetic workload is the most instructive number in the project's
-early history. PostgreSQL already chose the best available plan for 18 of its
-25 queries, and none of six model families (LightGBM, random forest, extra
-trees, gradient boosting, ridge regression and a multilayer perceptron) picked
-the fastest plan for a single query. We do not read this as six failed models.
-With only seven queries offering more than 5\%, the workload contained very
-little to learn. Rebuilding the schema around
-correlated columns raised the mean best-possible gain to 22.2\%, and the
-largest gains appeared on exactly the correlations we had planted.
+Table~\ref{tab:ceiling} gives the ceilings for our workloads. On the first
+synthetic workload, with a 6.5\% ceiling, PostgreSQL already chose the best
+available plan for 18 of 25 queries, and none of six model families picked the
+fastest plan for a single query. That was a property of the workload, not of
+the models. Rebuilding the schema around correlated columns raised the mean
+best-possible gain to 22.2\%.
 
 \begin{table}[t]
 \caption{Oracle Ceilings by Workload}
@@ -589,20 +559,20 @@ largest gains appeared on exactly the correlations we had planted.
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{|l|c|c|c|c|}
+\begin{tabular}{|l|c|c|c|}
 \hline
 \textbf{Measure} & \makecell{\textbf{Synth.}\\\textbf{v1}} &
-  \makecell{\textbf{Synth.}\\\textbf{v2}} & \textbf{TPC-H} & \textbf{JOB} \\
+  \makecell{\textbf{Synth.}\\\textbf{v2}} & \textbf{JOB} \\
 \hline
-Mean best-possible gain & 6.5\% & 22.2\% & $\approx$23\% & $\approx$82\% \\
+Mean best-possible gain & 6.5\% & 22.2\% & $\approx$82\% \\
 \hline
-Queries with $>$5\% gain & 7/25 & 14/23 & ---\textsuperscript{a} & 5/8 \\
+Queries with $>$5\% gain & 7/25 & 14/23 & 5/8 \\
 \hline
-Best top-1 accuracy & 0\% & --- & --- & 38\% \\
+Best top-1 accuracy & 0\% & ---\textsuperscript{a} & 38\% \\
 \hline
-\multicolumn{5}{l}{JOB figures are over its eight held-out queries.}\\
-\multicolumn{5}{l}{\textsuperscript{a}A dash means the quantity was not
-  measured.}
+\multicolumn{4}{p{0.85\columnwidth}}{\scriptsize JOB figures are over its eight
+held-out queries. The synthetic figures predate the PostgreSQL upgrade.
+\textsuperscript{a}Not measured.}
 \end{tabular}
 \end{table}
 
@@ -619,86 +589,86 @@ ceiling looks by chance alone, which inflates the headroom and deflates every
 capture ratio computed from it.
 
 The \texttt{paired} protocol (Algorithm~\ref{alg:paired}) keeps the single
-enumeration pass for choosing plans but not for reporting them. For each query it re-times the native plan, the served
-plan and the plan that was fastest in the enumeration pass, five times by
-default, and reports medians. The order of the three arms is shuffled
-independently in every repetition, so that no arm is always timed first or
-last. (The single runs in Table~\ref{tab:paired} predate this change and used
-a fixed order; its five-run replication uses the randomized one.) Drift then affects all three arms
-roughly equally, and the oracle is no longer a minimum over single draws of
-every candidate. The result is an oracle \emph{estimate}, and its biases run
-in both directions. It can be too high, because only the enumeration pass's
-fastest plan is re-timed and that plan need not be the fastest in the action
-space. It can be too low, because line~12 of Algorithm~\ref{alg:paired} takes
-the minimum of three medians, which can pick up a downward fluctuation.
-Re-timing every candidate would remove the first bias, at a cost that grows
-with the number of candidates per query. Section~\ref{sec:corrections} reports what the protocol did to our
-headline result.
+enumeration pass for choosing plans but not for reporting them. For each query
+it re-times the native plan, the served plan and the plan that was fastest in
+the enumeration pass, five times by default, in an order shuffled independently
+in every repetition, and reports medians. Arms that are the same plan, as when
+the gate declines or no candidate beats native, share one measurement. Drift
+then affects all arms roughly equally, and the oracle is no longer a minimum
+over single draws of every candidate. The single runs in
+Table~\ref{tab:paired} predate both the shuffling and the sharing: there, the
+order was fixed and identical arms were timed separately, so the minimum taken
+over them could turn noise between two executions of one plan into headroom.
+
+The result, $\widehat{T}_{\mathrm{orc}}$, is an estimate of $T_{\mathrm{orc}}$,
+and its biases run in both directions. It can be too high, because only the
+enumeration pass's fastest plan is re-timed and that plan need not be the
+fastest in the action space. It can be too low, because line~12 of
+Algorithm~\ref{alg:paired} takes the minimum of three medians, which can pick
+up a downward fluctuation. Re-timing every candidate would remove the first
+bias, at a cost that grows with the number of candidates per query.
 
 \begin{algorithm}[t]
 \caption{Paired Timing With an Oracle Estimate}
 \label{alg:paired}
 \small
 \begin{algorithmic}[1]
-\Require queries $Q$; action space $\mathcal{A}(q)$; served policy $\pi$;
-  repetitions $R$ (default 5)
-\Ensure totals $T_{\mathrm{nat}}$, $T_{\mathrm{srv}}$, $T_{\mathrm{orc}}$
-\State $T_{\mathrm{nat}}, T_{\mathrm{srv}}, T_{\mathrm{orc}} \gets 0$
+\Require queries $Q$; action space $\mathcal{A}(q)$; policy $\pi$;
+  repetitions $R$
+\Ensure $T_{\mathrm{nat}}$, $T_{\mathrm{srv}}$, $\widehat{T}_{\mathrm{orc}}$
+\State $T_{\mathrm{nat}}, T_{\mathrm{srv}}, \widehat{T}_{\mathrm{orc}} \gets 0$
 \For{each $q \in Q$}
   \State execute each $p \in \mathcal{A}(q)$ once, giving $t_1(p)$
-    \Comment{enumeration pass}
   \State $p_{\mathrm{srv}} \gets \pi(q)$;\quad
-    $p_{\mathrm{orc}} \gets \arg\min_{p\in\mathcal{A}(q)} t_1(p)$
-  \State $S_{\mathrm{nat}}, S_{\mathrm{srv}}, S_{\mathrm{orc}} \gets \emptyset$
+    $p_{\mathrm{orc}} \gets \arg\min_{p} t_1(p)$
+  \State $S_a \gets \emptyset$ for each arm $a$
   \For{$r \gets 1$ \textbf{to} $R$}
-    \For{$a \in \textsc{Shuffle}(\mathrm{nat}, \mathrm{srv}, \mathrm{orc})$}
-      \Comment{order randomized}
-      \State execute $p_a$ and append its latency to $S_a$
+    \For{$p \in \textsc{Shuffle}(\{p_{\mathrm{nat}}, p_{\mathrm{srv}},
+      p_{\mathrm{orc}}\})$}
+      \State execute $p$; add its time to $S_a$ for each $p_a = p$
     \EndFor
   \EndFor
   \State $m_a \gets \operatorname{median}(S_a)$ for each arm $a$
   \State $m_{\mathrm{orc}} \gets \min(m_{\mathrm{orc}}, m_{\mathrm{nat}},
-    m_{\mathrm{srv}})$ \Comment{oracle estimate $\le$ both arms}
-  \State $T_a \gets T_a + m_a$ for each arm $a$
+    m_{\mathrm{srv}})$
+  \State add $m_{\mathrm{nat}}$, $m_{\mathrm{srv}}$, $m_{\mathrm{orc}}$ to the
+    three totals
 \EndFor
-\State \Return $T_{\mathrm{nat}}$, $T_{\mathrm{srv}}$, $T_{\mathrm{orc}}$
+\State \Return $T_{\mathrm{nat}}$, $T_{\mathrm{srv}}$, $\widehat{T}_{\mathrm{orc}}$
 \end{algorithmic}
 \end{algorithm}
 
 \subsection{The Noise Floor}
 \label{sec:noise}
 
-Repeated executions of the same unchanged plan differ by 18.6\% on average on
-our setup, and
-we treat a latency difference smaller than that as unresolved. This is a single
-global figure, not a per-query floor, and noise may well differ from query to
-query.
-
-We also tried to obtain per-query floors without extra executions, from logged
-candidate plans that reported identical buffer counts, on the reasoning that
-such plans had done the same work. We no longer rely on that estimate, for two
-reasons. First, equal buffer counts do not imply equal work: two plans can read
-the same pages while doing different amounts of CPU work, for example with
-different join algorithms, so part of the latency difference between them is
-real. Second, PostgreSQL reports each node's buffer counts inclusive of its
-children, so the sum over the plan tree that our implementation used
-double-counts page accesses. The resulting spreads mix noise with genuine
-differences in work. Per-query floors should come from repeated executions of
-the same plan, which we have not yet run per query.
+To size the noise, we restarted PostgreSQL~18.6 and executed the native plan of
+each of the 65 synthetic queries seven times. For each query we take the
+relative spread, $(\max - \min)/\mathrm{median}$, of its execution times. Over
+the 65 queries, the median spread is 12.4\%, or 9.6\% when the first, cold
+execution is excluded, and the largest is 50.7\%. We treat a per-query
+difference smaller than about 10\% as unresolved; on individual queries the
+floor can be several times higher. An earlier measurement on PostgreSQL~16 put
+the variation at 18.6\% on average, under a definition that was not recorded,
+so we do not compare the two.
 
 %% ===========================================================================
 \section{A Taxonomy of Silent Failures}
 \label{sec:failures}
 
 We organize the defects by the question that exposed them, roughly in the order
-in which we learned to ask each one. Table~\ref{tab:questions} lists the seven
-questions with representative defects and their measured cost. Several defects
-were caught before they reached a reported figure and cost nothing, which is
-the best argument for asking these questions routinely instead of waiting for a
+in which we learned to ask each one. The six questions are a retrospective
+classification of defects in our own system, not a claim that they cover the
+defects of other systems. Most of the defects are measurement failures, which
+corrupt a reported number; a few are functional failures that the same
+questions found. The artifact lists every defect with the question that found
+it, the quantity it affected and the fix. Table~\ref{tab:questions} lists the
+six questions with representative defects and their measured cost. Several
+defects were caught before they reached a reported figure, which is the best
+argument for asking these questions routinely instead of waiting for a
 surprising result.
 
 \begin{table*}[t]
-\caption{The Seven Audit Questions, Representative Defects Each One Found, and
+\caption{The Six Audit Questions, Representative Defects Each One Found, and
 What Those Defects Cost}
 \label{tab:questions}
 \centering
@@ -715,9 +685,6 @@ What Those Defects Cost}
 \cline{2-3}
 & \texttt{INCLUDE\_DISABLE\_INDEX} generator gated on a different flag &
   one hint family silently absent \\
-\cline{2-3}
-& malformed environment variable crashing every entry point at import &
-  whole system, from one typo \\
 \hline
 \makecell[l]{\textbf{Q2} Does this measurement agree\\with what runs?} &
   \texttt{has\_hint} separating baselines from candidates in training &
@@ -742,10 +709,6 @@ What Those Defects Cost}
   a prefilter blamed for discarding winners; the logged oracle was wrong &
   oracle was a no-op on 11 of 65 queries \\
 \hline
-\makecell[l]{\textbf{Q7} Which language reads\\this string?} &
-  a word-boundary escape read as a backspace by both Python and PostgreSQL &
-  a filter that never fired \\
-\hline
 \end{tabular}
 \end{table*}
 
@@ -759,17 +722,6 @@ ignored; a configuration flag with six lines of documentation and no effect;
 39\% of the action space assigned to a catch-all category and dropped from every
 replay; and a hint family whose candidate generator checked a different flag
 from the one that enabled it, so that it produced no candidates at all.
-
-One recent instance shows how far such a defect can reach. We had a documented
-policy that a malformed environment variable should never prevent the server
-from starting. The policy could not take effect, because the learner module
-parsed five floating-point variables with a bare \texttt{float()} call at
-import time, and the settings module, which implemented the policy, imported
-the learner. A single malformed value therefore crashed every entry point in
-the system, including the component whose job was to prevent exactly that.
-Unlike most defects here, this one was loud once triggered, but it stayed latent
-until a malformed value arrived. An audit afterwards found seven more variables
-parsed the same way at import, in four other modules.
 
 \subsection{Q2: Does This Measurement Agree With What Runs?}
 \label{sec:q2}
@@ -795,21 +747,15 @@ gain to dropping all 23 features that are constant within a query. On
 re-checking, the other 22 made no difference on any of the 16 splits, and the
 whole effect came from this one feature. An ablation that removes a group of
 features and credits the group with the result is really measuring the group's
-most consequential member. The resulting model was nevertheless refused at
-promotion, because its worst pick was $3.31\times$ the best available plan
-against the incumbent's $1.41\times$.
+most consequential member.
 
 \subsection{Q3: Is This Worth Building, Asked Before Building?}
 \label{sec:q3}
 
-Asking this question first was cheap and effective. Before writing one proposed
-feature we checked that it increased monotonically with available headroom. We
-measured another proposed signal, from \texttt{pg\_overexplain}, at a median
-within-query rank correlation of $+0.04$ with latency over 56 queries, which is
-indistinguishable from chance, and never built it. We rejected buffer counts as
-a training label because of their 0.341 rank correlation with latency.
-
-The question has a second half that we learned the hard way. Three features we
+Asking this question first was cheap. A proposed signal from
+\texttt{pg\_overexplain} had a median within-query rank correlation of $+0.04$
+with latency over 56 queries, indistinguishable from chance, so we never built
+it. The question has a second half that we learned the hard way. Three features we
 did build, on good evidence, changed the model's choice on none of the 16
 held-out queries. The evidence was sound but measured along the wrong axis. The
 features predict which \emph{queries} have headroom, whereas our ranker compares
@@ -831,8 +777,9 @@ asked which population it would be computed over. The collection had been
 interrupted after 16 of the 65 queries, all from the correlated-predicate family
 that the workload lists first, and only four of those 16 were in the held-out
 split the sweep scores. The families' measured differences on those four
-queries ($-15$, $-7$, $0$, $0$ and $+2$\,ms) were well inside the noise floor,
-yet the sweep would have ranked them to the millisecond without saying so. The
+queries ($-15$, $-7$, $0$, $0$ and $+2$\,ms) were far smaller than the
+run-to-run variation we observe, yet the sweep would have ranked them to the
+millisecond without saying so. The
 collection budget and the evaluation population have to be chosen together. Ours
 lived in different modules, and nothing ever multiplied the two fractions.
 
@@ -858,6 +805,14 @@ because two functions, one reading the full history and the other the latest
 run, reported different coverage for the same family (65 and 33 queries).
 Collection now warns before it narrows the family set of the run it supersedes.
 
+With the data finally complete, the sweep replayed all 128 spaces on the 16
+held-out queries, keeping those whose calibrated gate left at most 25\% of
+deviations regressing and no query slower than $1.25\times$ native. No optional
+family improved on the three always-on ones (join order, operator toggles and
+cardinality correction). The surviving spaces' net improvements spanned only
+2.7 points (8.7\% to 6.0\%), less than the 8 points by which two benchmarks of
+one identical configuration once differed, so we report no ranking among them.
+
 \subsection{Q6: Is the Tool Wrong, or the Thing It Measures?}
 \label{sec:q6}
 
@@ -870,20 +825,6 @@ apparent wins were timing differences between identical plans, so it was the
 log's oracle that was wrong. And a transfer result read as evidence that the
 model generalized reflected the narrow candidate set it was measured on
 (Section~\ref{sec:corrections}).
-
-\subsection{Q7: Which Language Reads This String?}
-\label{sec:q7}
-
-This is the narrowest question, and the only one not about the seams between
-our own components. A regular expression meant to exclude \texttt{BEGIN},
-\texttt{COMMIT}, \texttt{SET} and similar statements from a workload report was
-written in a non-raw Python string, so its word-boundary escape \verb|\b| became
-a backspace and the filter never excluded a row. Python warned about a
-different, harmless escape in the same pattern. Making the string raw does not
-fix it either, because PostgreSQL's regular expressions also read \verb|\b| as a
-backspace; the word boundary there is \verb|\y|. A pattern written in one
-language and executed by another has every escape interpreted twice, and a
-warning from the outer language says nothing about the inner one.
 
 %% ===========================================================================
 \section{Results}
@@ -924,19 +865,22 @@ Re-collecting all 30 JOB queries under the wider action space
 took 8\,h 22\,min. On the eight held-out queries the oracle's total latency fell
 from 696\,ms to 520\,ms, while the plans our model served went from 723\,ms to
 718\,ms (Fig.~\ref{fig:job}). The uncaptured gap
-$T_{\mathrm{srv}} - T_{\mathrm{orc}}$ therefore grew from 27\,ms to 198\,ms. We
-attribute most of the 176\,ms fall in the oracle to plans that only the wider
-space contains, although the two runs also differ in machine state; in either
-case the model's served total barely moved. The capture ratio fell from 99.2\%
+$T_{\mathrm{srv}} - T_{\mathrm{orc}}$ therefore grew from 27\,ms to 198\,ms.
+The two totals come from separate collection runs, so the 176\,ms fall in the
+oracle mixes plans that only the wider space contains with differences in
+machine state, and this comparison cannot separate the two. The model's served
+total barely moved in either case. The capture ratio fell from 99.2\%
 to 91.0\%.
 
 Not all of that drop is due to the action space. The native total for the same
 eight queries also changed between the two runs, from 3,960\,ms to 2,715\,ms, a
-31\% change with no change to the queries or the data. As an illustrative
-sensitivity calculation, holding the native total fixed at either run's value
-attributes between 5.0 and 7.7 of the 8.2 points to the wider space. This is
-not a clean attribution, because the served and oracle totals were also timed
-in different runs and may have drifted too. A controlled comparison would time
+31\% change with no change to the queries or the data. As a sensitivity
+calculation only, holding the native total fixed at either run's value, and
+computing from the reported millisecond totals, leaves between 4.9 and 7.7 of
+the 8.2 points associated with the change in served and oracle totals. This is
+not an attribution, because the served and oracle totals were also timed in
+different runs and may have drifted too; the size of the action-space effect
+itself is unknown. A controlled comparison would time
 both action spaces within the same run. The drift is also why we compare arms
 only within a single run, and why we lean on the uncaptured gap, which does not
 involve the native total, though it is not immune to drift either.
@@ -1077,7 +1021,7 @@ Space}
 \textbf{Total latency (s)} & \textbf{Narrow} & \textbf{Wide} \\
 \hline
 Native, $T_{\mathrm{nat}}$ & 116.4 & 104.2 \\
-Oracle, $T_{\mathrm{orc}}$ & 30.1\textsuperscript{a} & 24.8 \\
+Oracle, $T_{\mathrm{orc}}$ & \textit{(30.1)}\textsuperscript{a} & 24.8 \\
 Random pick & 147.0 & 131.1 \\
 Transferred model, served & 32.7 & 108.4 \\
 JOB-trained model, served & 31.5 & 27.5 \\
@@ -1085,129 +1029,12 @@ JOB-trained model, served & 31.5 & 27.5 \\
 Transferred model, $C$ & 97.0\% & $-5.3$\% \\
 JOB-trained model, $C$ & 98.4\% & 96.5\% \\
 \hline
-\multicolumn{3}{l}{\textsuperscript{a}Derived from the recorded native and
-  served totals and $C$.}\\
-\multicolumn{3}{l}{The JOB-trained model's figures include its training
-  queries.}
+\multicolumn{3}{p{0.9\columnwidth}}{\scriptsize Totals over the collected JOB
+queries, from the logged collection runs. \textsuperscript{a}Not measured:
+reconstructed from the recorded native and served totals and $C$. The
+JOB-trained model's figures include its own training queries.}
 \end{tabular}
 \end{table}
-
-\subsection{Ensemble Uncertainty Measured the Wrong Quantity}
-\label{sec:sigma}
-
-Our gate needs an uncertainty estimate for each prediction. The obvious source
-is ensemble disagreement: train eight members on bootstrap samples and take the
-standard deviation of their predictions. This is what we built, and it was off
-by about a factor of four. On the ensemble's own out-of-bag predictions, the
-members' typical disagreement was 0.026, while the model's actual error was
-0.106. A one-sigma margin was therefore about a quarter of the real uncertainty,
-and a gate that required a gain of $z\sigma$ was demanding roughly a quarter of
-what it appeared to demand, on every decision it made.
-
-We tried two repairs and measured both. Giving the members different random
-seeds changed nothing, to sixteen decimal places. With
-\texttt{subsample=1.0} and \texttt{colsample\_bytree=1.0}, LightGBM is
-deterministic and the seed has nothing to act on. Enabling row and column
-sampling, so that the seed would matter, made the understatement worse (from
-$4.04\times$ to $4.41\times$) and slightly weakened the correlation between
-$\sigma$ and the actual error (from $+0.238$ to $+0.218$). We reverted both.
-
-Both repairs assumed that the members were too similar to one another. We
-believe the real problem is that they all make the same mistake. Ensemble
-spread measures variance: how much the model would change if it had been
-trained on different data. Under bias, every member errs in the same direction,
-so the members agree with each other while all being wrong, and no
-rearrangement of the ensemble can reveal an error that none of its members
-contains. Our evidence that the error is dominated by bias and by measurement
-noise is indirect: two changes that increased the members' diversity did not
-narrow the gap, and $\sigma$ correlates only weakly with the actual error. We
-have not performed a formal bias--variance decomposition.
-
-The remedy is to estimate uncertainty from how wrong the model has actually been
-instead of from how much its members disagree. Conformal
-prediction~\cite{vovk} does this, with coverage guarantees that hold under
-exchangeability when the procedure is followed as specified, and Liu et
-al.~\cite{conformallqo} develop it carefully for learned optimizers. Our own
-residual-based bound (Section~\ref{sec:gate}) follows the idea but not the
-procedure, and its coverage fell short of nominal on most splits (median
-75.5\% against a nominal 90\%). The mistake is easy to make because an
-ensemble's standard deviation is a plausible number in the right units that
-comes for free. Any system that gates on it should check the ratio of spread to
-realized error first.
-
-\subsection{What the Action Space Is Worth}
-\label{sec:actionspace}
-
-The preceding sections argue that narrowing an action space flatters the ratio
-computed against it. The complementary question is what widening one buys. Our
-optimizer has seven optional hint families in addition to the three it always
-serves (join order, operator toggles and cardinality correction). Collecting all
-seven on the queries our sweep scores took three attempts and exposed the
-defects described under Q4 and Q5. With the data finally complete, we swept all
-$2^7 = 128$ action spaces under the served policy, replaying logged executions
-on the 16 held-out queries. A space survives if its calibrated gate keeps the
-share of deviations that regress at or below 25\% and no query slower than
-$1.25\times$ native. Table~\ref{tab:spaces} lists every distinct outcome among
-the surviving spaces.
-
-\begin{table}[t]
-\caption{Distinct Outcomes Among Action Spaces Whose Gate Cleared the Safety
-Bounds (128 Swept; Replay on 16 Held-Out Queries)}
-\label{tab:spaces}
-\centering
-\footnotesize
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{|l|c|c|c|c|c|}
-\hline
-\textbf{Extra Families} & $\boldsymbol{z}$ &
-  \textbf{Deviates}\textsuperscript{a} & \textbf{Regress}\textsuperscript{b} &
-  \textbf{Worst}\textsuperscript{c} & \textbf{Net}\textsuperscript{d} \\
-\hline
-\emph{none} & 1.00 & 94\% & 20\% & 1.15$\times$ & \textbf{8.7\%} \\
-\texttt{bushy} & 1.00 & 94\% & 20\% & 1.15$\times$ & \textbf{8.7\%} \\
-\texttt{memoize} & 1.50 & 75\% & 17\% & 1.15$\times$ & 8.1\% \\
-\texttt{bushy,memoize} & 1.50 & 75\% & 17\% & 1.15$\times$ & 8.1\% \\
-\texttt{resource} & 2.00 & 62\% & 20\% & 1.15$\times$ & 6.1\% \\
-\texttt{join\_method} & 2.00 & 62\% & 20\% & 1.00$\times$ & 6.0\% \\
-\hline
-\multicolumn{6}{p{0.92\columnwidth}}{\scriptsize
-\textsuperscript{a}Share of queries on which the gate departs from the native
-plan. \textsuperscript{b}Share of those deviations that are slower than native.
-\textsuperscript{c}Largest served-to-native latency ratio.
-\textsuperscript{d}Net latency improvement over native. Every other surviving
-space adds \texttt{bushy} and/or \texttt{memoize} to a row shown and produces
-identical numbers.}
-\end{tabular}
-\end{table}
-
-In this replay, the best space is the three always-on families alone. None of the seven
-optional families improves on it, and the net improvement never rises when a
-family is added. Three families (\texttt{scan\_method}, \texttt{parallel} and
-\texttt{disable\_index}) appear in no surviving space: every space containing
-any of them failed the bounds outright.
-
-Most of Table~\ref{tab:spaces}, however, is not a result. The spread among the
-survivors is 2.7 points (8.7\% to 6.0\%), while two three-run benchmarks of an
-identical configuration once landed 8 points apart, so we report the table but
-not a ranking. Two observations are less sensitive to small differences, though
-neither is immune to noise. Every space containing \texttt{bushy} produced the
-same values as the same space without it, which suggests, though we have not
-confirmed it from the selection logs, that no bushy candidate was ever selected.
-And the three families that appear in no surviving space failed our replay
-safety criteria on this workload, which is not proof that they are unsafe. The
-sweep is a replay over logged rows, and its figures should be confirmed under
-the \texttt{paired} protocol before being relied on.
-
-\subsection{A Negative Result on Cold Start}
-\label{sec:coldstart}
-
-Replayed over the 65-query synthetic log, a fresh installation with no trained
-model deviated on every query and ran at $1.040\times$ native latency, with a
-worst case of $5.32\times$. The obvious repair, deviating only when the
-planner's cost estimate favors the candidate, ran at $1.109\times$ native in the
-same replay, with 10 of its 12 deviations (83\%) regressing. We shipped
-native-until-trained instead. The losing option looked like the safe,
-conservative change, and we would have accepted it without the measurement.
 
 \subsection{What Survives, End to End}
 \label{sec:survives}
@@ -1225,23 +1052,24 @@ a client actually waits for (Table~\ref{tab:e2e}). For each of the 65 synthetic
 queries we timed three paths from the client, with rows fetched: the query as
 written; the full serving path with no cache, in which every candidate is
 planned before the chosen plan runs; and the same path with a warm decision
-cache. Each query was timed five times per path, with the order of the paths
-shuffled in every repetition, and the median was kept. Shadow sampling was
-disabled for the measurement.
+cache. The session started from the same snapshot and restart as the
+replications, so the guard had no recent history. Each query was timed five
+times per path, with the order of the paths shuffled in every repetition, and
+the median was kept. Shadow sampling was disabled for the measurement.
 
-Without the cache, planning the candidates cost 3.5\,s across the workload, a
-median of 54\,ms per query, and the optimizer made the workload 22.5\% slower
-than PostgreSQL on its own. With a warm cache, choosing cost 73\,ms in total
-and the workload was 3.1\% faster than native. Nearly all of that difference
-comes from the 20 queries on which a hint was served, which went from 3,309\,ms
-to 2,944\,ms; on the other 45 queries the two paths were within 1\% of each
-other. The interval in Table~\ref{tab:e2e} resamples queries within one
-session. It shows how much the result depends on which queries are in the
-workload, not how much it would move between sessions, which
-Table~\ref{tab:paired} shows can be a lot. Taken together, the two
-measurements support a modest claim. On repeat traffic served from the cache,
-the system may save a few percent. On the first sight of a query, it costs
-about a fifth.
+Without the cache, planning the candidates cost 3.7\,s across the workload, a
+median of 53\,ms per query, and the optimizer made the workload 32.7\% slower
+than PostgreSQL on its own. With a warm cache, choosing cost 2\,ms in total
+and the workload was 4.0\% faster than native. Most of that difference comes
+from the 22 queries on which a hint was served, which went from 3,436\,ms to
+3,068\,ms, and 216\,ms of it from a single query; on the other 43 queries the
+two paths were within 1.2\% of each other. The interval in
+Table~\ref{tab:e2e} is a percentile bootstrap over queries (10,000 resamples)
+within one session. It shows how much the result depends on which queries are
+in the workload, not how much it would move between sessions, which
+Table~\ref{tab:paired} shows can be a lot. The two measurements together
+support a modest claim. On repeat traffic served from the cache, the system
+may save a few percent. On the first sight of a query, it costs about a third.
 
 \begin{table}[t]
 \caption{End-to-End Latency of the 65 Synthetic Queries, Planning Included}
@@ -1254,30 +1082,17 @@ about a fifth.
 \textbf{Path} & \textbf{Total (ms)} & \textbf{vs.\ Native} &
   \textbf{95\% CI (ms)} \\
 \hline
-Native & 13,642 & --- & --- \\
-No cache & 16,711 & $+22.5$\% & [$+2{,}544$, $+3{,}585$] \\
-Warm cache & 13,222 & $-3.1$\% & [$-837$, $-48$] \\
+Native & 11,712 & --- & --- \\
+No cache & 15,545 & $+32.7$\% & [$+3{,}310$, $+4{,}276$] \\
+Warm cache & 11,244 & $-4.0$\% & [$-1{,}000$, $-100$] \\
 \hline
 \multicolumn{4}{p{0.92\columnwidth}}{\scriptsize Client wall-clock time,
 median of five repetitions per query and path, path order shuffled per
-repetition. Choosing a plan cost 3,487\,ms in total without the cache and
-73\,ms with it. A hint was served on 20 of the 65 queries. The interval is a
-bootstrap over queries for the difference from native.}
+repetition. Choosing a plan cost 3,683\,ms in total without the cache and
+2\,ms with it. A hint was served on 22 of the 65 queries. The interval is a
+percentile bootstrap over queries for the difference from native.}
 \end{tabular}
 \end{table}
-
-Two robustness results hold as far as we tested them. In a stress test with six
-reader threads and one refreshing thread, the regression guard served 3.1
-million concurrent reads with zero errors. We attribute this to the refresh
-rebinding each shared attribute to a fully built object instead of mutating it
-in place, a property that was load-bearing yet undocumented until we went
-looking for it. A test of this kind cannot prove the absence of races, and one
-known window remains: the attributes are rebound one after another, so a reader
-can briefly pair a new block list with old observations. And on one four-way
-join that we profiled under concurrency, uncached planning stayed between 41\%
-and 47\% of the query's execution time from one to eight concurrent planners,
-because planning and execution slowed down by similar factors ($2.60\times$ and
-$2.43\times$ at eight-way concurrency).
 
 %% ===========================================================================
 \section{Discussion}
@@ -1290,9 +1105,9 @@ ceiling, but three of the seven systems in Table~\ref{tab:compare} already do,
 so our recommendation is narrower. What is missing is the second half. A ceiling is a statement about an action
 space, and outside Kepler's notation that space is not reported in a form that
 allows comparison across papers. Our own 99.2\% and 91.0\% come from an
-identical model on an identical set of queries, and an illustrative calculation
-attributes between 5.0 and 7.7 of the 8.2 points between them to the wider
-action space, with drift a plausible source of the rest. Neo shows the same dependence from the opposite direction,
+identical model on an identical set of queries measured over different action
+spaces, though also in different runs, so we cannot say exactly how much of the
+difference the action space accounts for. Neo shows the same dependence from the opposite direction,
 approximating the best possible latency by ``the best query latency seen so far
 by the system''. A reference of that kind moves with the system being
 evaluated, which makes it hard to read as a fixed ceiling.
@@ -1325,22 +1140,14 @@ saving from zero.
 
 Each audit question that repeatedly found defects has become a single command,
 because a lesson that exists only as advice rarely survives the next deadline.
-\texttt{diagnostics} compares the policy, action space and calibration time
-recorded with the deployed gate against what is running (Q1, Q2).
-\texttt{coverage\_sweep} reports a held-out figure as a range over ten splits:
-on our workload, held-out capture ranges from 24.2\% to 89.1\%.
-\texttt{feature\_audit} lists features that cannot separate the items a
-component compares, which is how three well-motivated features were found to
-change no decisions (Q3). \texttt{selection\_effect} estimates how much of a
-result comes from the choice of workload; only 6 of 40 randomly generated
-queries in our schema offer at least 8\% headroom. \texttt{benchmark
--{}-protocol paired} re-times the arms in randomized order and reports intervals
-across repeated runs, \texttt{e2e\_latency} counts the cost of choosing against
-what it saves, and \texttt{collect\_data -{}-held-out} spends the collection
-budget on the queries the sweep can score and warns before narrowing a family
-set (Q4, Q5). None of these tools is sophisticated. Their value is that each is
-one command, so the question gets asked at inconvenient moments and not only
-when someone is already suspicious.
+\texttt{diagnostics} compares the configuration recorded with the deployed gate
+against what is running (Q1, Q2); \texttt{feature\_audit} lists features that
+cannot separate the items a component compares (Q3); \texttt{coverage\_sweep}
+reports a held-out figure as a range over ten splits (Q4); and
+\texttt{benchmark -{}-protocol paired} and \texttt{e2e\_latency} produce the
+timings of Section~\ref{sec:results}. None of these tools is sophisticated.
+Their value is that each is one command, so the question gets asked at
+inconvenient moments and not only when someone is already suspicious.
 
 %% ===========================================================================
 \section{Threats to Validity}
@@ -1369,24 +1176,16 @@ earlier occasion, two independent three-run benchmarks of an identical
 configuration landed 8 points apart; we take that as a warning about the
 instrument's resolution, not as a calibrated bound.
 
-\subsubsection{End-to-End Latency}
-The end-to-end measurement of Table~\ref{tab:e2e} is a single session on one
-machine, with the client on the same host. Its interval resamples queries, not
-sessions. The cached path assumes repeat traffic within the cache's lifetime,
-and the measurement excludes shadow sampling and the runtime deadline that the
-serving path applies to long-running deviations.
+\subsubsection{Environment and End-to-End Latency}
+All measurements are on one machine, with one client at a time on the same
+host; behavior under concurrent load is outside our scope. The end-to-end
+interval resamples queries, not sessions, and the cached path assumes repeat
+traffic within the cache's lifetime.
 
 \subsubsection{Baselines}
-We compare against PostgreSQL's native plan, the
-cost-estimate argmin and random selection, but not against reimplementations of
-Bao or Lero. Our results describe one hint-based system and should not be read
-as measurements of those systems.
-
-\subsubsection{Environment}
-All measurements are single-node and single-instance, on
-one machine. We tested the regression guard and the planning path under
-concurrency, but not the full serving path; the HTTP layer, the connection pool
-and the decision cache under contention remain untested.
+We compare against PostgreSQL's native plan and random selection, but not
+against reimplementations of Bao or Lero, so our results describe one
+hint-based system only.
 
 \subsubsection{Completeness}
 This paper reports more than thirty defects and offers no
@@ -1404,7 +1203,7 @@ its effect on execution time from zero, and end to end it helps only when its
 decisions are reused from the cache. None of the corrections came from
 retraining the model. Each came
 from a specific structural mistake that produced a plausible number, and each
-was found by asking a question rather than by observing a failure. We offer the seven audit questions
+was found by asking a question rather than by observing a failure. We offer the six audit questions
 and the three reporting practices of Section~\ref{sec:discussion} in the hope that
 they save others some of the time they cost us. We arrived at both the hard way:
 we reported 99.2\%, and the number that replaced it came out of the same code.
@@ -1418,11 +1217,11 @@ measurement tools described in this paper are available at
 they were made, including those that turned out to be our own errors. Query
 definitions are in \texttt{backend/app/workload.py} (synthetic) and
 \texttt{data/job/queries} (JOB), and every trained model bundle records the
-identifiers of its held-out queries. The raw results of the replication and
-the end-to-end measurement are in \texttt{backend/models}. The version described
-in this paper is tagged \texttt{icde2027-submission}. The repository also
-includes more than 1,600 unit tests and 18 integration tests that check that
-hints actually bind.
+identifiers of its held-out queries. \texttt{paper/ARTIFACTS.md} gives the
+commands, seeds and file hashes behind every new measurement and the provenance
+of every historical one, \texttt{docs/DEFECTS.md} indexes the defects, and the
+raw results are in \texttt{backend/models}. The version described in this
+paper is tagged \texttt{paper-v2}.
 
 %% For the camera-ready version, balance the last page's reference columns with
 %% \IEEEtriggeratref{N}, placed here, where N is the reference to break before.

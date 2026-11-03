@@ -1,0 +1,1050 @@
+{
+  "reps": 7,
+  "n_queries": 65,
+  "median_relative_spread": 0.12371733290909198,
+  "max_relative_spread": 0.5072696860524962,
+  "median_warm_relative_spread": 0.0963118539910349,
+  "recommended_material_fraction": 0.0963118539910349,
+  "per_query": [
+    {
+      "query_id": "corr_3w_supplier_chain",
+      "median_ms": 15.544,
+      "relative_spread": 0.5072696860524962,
+      "warm_relative_spread": 0.5047530646864898,
+      "first_ms": 15.528,
+      "samples_ms": [
+        15.528,
+        13.055,
+        15.699,
+        15.314,
+        16.435,
+        15.544,
+        20.94
+      ]
+    },
+    {
+      "query_id": "shape_window_rank",
+      "median_ms": 8.76,
+      "relative_spread": 0.3670091324200913,
+      "warm_relative_spread": 0.18524069300401652,
+      "first_ms": 10.722,
+      "samples_ms": [
+        10.722,
+        8.853,
+        7.921,
+        7.881,
+        9.052,
+        7.507,
+        8.76
+      ]
+    },
+    {
+      "query_id": "corr_brand_category",
+      "median_ms": 44.196,
+      "relative_spread": 0.3440809122997555,
+      "warm_relative_spread": 0.09373788952971471,
+      "first_ms": 57.471,
+      "samples_ms": [
+        57.471,
+        46.376,
+        46.012,
+        42.817,
+        44.196,
+        43.538,
+        42.264
+      ]
+    },
+    {
+      "query_id": "ctl_3w_recent",
+      "median_ms": 22.093,
+      "relative_spread": 0.31516770017652657,
+      "warm_relative_spread": 0.1017998134201005,
+      "first_ms": 27.26,
+      "samples_ms": [
+        27.26,
+        22.368,
+        22.093,
+        21.143,
+        21.856,
+        20.297,
+        22.534
+      ]
+    },
+    {
+      "query_id": "gen_17_3w",
+      "median_ms": 21.394,
+      "relative_spread": 0.29475553893615036,
+      "warm_relative_spread": 0.291108854214754,
+      "first_ms": 17.626,
+      "samples_ms": [
+        17.626,
+        21.93,
+        21.394,
+        16.145,
+        22.008,
+        22.451,
+        19.974
+      ]
+    },
+    {
+      "query_id": "gen_18_2w",
+      "median_ms": 12.279,
+      "relative_spread": 0.2686700871406467,
+      "warm_relative_spread": 0.27785360859921515,
+      "first_ms": 13.835,
+      "samples_ms": [
+        13.835,
+        12.578,
+        13.793,
+        11.165,
+        11.104,
+        10.536,
+        12.279
+      ]
+    },
+    {
+      "query_id": "ctl_5w_signup",
+      "median_ms": 278.272,
+      "relative_spread": 0.2665701184452623,
+      "warm_relative_spread": 0.2339857684688512,
+      "first_ms": 306.612,
+      "samples_ms": [
+        306.612,
+        232.433,
+        235.573,
+        253.786,
+        278.272,
+        279.779,
+        294.68
+      ]
+    },
+    {
+      "query_id": "corr_3w_city_electronics",
+      "median_ms": 83.247,
+      "relative_spread": 0.2411017814455776,
+      "warm_relative_spread": 0.18503642262124034,
+      "first_ms": 75.336,
+      "samples_ms": [
+        75.336,
+        79.836,
+        82.216,
+        83.247,
+        85.055,
+        85.705,
+        95.407
+      ]
+    },
+    {
+      "query_id": "gen_22_5w",
+      "median_ms": 152.9,
+      "relative_spread": 0.23657292347939826,
+      "warm_relative_spread": 0.23804885753395807,
+      "first_ms": 152.9,
+      "samples_ms": [
+        152.9,
+        150.822,
+        153.699,
+        158.85,
+        153.082,
+        133.06,
+        122.678
+      ]
+    },
+    {
+      "query_id": "corr_city_country",
+      "median_ms": 47.93,
+      "relative_spread": 0.2358230753181723,
+      "warm_relative_spread": 0.10921588057939234,
+      "first_ms": 54.888,
+      "samples_ms": [
+        54.888,
+        47.93,
+        46.928,
+        43.585,
+        48.434,
+        44.706,
+        48.765
+      ]
+    },
+    {
+      "query_id": "corr_city_country_lang",
+      "median_ms": 35.926,
+      "relative_spread": 0.23425931080554474,
+      "warm_relative_spread": 0.24344103439298836,
+      "first_ms": 37.162,
+      "samples_ms": [
+        37.162,
+        39.756,
+        37.752,
+        35.926,
+        32.687,
+        33.216,
+        31.34
+      ]
+    },
+    {
+      "query_id": "gen_12_2w",
+      "median_ms": 14.569,
+      "relative_spread": 0.2190267005285195,
+      "warm_relative_spread": 0.10627787307032587,
+      "first_ms": 12.37,
+      "samples_ms": [
+        12.37,
+        14.581,
+        14.012,
+        15.158,
+        14.569,
+        15.561,
+        14.025
+      ]
+    },
+    {
+      "query_id": "corr_brand_band",
+      "median_ms": 44.989,
+      "relative_spread": 0.21360777078841495,
+      "warm_relative_spread": 0.21149233037698892,
+      "first_ms": 42.96,
+      "samples_ms": [
+        42.96,
+        51.405,
+        44.722,
+        44.989,
+        41.795,
+        46.184,
+        45.889
+      ]
+    },
+    {
+      "query_id": "corr_6w_supplier_country",
+      "median_ms": 390.234,
+      "relative_spread": 0.20261432883859432,
+      "warm_relative_spread": 0.15289341498658227,
+      "first_ms": 419.644,
+      "samples_ms": [
+        419.644,
+        397.238,
+        345.934,
+        390.234,
+        393.822,
+        340.577,
+        350.949
+      ]
+    },
+    {
+      "query_id": "gen_25_5w",
+      "median_ms": 266.325,
+      "relative_spread": 0.18878062517600672,
+      "warm_relative_spread": 0.18340467987079193,
+      "first_ms": 262.137,
+      "samples_ms": [
+        262.137,
+        266.325,
+        281.938,
+        286.205,
+        299.921,
+        265.644,
+        249.644
+      ]
+    },
+    {
+      "query_id": "ctl_supplier_rating",
+      "median_ms": 10.687,
+      "relative_spread": 0.18021895761205206,
+      "warm_relative_spread": 0.1795134681703794,
+      "first_ms": 10.287,
+      "samples_ms": [
+        10.287,
+        10.919,
+        10.687,
+        10.771,
+        9.338,
+        10.683,
+        11.264
+      ]
+    },
+    {
+      "query_id": "gen_26_5w",
+      "median_ms": 288.797,
+      "relative_spread": 0.18007112262246477,
+      "warm_relative_spread": 0.14985091278563978,
+      "first_ms": 279.052,
+      "samples_ms": [
+        279.052,
+        313.535,
+        331.056,
+        286.511,
+        285.926,
+        288.797,
+        317.942
+      ]
+    },
+    {
+      "query_id": "corr_6w_band_category",
+      "median_ms": 130.269,
+      "relative_spread": 0.17918307502168598,
+      "warm_relative_spread": 0.08996585136478907,
+      "first_ms": 143.526,
+      "samples_ms": [
+        143.526,
+        125.082,
+        129.185,
+        131.855,
+        120.184,
+        130.269,
+        131.649
+      ]
+    },
+    {
+      "query_id": "gen_16_3w",
+      "median_ms": 220.78,
+      "relative_spread": 0.1733671528218136,
+      "warm_relative_spread": 0.17760289910887672,
+      "first_ms": 220.78,
+      "samples_ms": [
+        220.78,
+        226.36,
+        223.584,
+        221.222,
+        195.678,
+        209.807,
+        188.084
+      ]
+    },
+    {
+      "query_id": "shape_6w_anti_join",
+      "median_ms": 195.579,
+      "relative_spread": 0.16764069762091025,
+      "warm_relative_spread": 0.15053148220473694,
+      "first_ms": 180.328,
+      "samples_ms": [
+        180.328,
+        207.217,
+        206.41,
+        213.115,
+        195.579,
+        186.96,
+        182.859
+      ]
+    },
+    {
+      "query_id": "corr_status_channel",
+      "median_ms": 30.591,
+      "relative_spread": 0.1651466117485536,
+      "warm_relative_spread": 0.16159677574129172,
+      "first_ms": 30.591,
+      "samples_ms": [
+        30.591,
+        30.328,
+        33.557,
+        29.312,
+        32.198,
+        28.505,
+        32.391
+      ]
+    },
+    {
+      "query_id": "shape_range_recent",
+      "median_ms": 30.345,
+      "relative_spread": 0.16483769978579677,
+      "warm_relative_spread": 0.16434755466478299,
+      "first_ms": 30.345,
+      "samples_ms": [
+        30.345,
+        33.649,
+        28.647,
+        29.793,
+        29.736,
+        31.078,
+        31.858
+      ]
+    },
+    {
+      "query_id": "gen_02_4w",
+      "median_ms": 277.07,
+      "relative_spread": 0.16141769227992922,
+      "warm_relative_spread": 0.1415457926757181,
+      "first_ms": 295.63,
+      "samples_ms": [
+        295.63,
+        283.571,
+        272.745,
+        250.906,
+        252.45,
+        277.07,
+        289.818
+      ]
+    },
+    {
+      "query_id": "gen_01_3w",
+      "median_ms": 14.005,
+      "relative_spread": 0.1600856836843985,
+      "warm_relative_spread": 0.15741065786702246,
+      "first_ms": 13.064,
+      "samples_ms": [
+        13.064,
+        12.96,
+        12.863,
+        14.638,
+        15.105,
+        14.005,
+        14.481
+      ]
+    },
+    {
+      "query_id": "shape_6w_supplier_reach",
+      "median_ms": 588.985,
+      "relative_spread": 0.15197670568859978,
+      "warm_relative_spread": 0.052405350043820534,
+      "first_ms": 661.776,
+      "samples_ms": [
+        661.776,
+        598.527,
+        581.697,
+        572.264,
+        579.061,
+        602.939,
+        588.985
+      ]
+    },
+    {
+      "query_id": "gen_08_4w",
+      "median_ms": 353.057,
+      "relative_spread": 0.15012306794653557,
+      "warm_relative_spread": 0.1488197355601167,
+      "first_ms": 347.42,
+      "samples_ms": [
+        347.42,
+        324.667,
+        373.931,
+        359.241,
+        353.057,
+        377.669,
+        348.572
+      ]
+    },
+    {
+      "query_id": "gen_14_2w",
+      "median_ms": 22.019,
+      "relative_spread": 0.148871429220219,
+      "warm_relative_spread": 0.14462625178826893,
+      "first_ms": 20.781,
+      "samples_ms": [
+        20.781,
+        22.717,
+        23.162,
+        20.975,
+        22.019,
+        20.824,
+        24.059
+      ]
+    },
+    {
+      "query_id": "ctl_country_only",
+      "median_ms": 48.162,
+      "relative_spread": 0.14119014991071807,
+      "warm_relative_spread": 0.13977389516957872,
+      "first_ms": 45.249,
+      "samples_ms": [
+        45.249,
+        49.138,
+        44.535,
+        50.107,
+        51.335,
+        48.162,
+        47.318
+      ]
+    },
+    {
+      "query_id": "shape_top_n_orders",
+      "median_ms": 300.393,
+      "relative_spread": 0.1325630091247134,
+      "warm_relative_spread": 0.13263299187801542,
+      "first_ms": 301.052,
+      "samples_ms": [
+        301.052,
+        312.605,
+        287.65,
+        297.587,
+        300.393,
+        300.076,
+        327.471
+      ]
+    },
+    {
+      "query_id": "gen_27_5w",
+      "median_ms": 368.877,
+      "relative_spread": 0.13189220254990142,
+      "warm_relative_spread": 0.10377257814274334,
+      "first_ms": 390.483,
+      "samples_ms": [
+        390.483,
+        362.029,
+        350.722,
+        341.831,
+        379.755,
+        376.138,
+        368.877
+      ]
+    },
+    {
+      "query_id": "gen_19_4w",
+      "median_ms": 371.37,
+      "relative_spread": 0.13165306836847349,
+      "warm_relative_spread": 0.13354492787667058,
+      "first_ms": 373.481,
+      "samples_ms": [
+        373.481,
+        371.37,
+        371.456,
+        349.219,
+        360.848,
+        398.111,
+        353.008
+      ]
+    },
+    {
+      "query_id": "shape_anti_join_unsold",
+      "median_ms": 90.893,
+      "relative_spread": 0.1259612951492414,
+      "warm_relative_spread": 0.12624951067149653,
+      "first_ms": 93.023,
+      "samples_ms": [
+        93.023,
+        97.785,
+        86.336,
+        90.478,
+        90.339,
+        90.893,
+        93.802
+      ]
+    },
+    {
+      "query_id": "gen_15_4w",
+      "median_ms": 163.429,
+      "relative_spread": 0.12371733290909198,
+      "warm_relative_spread": 0.12344653896054336,
+      "first_ms": 161.064,
+      "samples_ms": [
+        161.064,
+        169.475,
+        179.515,
+        164.146,
+        159.296,
+        163.02,
+        163.429
+      ]
+    },
+    {
+      "query_id": "corr_4w_broad",
+      "median_ms": 748.046,
+      "relative_spread": 0.12277988252059353,
+      "warm_relative_spread": 0.023656921192814397,
+      "first_ms": 666.181,
+      "samples_ms": [
+        666.181,
+        740.322,
+        748.683,
+        743.351,
+        758.026,
+        748.046,
+        757.009
+      ]
+    },
+    {
+      "query_id": "gen_24_5w",
+      "median_ms": 113.146,
+      "relative_spread": 0.12208120481501766,
+      "warm_relative_spread": 0.12371198652987554,
+      "first_ms": 116.227,
+      "samples_ms": [
+        116.227,
+        119.338,
+        116.773,
+        108.571,
+        113.146,
+        110.163,
+        105.525
+      ]
+    },
+    {
+      "query_id": "gen_09_4w",
+      "median_ms": 60.662,
+      "relative_spread": 0.11511325046981642,
+      "warm_relative_spread": 0.06215619287114634,
+      "first_ms": 66.542,
+      "samples_ms": [
+        66.542,
+        63.316,
+        60.227,
+        62.235,
+        60.662,
+        59.559,
+        59.771
+      ]
+    },
+    {
+      "query_id": "gen_11_2w",
+      "median_ms": 17.224,
+      "relative_spread": 0.11321411983279152,
+      "warm_relative_spread": 0.11537778829655057,
+      "first_ms": 17.449,
+      "samples_ms": [
+        17.449,
+        17.224,
+        17.315,
+        15.719,
+        17.669,
+        15.889,
+        16.578
+      ]
+    },
+    {
+      "query_id": "ctl_category_only",
+      "median_ms": 103.327,
+      "relative_spread": 0.09586071404376399,
+      "warm_relative_spread": 0.0963118539910349,
+      "first_ms": 105.358,
+      "samples_ms": [
+        105.358,
+        101.245,
+        102.359,
+        99.007,
+        103.327,
+        104.316,
+        108.912
+      ]
+    },
+    {
+      "query_id": "gen_21_3w",
+      "median_ms": 93.932,
+      "relative_spread": 0.09523910914278412,
+      "warm_relative_spread": 0.03588658304502881,
+      "first_ms": 100.63,
+      "samples_ms": [
+        100.63,
+        94.233,
+        93.932,
+        95.05,
+        93.659,
+        92.061,
+        91.684
+      ]
+    },
+    {
+      "query_id": "gen_06_4w",
+      "median_ms": 298.087,
+      "relative_spread": 0.09429797341044723,
+      "warm_relative_spread": 0.04486605611436395,
+      "first_ms": 278.478,
+      "samples_ms": [
+        278.478,
+        299.514,
+        306.587,
+        297.366,
+        293.181,
+        305.675,
+        298.087
+      ]
+    },
+    {
+      "query_id": "shape_6w_distinct_pairs",
+      "median_ms": 128.335,
+      "relative_spread": 0.0877936650173374,
+      "warm_relative_spread": 0.04442902840405438,
+      "first_ms": 122.102,
+      "samples_ms": [
+        122.102,
+        128.016,
+        128.335,
+        127.605,
+        132.245,
+        131.135,
+        133.369
+      ]
+    },
+    {
+      "query_id": "gen_10_2w",
+      "median_ms": 13.215,
+      "relative_spread": 0.08709799470298901,
+      "warm_relative_spread": 0.0872134874029172,
+      "first_ms": 13.215,
+      "samples_ms": [
+        13.215,
+        13.151,
+        13.854,
+        12.703,
+        13.248,
+        13.244,
+        12.979
+      ]
+    },
+    {
+      "query_id": "gen_13_5w",
+      "median_ms": 154.525,
+      "relative_spread": 0.08645850186054027,
+      "warm_relative_spread": 0.08651056775797751,
+      "first_ms": 160.973,
+      "samples_ms": [
+        160.973,
+        164.885,
+        154.525,
+        151.988,
+        154.339,
+        160.618,
+        151.525
+      ]
+    },
+    {
+      "query_id": "shape_semi_join_exists",
+      "median_ms": 314.045,
+      "relative_spread": 0.08572338359152348,
+      "warm_relative_spread": 0.03941966197324999,
+      "first_ms": 296.497,
+      "samples_ms": [
+        296.497,
+        310.898,
+        314.045,
+        323.418,
+        312.213,
+        321.171,
+        321.542
+      ]
+    },
+    {
+      "query_id": "corr_6w_everything",
+      "median_ms": 129.345,
+      "relative_spread": 0.08496656229463845,
+      "warm_relative_spread": 0.08494226399344583,
+      "first_ms": 129.345,
+      "samples_ms": [
+        129.345,
+        127.384,
+        127.817,
+        137.722,
+        130.947,
+        131.143,
+        126.732
+      ]
+    },
+    {
+      "query_id": "corr_3w_brand_chain",
+      "median_ms": 101.012,
+      "relative_spread": 0.07997069655090473,
+      "warm_relative_spread": 0.08036411570124594,
+      "first_ms": 102.516,
+      "samples_ms": [
+        102.516,
+        101.012,
+        100.023,
+        103.667,
+        104.746,
+        99.471,
+        96.668
+      ]
+    },
+    {
+      "query_id": "corr_4w_cancelled_premium",
+      "median_ms": 103.548,
+      "relative_spread": 0.0765731834511531,
+      "warm_relative_spread": 0.05210667369623482,
+      "first_ms": 106.786,
+      "samples_ms": [
+        106.786,
+        104.194,
+        103.69,
+        98.857,
+        103.548,
+        101.301,
+        99.724
+      ]
+    },
+    {
+      "query_id": "gen_03_3w",
+      "median_ms": 236.53,
+      "relative_spread": 0.07441339364985414,
+      "warm_relative_spread": 0.07453092645993979,
+      "first_ms": 241.162,
+      "samples_ms": [
+        241.162,
+        243.243,
+        240.795,
+        235.57,
+        236.53,
+        235.784,
+        225.642
+      ]
+    },
+    {
+      "query_id": "gen_04_4w",
+      "median_ms": 299.656,
+      "relative_spread": 0.07318058039885746,
+      "warm_relative_spread": 0.0546175205641811,
+      "first_ms": 310.156,
+      "samples_ms": [
+        310.156,
+        299.656,
+        304.425,
+        293.487,
+        291.778,
+        288.227,
+        303.967
+      ]
+    },
+    {
+      "query_id": "corr_6w_status_premium",
+      "median_ms": 143.579,
+      "relative_spread": 0.07214146915635297,
+      "warm_relative_spread": 0.07197434467373126,
+      "first_ms": 146.362,
+      "samples_ms": [
+        146.362,
+        139.565,
+        144.432,
+        143.301,
+        136.004,
+        143.579,
+        146.328
+      ]
+    },
+    {
+      "query_id": "corr_3w_both_ends",
+      "median_ms": 105.16,
+      "relative_spread": 0.06661278052491437,
+      "warm_relative_spread": 0.06706269236844746,
+      "first_ms": 105.16,
+      "samples_ms": [
+        105.16,
+        105.641,
+        107.996,
+        101.669,
+        100.991,
+        103.268,
+        107.905
+      ]
+    },
+    {
+      "query_id": "corr_4w_premium_us",
+      "median_ms": 100.804,
+      "relative_spread": 0.0662672116185865,
+      "warm_relative_spread": 0.06620449060699005,
+      "first_ms": 96.831,
+      "samples_ms": [
+        96.831,
+        100.995,
+        102.735,
+        100.804,
+        97.376,
+        103.303,
+        96.623
+      ]
+    },
+    {
+      "query_id": "gen_05_3w",
+      "median_ms": 93.154,
+      "relative_spread": 0.06597676965025658,
+      "warm_relative_spread": 0.06618743774062408,
+      "first_ms": 93.861,
+      "samples_ms": [
+        93.861,
+        89.192,
+        93.734,
+        95.338,
+        93.154,
+        92.561,
+        92.44
+      ]
+    },
+    {
+      "query_id": "shape_6w_top_suppliers",
+      "median_ms": 157.327,
+      "relative_spread": 0.065646710354866,
+      "warm_relative_spread": 0.06570016348704509,
+      "first_ms": 158.913,
+      "samples_ms": [
+        158.913,
+        157.327,
+        153.128,
+        159.433,
+        160.931,
+        150.603,
+        157.071
+      ]
+    },
+    {
+      "query_id": "ctl_4w_quantity",
+      "median_ms": 466.554,
+      "relative_spread": 0.06477278085709258,
+      "warm_relative_spread": 0.06454382551381962,
+      "first_ms": 458.363,
+      "samples_ms": [
+        458.363,
+        444.211,
+        469.864,
+        465.875,
+        474.25,
+        474.431,
+        466.554
+      ]
+    },
+    {
+      "query_id": "gen_07_2w",
+      "median_ms": 53.775,
+      "relative_spread": 0.062185030218503044,
+      "warm_relative_spread": 0.062426493923497695,
+      "first_ms": 54.765,
+      "samples_ms": [
+        54.765,
+        53.359,
+        53.775,
+        51.608,
+        54.952,
+        54.678,
+        52.448
+      ]
+    },
+    {
+      "query_id": "gen_20_2w",
+      "median_ms": 115.45,
+      "relative_spread": 0.05982676483326112,
+      "warm_relative_spread": 0.05979775942375285,
+      "first_ms": 115.216,
+      "samples_ms": [
+        115.216,
+        115.45,
+        114.197,
+        115.562,
+        113.602,
+        116.716,
+        120.509
+      ]
+    },
+    {
+      "query_id": "ctl_6w_uncorrelated",
+      "median_ms": 98.63,
+      "relative_spread": 0.05910980431917265,
+      "warm_relative_spread": 0.059271459216559394,
+      "first_ms": 100.188,
+      "samples_ms": [
+        100.188,
+        103.76,
+        101.47,
+        98.047,
+        97.93,
+        98.092,
+        98.63
+      ]
+    },
+    {
+      "query_id": "corr_5w_premium_supplier",
+      "median_ms": 129.201,
+      "relative_spread": 0.057724011424060175,
+      "warm_relative_spread": 0.057686506555284824,
+      "first_ms": 128.496,
+      "samples_ms": [
+        128.496,
+        127.59,
+        135.048,
+        129.201,
+        129.103,
+        129.369,
+        129.512
+      ]
+    },
+    {
+      "query_id": "gen_23_5w",
+      "median_ms": 126.331,
+      "relative_spread": 0.0552675115371524,
+      "warm_relative_spread": 0.055349003131317125,
+      "first_ms": 127.83,
+      "samples_ms": [
+        127.83,
+        128.362,
+        122.768,
+        125.959,
+        126.331,
+        121.38,
+        127.42
+      ]
+    },
+    {
+      "query_id": "shape_distinct_brands",
+      "median_ms": 154.253,
+      "relative_spread": 0.04843990068264462,
+      "warm_relative_spread": 0.04877634817121321,
+      "first_ms": 155.234,
+      "samples_ms": [
+        155.234,
+        158.248,
+        150.776,
+        151.15,
+        154.253,
+        154.712,
+        152.125
+      ]
+    },
+    {
+      "query_id": "corr_4w_power_users",
+      "median_ms": 123.394,
+      "relative_spread": 0.044767168581940894,
+      "warm_relative_spread": 0.044806203436710546,
+      "first_ms": 128.006,
+      "samples_ms": [
+        128.006,
+        127.91,
+        123.086,
+        123.394,
+        122.722,
+        123.179,
+        128.246
+      ]
+    },
+    {
+      "query_id": "shape_group_by_category",
+      "median_ms": 98.859,
+      "relative_spread": 0.0375383121415349,
+      "warm_relative_spread": 0.03724669537201528,
+      "first_ms": 98.753,
+      "samples_ms": [
+        98.753,
+        98.859,
+        100.407,
+        102.132,
+        98.709,
+        100.974,
+        98.421
+      ]
+    },
+    {
+      "query_id": "corr_5w_supplier_chain",
+      "median_ms": 149.233,
+      "relative_spread": 0.034040728257155005,
+      "warm_relative_spread": 0.01883433628911945,
+      "first_ms": 152.532,
+      "samples_ms": [
+        152.532,
+        149.233,
+        149.456,
+        149.052,
+        147.452,
+        150.261,
+        147.782
+      ]
+    },
+    {
+      "query_id": "corr_4w_full_correlated",
+      "median_ms": 143.124,
+      "relative_spread": 0.03184651071797877,
+      "warm_relative_spread": 0.021429372040238728,
+      "first_ms": 146.041,
+      "samples_ms": [
+        146.041,
+        141.483,
+        142.372,
+        144.36,
+        143.124,
+        144.542,
+        142.03
+      ]
+    }
+  ]
+}

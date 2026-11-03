@@ -135,6 +135,46 @@ class TestRandomisedArmOrder:
         assert "rng=arm_rng" in source
 
 
+class TestIdenticalArmsAreTimedOnce:
+    """Served is native when the gate declines, and oracle is native when no
+    candidate beat it. Timing the same plan twice and taking a minimum turned
+    noise between two executions into headroom (found by the paper's third
+    external review)."""
+
+    @staticmethod
+    def _declined():
+        native = {"actual_total_time_ms": 100.0}
+        return {"native": native, "served": native,
+                "oracle": {"actual_total_time_ms": 70.0, "hint": "/*+ B */"}}
+
+    def test_one_execution_per_repetition_for_a_shared_plan(self, monkeypatch):
+        cur = _Cur({"native": [90.0, 100.0, 110.0], "B": [60.0, 70.0, 80.0]})
+        _patch(monkeypatch, cur)
+
+        _paired_medians(cur, "SELECT 1", self._declined(), 3)
+
+        assert cur.order == ["native", "B"] * 3
+
+    def test_a_declined_query_saves_exactly_nothing(self, monkeypatch):
+        cur = _Cur({"native": [90.0, 100.0, 110.0], "B": [60.0, 70.0, 80.0]})
+        _patch(monkeypatch, cur)
+
+        native, served, _ = _paired_medians(cur, "SELECT 1", self._declined(), 3)
+
+        assert served == native
+
+    def test_no_headroom_when_native_is_the_oracle(self, monkeypatch):
+        native = {"actual_total_time_ms": 100.0}
+        plans = {"native": native, "served": native, "oracle": native}
+        cur = _Cur({"native": [90.0, 140.0, 100.0]})
+        _patch(monkeypatch, cur)
+
+        n, s, o = _paired_medians(cur, "SELECT 1", plans, 3)
+
+        assert n == s == o
+        assert cur.order == ["native"] * 3
+
+
 def test_a_failing_arm_keeps_its_original_timing(monkeypatch):
     """Dropping it would silently turn a paired comparison back into an unpaired
     one -- two arms re-timed under new conditions and the third under old."""
@@ -232,3 +272,38 @@ class TestTheProtocolIsWiredUp:
     @pytest.mark.parametrize("field", ["question", "note", "use_guard"])
     def test_it_describes_itself_like_the_others(self, field):
         assert field in PROTOCOLS["paired"]
+
+
+class TestTheServedArmIsTheServersDecision:
+    """The served arm called `optimizer.select_plan` on the benchmark's own
+    candidates: no guard `caution` (2.0 on an unseen query) and no candidate
+    budget. Its "served" was a decision the server never makes."""
+
+    def test_run_decides_through_plan_query(self):
+        import inspect
+
+        from app import benchmark
+
+        source = inspect.getsource(benchmark.run)
+        assert "plan_query(" in source
+        assert "optimizer.select_plan(" not in source
+
+    def test_the_guard_reaches_the_decision(self):
+        """Without the guard, `plan_query` applies caution 1.0 -- the old
+        bug under a new name."""
+        import inspect
+
+        from app import benchmark
+
+        source = inspect.getsource(benchmark.run)
+        assert "guard=guard if use_guard else None" in source
+
+    def test_the_oracle_space_includes_what_the_server_generates(self):
+        """`candidate_hints` without a cursor drops the families that need the
+        query's index map, which the server's call includes."""
+        import inspect
+
+        from app import benchmark
+
+        source = inspect.getsource(benchmark.run)
+        assert "candidate_hints(optimizer, baseline, tables, cur=cur)" in source

@@ -1,0 +1,31 @@
+{
+  "protocol": "paired",
+  "repeat": 1,
+  "runs": [
+    {
+      "policy": "pairwise_rank",
+      "guard": true,
+      "paired_reps": 5,
+      "arm_order": "random",
+      "seed": 102,
+      "saved_ms": -425.91999999999916,
+      "n_curated": 38,
+      "curated_native_ms": 4944.074999999999,
+      "curated_served_ms": 5464.203999999998,
+      "curated_oracle_ms": 4606.121999999999,
+      "curated_captured_pct": -153.90572061795567,
+      "native_ms": 7619.971999999999,
+      "served_ms": 8045.891999999998,
+      "oracle_ms": 7186.981999999998,
+      "headroom_ms": 432.9900000000007,
+      "captured_pct": -98.36716783297501,
+      "n_vetoed": 31,
+      "n_guarded": 0,
+      "n_held_out": 16,
+      "held_out_native_ms": 1439.297,
+      "held_out_served_ms": 1447.344,
+      "held_out_oracle_ms": 1383.0539999999999,
+      "held_out_captured_pct": -14.307558273918536
+    }
+  ]
+}

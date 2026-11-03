@@ -5,7 +5,7 @@ IEEE conference format only.
 | File | Class | Aimed at |
 |---|---|---|
 | `main.tex` | `IEEEtran` (conference) | ICDE, or any IEEE venue |
-| `references.bib` | — | 28 entries, all cited |
+| `references.bib` | — | 24 entries, all cited |
 | `figures/*.drawio` | draw.io | reference only, see below |
 
 ```
@@ -46,9 +46,18 @@ Algorithm 1 gives the paired timing protocol, now with randomized arm order.
   used to be spread across Results and Conclusion. *Threats to Validity* absorbs
   the reviewer gaps this file used to list (no Bao/Lero baseline, no
   significance tests, the 64.9-point split range).
-- **Seven audit questions, not six.** Q5, *at what granularity does this rule
-  resolve conflicts?* (WRITEUP §2.93), was missing from the paper even though
-  §VII-C already referred to the defect it found.
+- **Six audit questions.** Q5, *at what granularity does this rule resolve
+  conflicts?* (WRITEUP §2.93), was added; the old Q7 (*which language reads
+  this string?*, one regex defect) was dropped as off-thesis.
+- **Trimmed to the thesis** (capture-ratio validity and silent measurement
+  failures). Removed: the Selection Policies and Cold Start subsections, the
+  concurrency paragraph, TPC-H, the Candidate Generation and Features
+  subsections (one clause each in §III-A now), the hyperparameter paragraph
+  (now only in `ARTIFACTS.md`), the buffer-count noise-floor paragraph (D43),
+  the Q1 environment-variable crash story, Q7, the separate Robustness related
+  work, the action-space sweep table (its outcome is one paragraph at the end
+  of Q5), and the long tool list. The ensemble result is one paragraph in
+  §III-B and no longer in the abstract or contributions.
 - **Bibliography completed.** Every entry now has a full author list. Checked
   against Crossref and DataCite on 2026-11-03.
 
@@ -70,11 +79,12 @@ Algorithm 1 gives the paired timing protocol, now with randomized arm order.
    "thirteen of the 128" and then lists twelve rows "in full". It also says
    `bushy` is identical "across four pairs", but the twelve rows contain six
    such pairs. The paper now avoids both counts. Re-run
-   `python -m app.autotune --policy pairwise_rank` and put the real number back
-   into §VII-C.
+   `python -m app.autotune --policy pairwise_rank` if the count is ever needed
+   (the sweep is now one paragraph at the end of §VI-E).
 2. **Hardware: confirmed** by the author (Intel Core Ultra 7 155H, 32 GB, NVMe
    SSD, Windows 11, Docker Desktop). The paper cites the tag
-   `icde2027-submission`. **Push the branch and the tag to GitHub before
+   `paper-v2` (the older `icde2027-submission` tag points at the previous
+   version). **Push the branch and the tag to GitHub before
    submitting**, or the citation points nowhere.
 3. **The 29% figure.** `docs/CONFIDENCE.md` §3 still says a query timed twice
    differs by "around 29%", while everything else, including the paper, uses
@@ -82,11 +92,9 @@ Algorithm 1 gives the paired timing protocol, now with randomized arm order.
 4. **Redbench** has a published version (doi `10.1145/3735403.3735998`). Its
    venue was not confirmed, so the arXiv version is cited. Swap it in once
    confirmed.
-5. **Page budget.** Compiled locally with the `article` class standing in for
-   IEEEtran (not installable here), the body runs about 185 words past page 12
-   in Computer Modern. IEEEtran's Times is more compact, so it should fit ICDE's
-   12 pages plus references, but **check on Overleaf**. If it is over, cut
-   §VII-D (cold start) or the Q6 paragraph first.
+5. **Page budget.** After the trims the body is about 9,100 words, well inside
+   a 12-page IEEE limit. CONECCT allows 6–8 pages, so a shorter version is
+   still needed there; **check on Overleaf**.
 6. **Survey quotes.** The quotes in Table I come from the original reading of
    each paper and were not re-checked in this revision.
 
@@ -204,26 +212,24 @@ recorded here so the decision does not have to be made again:
 If the paper needs to grow for a full-paper venue, grow the survey, not this
 list.
 
-## Where to submit (decided: IEEE)
+## Where to submit (decided: an Indian IEEE venue)
 
-Checked 2026-11-03. Confirm dates on each official site before submitting.
+ICDE 2027 was dropped because of cost (full registration about USD 1,040 plus
+travel to Copenhagen), so the "[Experiment, Analysis, and Benchmark]" title tag
+was removed. Checked 2026-11-03; confirm on each official site.
 
-1. **ICDE 2027, Experiment, Analysis & Benchmark (EAB) category.** Round 2
-   deadline **Nov 11, 2026, 5 pm Pacific**, via Microsoft CMT. Copenhagen,
-   May 17–21, 2027. 12 pages plus references, IEEE format, single-blind, no
-   appendix, accept/reject with no revision. EAB papers must start the title
-   with "[Experiment, Analysis, and Benchmark]" (already in `main.tex`) and must
-   make every artifact public; the repo is public at
-   `github.com/parthkansal823/DB_QueryOptimizer`. ICDE's policy also requires
-   AI-generated content to be disclosed in the acknowledgments. See
-   icde2027.github.io/submission-guidelines.html.
-2. **IEEE CONECCT 2027** (IEEE Bangalore Section). Deadline **Dec 15, 2026**;
-   Bengaluru, Jul 29–31, 2027. Was 6 pages in 2025, so it would need a
-   shortened version.
+1. **IEEE CONECCT 2027** (IEEE Bangalore Section). Deadline **15 Dec 2026**;
+   Bengaluru, 29–31 Jul 2027. The 2026 rules were 6–8 pages, IEEE template,
+   **double-blind** (remove name, university and repository link), and a fee
+   of INR 10,000 for IEEE student members (INR 12,000 for non-members) plus 18%
+   GST. Needs a shortened, anonymized version.
+2. **ICDSE 2027** (CUSAT, Kochi, 22–24 Jul 2027). Full-paper deadline 10 Jun
+   2027. The backup if CONECCT rejects.
 3. **IEEE HiPC 2027** (Bengaluru, December). The strongest IEEE venue in India;
-   expect a deadline around mid-2027.
-4. **ISPASS 2027** (IEEE). Fits the measurement-methodology angle. Not yet
-   announced; the 2025 deadline was mid-December.
+   the deadline is likely mid-2027.
+
+A paper under review at one venue cannot be submitted to another at the same
+time.
 
 **arXiv:** posting a preprint establishes a date and does not count as prior
 publication at the venues above. Resolve open items 1 and 2 first, because an
