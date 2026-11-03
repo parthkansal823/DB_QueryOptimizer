@@ -1,0 +1,618 @@
+{
+  "reps": 5,
+  "seed": 200,
+  "use_guard": true,
+  "policy": "pairwise_rank",
+  "summary": {
+    "n_queries": 65,
+    "n_deviated": 20,
+    "native_total_ms": 13641.594600019744,
+    "uncached": {
+      "total_ms": 16710.8444001351,
+      "choose_total_ms": 3487.311300035799,
+      "diff_vs_native_ms": 3069.249800115358,
+      "diff_vs_native_pct": 22.499201083947444,
+      "diff_ci_ms": [
+        2544.348200317472,
+        3585.0334998685867
+      ]
+    },
+    "cached": {
+      "total_ms": 13222.107699664775,
+      "choose_total_ms": 72.49869997031055,
+      "diff_vs_native_ms": -419.4869003549684,
+      "diff_vs_native_pct": -3.075057664844851,
+      "diff_ci_ms": [
+        -836.5102003444918,
+        -48.21770032867789
+      ]
+    }
+  },
+  "rows": [
+    {
+      "query_id": "corr_city_country",
+      "native_ms": 65.95889999880455,
+      "uncached_ms": 140.1581000245642,
+      "cached_ms": 59.33929997263476,
+      "uncached_choose_ms": 37.31840002001263,
+      "cached_choose_ms": 0.03329999162815511,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_city_country_lang",
+      "native_ms": 25.103499996475875,
+      "uncached_ms": 72.8501999983564,
+      "cached_ms": 29.468699969584122,
+      "uncached_choose_ms": 46.672900003613904,
+      "cached_choose_ms": 0.038700003642588854,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_brand_category",
+      "native_ms": 61.303800001041964,
+      "uncached_ms": 60.11869997018948,
+      "cached_ms": 62.2880999580957,
+      "uncached_choose_ms": 3.6988000210840255,
+      "cached_choose_ms": 3.448799980105832,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_brand_band",
+      "native_ms": 67.07069999538362,
+      "uncached_ms": 78.89360000262968,
+      "cached_ms": 66.27989999833517,
+      "uncached_choose_ms": 3.2862999942153692,
+      "cached_choose_ms": 3.796300006797537,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_status_channel",
+      "native_ms": 55.052600015187636,
+      "uncached_ms": 111.36219999752939,
+      "cached_ms": 54.24139997921884,
+      "uncached_choose_ms": 50.844800018239766,
+      "cached_choose_ms": 0.04840001929551363,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_3w_city_electronics",
+      "native_ms": 89.07749998616055,
+      "uncached_ms": 83.23139999993145,
+      "cached_ms": 93.008399970131,
+      "uncached_choose_ms": 5.746599985286593,
+      "cached_choose_ms": 3.617299982579425,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_3w_brand_chain",
+      "native_ms": 113.24050000985153,
+      "uncached_ms": 153.65720001864247,
+      "cached_ms": 92.32379999593832,
+      "uncached_choose_ms": 59.6988000033889,
+      "cached_choose_ms": 0.04300000728107989,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_3w_supplier_chain",
+      "native_ms": 13.27070000115782,
+      "uncached_ms": 68.12660000286996,
+      "cached_ms": 14.72999999532476,
+      "uncached_choose_ms": 53.825799986952916,
+      "cached_choose_ms": 0.040700018871575594,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_3w_both_ends",
+      "native_ms": 92.17409999109805,
+      "uncached_ms": 128.03530000383034,
+      "cached_ms": 71.82599999941885,
+      "uncached_choose_ms": 54.46099999244325,
+      "cached_choose_ms": 0.04089999129064381,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_4w_full_correlated",
+      "native_ms": 124.91210000007413,
+      "uncached_ms": 140.58470001327805,
+      "cached_ms": 70.56629998260178,
+      "uncached_choose_ms": 63.81549997604452,
+      "cached_choose_ms": 0.031200004741549492,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_4w_premium_us",
+      "native_ms": 82.75540001341142,
+      "uncached_ms": 136.13279999117367,
+      "cached_ms": 71.57870003720745,
+      "uncached_choose_ms": 60.05419997381978,
+      "cached_choose_ms": 0.0315000070258975,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_4w_cancelled_premium",
+      "native_ms": 86.35850000428036,
+      "uncached_ms": 157.8915000136476,
+      "cached_ms": 88.11190002597868,
+      "uncached_choose_ms": 59.68790000770241,
+      "cached_choose_ms": 0.02680000034160912,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_4w_power_users",
+      "native_ms": 120.12289999984205,
+      "uncached_ms": 153.42970000347123,
+      "cached_ms": 85.25279996683821,
+      "uncached_choose_ms": 71.14390001515858,
+      "cached_choose_ms": 0.04229997284710407,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_4w_broad",
+      "native_ms": 1210.9171000192873,
+      "uncached_ms": 1245.333999977447,
+      "cached_ms": 1204.1783999593463,
+      "uncached_choose_ms": 20.892400003504008,
+      "cached_choose_ms": 19.344700005603954,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_5w_supplier_chain",
+      "native_ms": 209.22359998803586,
+      "uncached_ms": 214.2343000159599,
+      "cached_ms": 213.39089999673888,
+      "uncached_choose_ms": 5.779300001449883,
+      "cached_choose_ms": 7.988099998328835,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_5w_premium_supplier",
+      "native_ms": 172.15030000079423,
+      "uncached_ms": 190.0249000173062,
+      "cached_ms": 180.15259999083355,
+      "uncached_choose_ms": 5.280900018988177,
+      "cached_choose_ms": 5.235399992670864,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_6w_everything",
+      "native_ms": 111.48830002639443,
+      "uncached_ms": 164.11529999459162,
+      "cached_ms": 66.90229999367148,
+      "uncached_choose_ms": 85.52699998836033,
+      "cached_choose_ms": 0.04409998655319214,
+      "deviated": true
+    },
+    {
+      "query_id": "corr_6w_status_premium",
+      "native_ms": 205.99879999645054,
+      "uncached_ms": 217.63870000722818,
+      "cached_ms": 207.300599955488,
+      "uncached_choose_ms": 7.843300001695752,
+      "cached_choose_ms": 6.811899977037683,
+      "deviated": false
+    },
+    {
+      "query_id": "ctl_country_only",
+      "native_ms": 66.2298999959603,
+      "uncached_ms": 114.96000000624917,
+      "cached_ms": 62.57849998655729,
+      "uncached_choose_ms": 43.33969997242093,
+      "cached_choose_ms": 0.03840000135824084,
+      "deviated": false
+    },
+    {
+      "query_id": "ctl_category_only",
+      "native_ms": 139.91389999864623,
+      "uncached_ms": 172.4718000041321,
+      "cached_ms": 155.79379996052012,
+      "uncached_choose_ms": 47.6630000048317,
+      "cached_choose_ms": 0.032400013878941536,
+      "deviated": false
+    },
+    {
+      "query_id": "ctl_3w_recent",
+      "native_ms": 32.55570001783781,
+      "uncached_ms": 32.98660001019016,
+      "cached_ms": 40.39709997596219,
+      "uncached_choose_ms": 1.7689999949652702,
+      "cached_choose_ms": 1.5891000221017748,
+      "deviated": false
+    },
+    {
+      "query_id": "ctl_4w_quantity",
+      "native_ms": 692.0712999999523,
+      "uncached_ms": 790.9251999808475,
+      "cached_ms": 708.8055000058375,
+      "uncached_choose_ms": 83.53910001460463,
+      "cached_choose_ms": 0.03139997716061771,
+      "deviated": false
+    },
+    {
+      "query_id": "ctl_5w_signup",
+      "native_ms": 512.2255999885965,
+      "uncached_ms": 525.1447000191547,
+      "cached_ms": 516.4850000001024,
+      "uncached_choose_ms": 11.488899996038526,
+      "cached_choose_ms": 11.325800005579367,
+      "deviated": false
+    },
+    {
+      "query_id": "ctl_supplier_rating",
+      "native_ms": 5.819899990456179,
+      "uncached_ms": 49.062400008551776,
+      "cached_ms": 6.620099971769378,
+      "uncached_choose_ms": 42.894500016700476,
+      "cached_choose_ms": 0.031499977922067046,
+      "deviated": false
+    },
+    {
+      "query_id": "shape_6w_supplier_reach",
+      "native_ms": 485.2172000100836,
+      "uncached_ms": 453.8862000044901,
+      "cached_ms": 349.2456000240054,
+      "uncached_choose_ms": 98.15510001499206,
+      "cached_choose_ms": 0.029399991035461426,
+      "deviated": true
+    },
+    {
+      "query_id": "shape_distinct_brands",
+      "native_ms": 99.20949998195283,
+      "uncached_ms": 85.11539999744855,
+      "cached_ms": 95.96079998300411,
+      "uncached_choose_ms": 2.038100006757304,
+      "cached_choose_ms": 2.4930000072345138,
+      "deviated": false
+    },
+    {
+      "query_id": "shape_group_by_category",
+      "native_ms": 65.07720000809059,
+      "uncached_ms": 110.0330000044778,
+      "cached_ms": 55.77659999835305,
+      "uncached_choose_ms": 50.45310000423342,
+      "cached_choose_ms": 0.02680000034160912,
+      "deviated": true
+    },
+    {
+      "query_id": "shape_top_n_orders",
+      "native_ms": 197.40340000134893,
+      "uncached_ms": 266.466400003992,
+      "cached_ms": 200.22860003518872,
+      "uncached_choose_ms": 63.812000007601455,
+      "cached_choose_ms": 0.02269999822601676,
+      "deviated": false
+    },
+    {
+      "query_id": "shape_semi_join_exists",
+      "native_ms": 192.49139999737963,
+      "uncached_ms": 247.72200000006706,
+      "cached_ms": 180.04109998582862,
+      "uncached_choose_ms": 67.59550000424497,
+      "cached_choose_ms": 0.02889998722821474,
+      "deviated": true
+    },
+    {
+      "query_id": "shape_window_rank",
+      "native_ms": 28.99219997925684,
+      "uncached_ms": 94.25959998043254,
+      "cached_ms": 33.29150000354275,
+      "uncached_choose_ms": 50.77259999234229,
+      "cached_choose_ms": 0.03809999907389283,
+      "deviated": false
+    },
+    {
+      "query_id": "shape_anti_join_unsold",
+      "native_ms": 45.407300000078976,
+      "uncached_ms": 88.46689999336377,
+      "cached_ms": 44.59909998695366,
+      "uncached_choose_ms": 48.0231000110507,
+      "cached_choose_ms": 0.04159999662078917,
+      "deviated": false
+    },
+    {
+      "query_id": "shape_range_recent",
+      "native_ms": 41.68600001139566,
+      "uncached_ms": 88.78819999517873,
+      "cached_ms": 38.5101999854669,
+      "uncached_choose_ms": 45.56410000077449,
+      "cached_choose_ms": 0.030399998649954796,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_01_3w",
+      "native_ms": 11.37730001937598,
+      "uncached_ms": 62.577600008808076,
+      "cached_ms": 12.148400011938065,
+      "uncached_choose_ms": 51.858499995432794,
+      "cached_choose_ms": 0.03789999755099416,
+      "deviated": true
+    },
+    {
+      "query_id": "gen_02_4w",
+      "native_ms": 317.46049999492243,
+      "uncached_ms": 399.51610000571236,
+      "cached_ms": 372.3930999694858,
+      "uncached_choose_ms": 68.96679999772459,
+      "cached_choose_ms": 0.031400006264448166,
+      "deviated": true
+    },
+    {
+      "query_id": "gen_03_3w",
+      "native_ms": 274.2467999923974,
+      "uncached_ms": 290.67799999029376,
+      "cached_ms": 237.6374999876134,
+      "uncached_choose_ms": 58.153599995421246,
+      "cached_choose_ms": 0.03749999450519681,
+      "deviated": true
+    },
+    {
+      "query_id": "gen_04_4w",
+      "native_ms": 334.6380000002682,
+      "uncached_ms": 368.9095000154339,
+      "cached_ms": 297.8060000168625,
+      "uncached_choose_ms": 68.1437999883201,
+      "cached_choose_ms": 0.037699996028095484,
+      "deviated": true
+    },
+    {
+      "query_id": "gen_05_3w",
+      "native_ms": 171.52460000943393,
+      "uncached_ms": 231.93819998414256,
+      "cached_ms": 190.636799990898,
+      "uncached_choose_ms": 59.73959999391809,
+      "cached_choose_ms": 0.03899997682310641,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_06_4w",
+      "native_ms": 583.7784000032116,
+      "uncached_ms": 655.8211999945343,
+      "cached_ms": 599.7060999798123,
+      "uncached_choose_ms": 79.30579999811016,
+      "cached_choose_ms": 0.03190001007169485,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_07_2w",
+      "native_ms": 52.04850001609884,
+      "uncached_ms": 102.77549998136237,
+      "cached_ms": 49.89399999612942,
+      "uncached_choose_ms": 45.9872999927029,
+      "cached_choose_ms": 0.035500008380040526,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_08_4w",
+      "native_ms": 463.837399991462,
+      "uncached_ms": 581.8029000074603,
+      "cached_ms": 462.18839997891337,
+      "uncached_choose_ms": 76.51700000860728,
+      "cached_choose_ms": 0.03329999162815511,
+      "deviated": true
+    },
+    {
+      "query_id": "gen_09_4w",
+      "native_ms": 46.434400021098554,
+      "uncached_ms": 42.60840002098121,
+      "cached_ms": 42.891799967037514,
+      "uncached_choose_ms": 1.7485000134911388,
+      "cached_choose_ms": 1.7918000230565667,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_10_2w",
+      "native_ms": 16.01619998109527,
+      "uncached_ms": 61.52980000479147,
+      "cached_ms": 14.241899974877015,
+      "uncached_choose_ms": 44.81379999197088,
+      "cached_choose_ms": 0.0425000034738332,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_11_2w",
+      "native_ms": 31.59349999623373,
+      "uncached_ms": 72.1583999984432,
+      "cached_ms": 28.39180000592023,
+      "uncached_choose_ms": 44.044299982488155,
+      "cached_choose_ms": 0.039000005926936865,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_12_2w",
+      "native_ms": 10.165899991989136,
+      "uncached_ms": 57.488899998134,
+      "cached_ms": 10.867300035897642,
+      "uncached_choose_ms": 45.43760002707131,
+      "cached_choose_ms": 0.03169997944496572,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_13_5w",
+      "native_ms": 264.3546999897808,
+      "uncached_ms": 336.55420001014136,
+      "cached_ms": 249.28069999441504,
+      "uncached_choose_ms": 89.79950001230463,
+      "cached_choose_ms": 0.03229998401366174,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_14_2w",
+      "native_ms": 41.143500013276935,
+      "uncached_ms": 89.40450000227429,
+      "cached_ms": 41.2064999982249,
+      "uncached_choose_ms": 48.34320000372827,
+      "cached_choose_ms": 0.03190001007169485,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_15_4w",
+      "native_ms": 285.2063999744132,
+      "uncached_ms": 374.18360004085116,
+      "cached_ms": 316.8895000126213,
+      "uncached_choose_ms": 73.7698000157252,
+      "cached_choose_ms": 0.028399983420968056,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_16_3w",
+      "native_ms": 776.828200003365,
+      "uncached_ms": 780.3637000033632,
+      "cached_ms": 741.4411999925505,
+      "uncached_choose_ms": 74.31080000242218,
+      "cached_choose_ms": 0.030300026992335916,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_17_3w",
+      "native_ms": 25.380899984156713,
+      "uncached_ms": 75.75830002315342,
+      "cached_ms": 30.207300005713478,
+      "uncached_choose_ms": 45.40510001243092,
+      "cached_choose_ms": 0.04049998824484646,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_18_2w",
+      "native_ms": 10.420000005979091,
+      "uncached_ms": 59.137600008398294,
+      "cached_ms": 10.849000012967736,
+      "uncached_choose_ms": 49.70229999162257,
+      "cached_choose_ms": 0.029399991035461426,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_19_4w",
+      "native_ms": 883.125199994538,
+      "uncached_ms": 898.3880000014324,
+      "cached_ms": 821.2519999942742,
+      "uncached_choose_ms": 74.81380001991056,
+      "cached_choose_ms": 0.03359999391250312,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_20_2w",
+      "native_ms": 119.57500001881272,
+      "uncached_ms": 164.10900000482798,
+      "cached_ms": 117.91570001514629,
+      "uncached_choose_ms": 46.01289998390712,
+      "cached_choose_ms": 0.037900026654824615,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_21_3w",
+      "native_ms": 109.13349999464117,
+      "uncached_ms": 158.744000014849,
+      "cached_ms": 102.3840999987442,
+      "uncached_choose_ms": 52.30959999607876,
+      "cached_choose_ms": 0.0467000063508749,
+      "deviated": true
+    },
+    {
+      "query_id": "gen_22_5w",
+      "native_ms": 237.19379998510703,
+      "uncached_ms": 354.885100008687,
+      "cached_ms": 266.2498000136111,
+      "uncached_choose_ms": 80.23469999898225,
+      "cached_choose_ms": 0.03260001540184021,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_23_5w",
+      "native_ms": 251.66169999283738,
+      "uncached_ms": 329.26260001841,
+      "cached_ms": 257.4989000277128,
+      "uncached_choose_ms": 77.49159997911192,
+      "cached_choose_ms": 0.03560000914148986,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_24_5w",
+      "native_ms": 193.02110001444817,
+      "uncached_ms": 283.4333999780938,
+      "cached_ms": 182.9058000294026,
+      "uncached_choose_ms": 81.67929999763146,
+      "cached_choose_ms": 0.027700007194653153,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_25_5w",
+      "native_ms": 533.7069999950472,
+      "uncached_ms": 568.1800000020303,
+      "cached_ms": 500.7564999978058,
+      "uncached_choose_ms": 83.08459998806939,
+      "cached_choose_ms": 0.042400002712383866,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_26_5w",
+      "native_ms": 660.7092999911401,
+      "uncached_ms": 730.2196999953594,
+      "cached_ms": 641.0420000029262,
+      "uncached_choose_ms": 97.51980000874028,
+      "cached_choose_ms": 0.030399998649954796,
+      "deviated": false
+    },
+    {
+      "query_id": "gen_27_5w",
+      "native_ms": 652.8588000219315,
+      "uncached_ms": 721.3263000012375,
+      "cached_ms": 655.7050999836065,
+      "uncached_choose_ms": 81.09359999070875,
+      "cached_choose_ms": 0.03270001616328955,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_6w_supplier_country",
+      "native_ms": 228.13020000467077,
+      "uncached_ms": 211.88599997549318,
+      "cached_ms": 224.2606999934651,
+      "uncached_choose_ms": 2.451899985317141,
+      "cached_choose_ms": 3.2173999934457242,
+      "deviated": false
+    },
+    {
+      "query_id": "corr_6w_band_category",
+      "native_ms": 95.6865000189282,
+      "uncached_ms": 192.91139996494167,
+      "cached_ms": 97.95309999026358,
+      "uncached_choose_ms": 89.18979999725707,
+      "cached_choose_ms": 0.02649999805726111,
+      "deviated": true
+    },
+    {
+      "query_id": "shape_6w_top_suppliers",
+      "native_ms": 159.2577999981586,
+      "uncached_ms": 226.20350000215694,
+      "cached_ms": 131.43380003748462,
+      "uncached_choose_ms": 96.319800009951,
+      "cached_choose_ms": 0.032800016924738884,
+      "deviated": false
+    },
+    {
+      "query_id": "shape_6w_distinct_pairs",
+      "native_ms": 104.52709998935461,
+      "uncached_ms": 202.7047000010498,
+      "cached_ms": 98.32299998379312,
+      "uncached_choose_ms": 78.8821000023745,
+      "cached_choose_ms": 0.0329999893438071,
+      "deviated": true
+    },
+    {
+      "query_id": "ctl_6w_uncorrelated",
+      "native_ms": 68.91639999230392,
+      "uncached_ms": 174.05739999958314,
+      "cached_ms": 76.92639998276718,
+      "uncached_choose_ms": 83.80799999576993,
+      "cached_choose_ms": 0.025299988919869065,
+      "deviated": true
+    },
+    {
+      "query_id": "shape_6w_anti_join",
+      "native_ms": 117.156199994497,
+      "uncached_ms": 215.2193000074476,
+      "cached_ms": 119.54990003141575,
+      "uncached_choose_ms": 83.68690000497736,
+      "cached_choose_ms": 0.03920000744983554,
+      "deviated": false
+    }
+  ]
+}

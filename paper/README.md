@@ -12,22 +12,24 @@ IEEE conference format only.
 pdflatex main && bibtex main && pdflatex main && pdflatex main
 ```
 
-**Not yet compiled.** There is no LaTeX toolchain on this machine. Citations,
-cross-references, environments and brace balance have been checked by script,
-but not the layout. Overleaf is the quickest way to compile: upload `main.tex`
-and `references.bib`, keep the default pdfLaTeX compiler, and recompile.
-Expect to fix a few overfull boxes in the two full-width tables.
+**Compile on Overleaf.** Upload `main.tex` and `references.bib`, keep the
+default pdfLaTeX compiler, and recompile. Locally, the only TeX image lacks
+IEEEtran, makecell and pgfplots, so the paper was checked by compiling a copy
+with the `article` class and those packages stubbed: no errors, no undefined
+references or citations, and one 0.8 pt overfull line in Table I.
 
 ### Figures
 
-Both figures are drawn in TikZ inside `main.tex`, so the paper builds
-with no image files and no export step. The `.drawio` files were the original
-sketches and are kept for reference; editing them no longer changes the paper.
+Both figures are drawn inside `main.tex` (TikZ and pgfplots), so the paper
+builds with no image files. The `.drawio` files are earlier sketches, kept for
+reference only.
 
 | Figure | Shows |
 |---|---|
 | Fig. 1 | offline and online paths, learned steps shaded, the two duplicated steps marked ➊ ➋ |
-| Fig. 2 | `deploy` vs `paired` arm ordering |
+| Fig. 2 | JOB served vs. oracle totals under the narrow and wide action spaces |
+
+Algorithm 1 gives the paired timing protocol, now with randomized arm order.
 
 ---
 
@@ -70,21 +72,21 @@ sketches and are kept for reference; editing them no longer changes the paper.
    such pairs. The paper now avoids both counts. Re-run
    `python -m app.autotune --policy pairwise_rank` and put the real number back
    into §VII-C.
-2. **Hardware.** §IV-A now lists the machine this repository lives on (Intel
-   Core Ultra 7 155H, 32 GB, NVMe SSD, Windows 11, Docker Desktop). **Confirm
-   the measurements actually ran on it.** Also commit the working tree, tag a
-   release for the paper, and cite the tag in Artifact Availability (there is a
-   TODO comment there).
+2. **Hardware: confirmed** by the author (Intel Core Ultra 7 155H, 32 GB, NVMe
+   SSD, Windows 11, Docker Desktop). The paper cites the tag
+   `icde2027-submission`. **Push the branch and the tag to GitHub before
+   submitting**, or the citation points nowhere.
 3. **The 29% figure.** `docs/CONFIDENCE.md` §3 still says a query timed twice
    differs by "around 29%", while everything else, including the paper, uses
    18.6%. The paper does not depend on the 29% figure, but fix the doc.
 4. **Redbench** has a published version (doi `10.1145/3735403.3735998`). Its
    venue was not confirmed, so the arXiv version is cited. Swap it in once
    confirmed.
-5. **Page budget.** The body is about 9,000 words. That is roughly 10–11 IEEE
-   two-column pages plus references. It fits ICDE (12 + references) but not a
-   6- or 8-page venue. If one is targeted, cut §III-E, §VII-D and the tooling
-   list in §VIII-B first.
+5. **Page budget.** Compiled locally with the `article` class standing in for
+   IEEEtran (not installable here), the body runs about 185 words past page 12
+   in Computer Modern. IEEEtran's Times is more compact, so it should fit ICDE's
+   12 pages plus references, but **check on Overleaf**. If it is over, cut
+   §VII-D (cold start) or the Q6 paragraph first.
 6. **Survey quotes.** The quotes in Table I come from the original reading of
    each paper and were not re-checked in this revision.
 
@@ -111,25 +113,36 @@ sketches and are kept for reference; editing them no longer changes the paper.
 one-line summaries of other papers in §II. Check those against the papers
 themselves.
 
-### From the external review (2026-11-03): needs new experiments
+### New experiments (2026-11-03), run on the author's laptop
 
-The text now claims only what the existing data supports. These need new runs
-before the claims can be made stronger:
+The database was restored from `backups/lqo_pg18_20260904-1345.dump` into a
+fresh PostgreSQL 18.6 container, then analyzed. Raw results are in
+`backend/models/`.
 
-7. **Repeat the paired benchmark** several times, with randomized or
-   counterbalanced arm order (`_paired_medians` always times native, served,
-   oracle in that order), and report confidence intervals.
-8. **Measure end-to-end latency**, planning included, with and without the
-   decision cache. Without it the paper cannot claim a net saving: 215 ms is
-   3.8% of native, and uncached planning measured 41–47% of execution time on
-   the one query profiled.
-9. **Per-query noise floor from repeated executions** of the same plan. The
+- **Paired replication**: `python -m app.benchmark --protocol paired --repeat 5
+  --arm-order random --seed 100 --json-out models/paired_5runs_random.json`.
+  Mean saving 84 ms (1.4% of native), 95% *t*-interval [−226, +393] ms, so the
+  saving is **not distinguishable from zero**. Headroom is stable at 526 ms
+  [452, 599]. The guard blocked 0 queries in runs 1–3 and 11–12 in runs 4–5
+  (because the runs feed it), and runs 4–5 are where the savings came from.
+  The *t*-intervals in the paper were computed from the JSON; the script
+  itself prints bootstrap intervals, which are narrower at n = 5.
+- **End to end**: `python -m app.e2e_latency --reps 5 --seed 200 --json-out
+  models/e2e_latency.json`. Without the cache, +22.5% vs native [+2,544,
+  +3,585] ms; with a warm cache, −3.1% [−837, −48] ms. The interval
+  resamples queries, not sessions.
+
+### Remaining items from the external reviews
+
+7. **Per-query noise floor from repeated executions** of the same plan. The
    buffer-count floor was removed. If it is ever revived, `buffer_signature`
    should read the root node's counts (which are already cumulative) instead of
    summing every node.
-10. **Defect inventory.** The reviewer asked for a numbered list backing the
-    "thirty" in the title (trigger, consequence, fix, validation for each).
-    Either add it to the repo and cite it, or drop the number from the title.
+8. **Defect inventory.** Resolved by dropping "Thirty" from the title. The
+   abstract still says "more than thirty", which `docs/WRITEUP.md` supports.
+9. **Independent replications.** The five paired runs share a guard that learns
+   between them. A cleaner design would reset or freeze the guard per run, or
+   run with `--no-guard` as a separate arm.
 
 ---
 

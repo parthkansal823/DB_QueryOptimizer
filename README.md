@@ -275,7 +275,9 @@ Everything it decides is inspectable:
 | `python -m app.selection_effect` | how much of the headline is the workload having been chosen? |
 | `python -m app.feature_audit` | which features cannot separate the plans being compared? |
 | `python -m app.coverage_sweep` | how much of a held-out number is the split? |
-| `python -m app.noise --from-buffers` | how big does a difference have to be on *this* query to be real? |
+| `python -m app.noise --from-buffers` | how big does a difference have to be on *this* query to be real? (indicative only: equal buffer counts do not mean equal CPU work, and the summed per-node counts double-count; see `paper/README.md`) |
+| `python -m app.benchmark --protocol paired --repeat 5` | how big is the effect, with arm order randomized and an interval across runs? |
+| `python -m app.e2e_latency` | what does a client actually wait for, planning included, with and without the decision cache? |
 
 The dashboard shows the first two. The third exists because a hint that is
 ignored is indistinguishable from one that did nothing, and the fourth because
@@ -421,8 +423,9 @@ And the three that exist to argue with the numbers above:
 docker compose exec backend python -m app.selection_effect     # 6 of 40 generated queries have >=8% headroom (2.72)
 docker compose exec backend python -m app.feature_audit        # 23 of 67 features can't separate a query's candidates (2.69)
 docker compose exec backend python -m app.coverage_sweep       # conformal coverage 62.5-92.6% across ten splits (2.66)
-docker compose exec backend python -m app.noise --from-buffers # per-query noise floor, free: 6% to 130% (2.88)
-docker compose exec backend python -m app.benchmark --protocol paired
+docker compose exec backend python -m app.noise --from-buffers # indicative per-query floor only (2.88; see paper/README.md)
+docker compose exec backend python -m app.benchmark --protocol paired --repeat 5 --json-out models/paired.json  # randomized arm order, bootstrap intervals over runs
+docker compose exec backend python -m app.e2e_latency --json-out models/e2e_latency.json  # end to end: native vs uncached vs cached
 ```
 
 `--protocol paired` re-times native, served and oracle **alternately** per
