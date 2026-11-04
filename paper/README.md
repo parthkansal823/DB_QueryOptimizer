@@ -12,11 +12,17 @@ IEEE conference format only.
 pdflatex main && bibtex main && pdflatex main && pdflatex main
 ```
 
-**Compile on Overleaf.** Upload `main.tex` and `references.bib`, keep the
-default pdfLaTeX compiler, and recompile. Locally, the only TeX image lacks
-IEEEtran, makecell and pgfplots, so the paper was checked by compiling a copy
-with the `article` class and those packages stubbed: no errors, no undefined
-references or citations, and one 0.8 pt overfull line in Table I.
+**Compile locally** with the full TeX Live image (it has IEEEtran, makecell and
+pgfplots; `latest-medium` does not):
+
+```
+docker run --rm -v "$PWD/paper:/w" -w /w texlive/texlive:latest \
+  sh -c "pdflatex main && bibtex main && pdflatex main && pdflatex main"
+```
+
+`paper/main.pdf` was built this way on 2026-11-04: 10 pages, no errors,
+warnings or overfull lines, all 24 fonts embedded (Times as NimbusRomNo9L).
+Overleaf, with the default pdfLaTeX compiler, works too.
 
 ### Figures
 
@@ -72,6 +78,8 @@ Algorithm 1 gives the paired timing protocol, now with randomized arm order.
 | paired protocol "puts the min-of-draws effect at 66% of headroom" | 66% is the combined effect of drift and oracle bias | the 66% comes from both causes together and cannot be attributed to the min bias alone |
 | buffer-count per-query noise floor (§2.88) | removed; only the 18.6% from repeated runs of one plan is used | equal buffer counts do not mean equal CPU work, and `noise.buffer_signature` sums PostgreSQL's per-node counts, which already include their children, so it double-counts |
 | "13 survivors … the other seven are these rows plus bushy/memoize" | no count; "every other survivor adds bushy and/or memoize" | see the open item below |
+| JOB "totals" 3,960 / 696 / 723 → 2,715 / 520 / 718 ms; gap 27 → 198 ms "in total" | **per-query means** over the 8 held-out queries; Fig. 2 axis relabelled | `docs/JOB_RESULTS.md` labels the column "avg latency"; its per-query table sums to 21,716.6 / 4,157.7 / 5,745.6 ms (÷ 8 = the figures). Capture ratios unchanged |
+| "No model was retrained between the original and corrected figures" | removed; the JOB model **was** retrained on the wide collection (same class, split seed 42); for transfer the record does not say | `JOB_RESULTS.md`: "Same model class, same 8 held-out queries, same split seed 42"; WRITEUP §2.80 compares two bundles (72/139 vs 75/142 constant features) |
 
 ### Still open: check these before submitting
 

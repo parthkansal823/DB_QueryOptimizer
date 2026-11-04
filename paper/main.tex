@@ -45,8 +45,7 @@ something other than the deployed system. Three headline results did not
 survive. Capture on the Join Order Benchmark fell from 99.2\% to 91.0\% once the
 oracle covered the action space actually served. A cross-schema transfer result
 fell from 97.0\% to $-5.3$\%. The latency saved on a synthetic workload fell
-from 797\,ms to 215\,ms under alternated, repeated timing. No model was
-retrained between the original and corrected figures. Five independent,
+from 797\,ms to 215\,ms under alternated, repeated timing. Five independent,
 randomized replications, run after we found that the benchmark's ``served''
 arm did not make the server's decision, put the saving at 190\,ms (2.8\% of
 native; 95\% confidence interval 148--233\,ms), none of it on held-out queries. End
@@ -88,12 +87,13 @@ execution was real, the evaluation queries were held out, and the code under
 test was the code we deployed. Even so, the figure said less than it seemed to,
 because the set of plans the oracle could choose from was narrower than the set
 the server actually offered. Within that narrow set, the best plans were only
-27\,ms faster in total than the ones our model served. When we re-collected
-with the set widened to match the server, the oracle's total latency was
-176\,ms lower while the plans our model served changed by 5\,ms, so the gap the
-model left uncaptured grew from 27\,ms to 198\,ms. The same model on the same
-queries now scored 91.0\%, although part of that change reflects drift between
-the two collection runs (Section~\ref{sec:corrections}).
+27\,ms per query faster, on average, than the ones our model served. When we
+re-collected with the set widened to match the server and retrained the model
+the same way, the oracle's mean latency fell by 176\,ms per query while that of
+the plans our model served changed by 5\,ms, so the gap the model left
+uncaptured grew from 27\,ms to 198\,ms per query. The same kind of model on the
+same queries now scored 91.0\%, although part of that change reflects drift
+between the two collection runs (Section~\ref{sec:corrections}).
 
 This pattern recurred throughout the project. We eventually recorded more than
 thirty defects of the same character. Almost none caused a crash or an error;
@@ -304,25 +304,25 @@ offline and online paths.
 \def\xb{4.1}
 % offline path
 \node[box]     (a1) at (0,0)          {workload queries};
-\node[box]     (a2) at (0,-1.5*\dy)   {\ding{182}\ generate candidates};
-\node[box]     (a3) at (0,-3*\dy)     {execute all (3 repetitions)};
-\node[store]   (a4) at (0,-4.6*\dy)   {plan execution log};
-\node[box]     (a5) at (0,-6.3*\dy)   {\ding{183}\ featurize};
-\node[learned] (a6) at (0,-8*\dy)     {train ensemble + ranker};
-\node[learned] (a7) at (0,-9*\dy)     {calibrate gate};
-\node[box]     (a8) at (0,-10.4*\dy)  {champion/challenger};
+\node[box]     (a2) at (0,-1.8*\dy)   {\ding{182}\ generate candidates};
+\node[box]     (a3) at (0,-3.6*\dy)   {execute all (3 repetitions)};
+\node[store]   (a4) at (0,-5.4*\dy)   {plan execution log};
+\node[box]     (a5) at (0,-7.3*\dy)   {\ding{183}\ featurize};
+\node[learned] (a6) at (0,-9.2*\dy)   {train ensemble + ranker};
+\node[learned] (a7) at (0,-10.2*\dy)  {calibrate gate};
+\node[box]     (a8) at (0,-11.6*\dy)  {champion/challenger};
 % online path, in the order plan_query runs it
 \node[box]     (b1)  at (\xb,0)         {incoming query};
 \node[box]     (b2)  at (\xb,-1*\dy)    {regression guard};
-\node[box]     (b3)  at (\xb,-2*\dy)    {decision cache lookup};
-\node[box]     (b4)  at (\xb,-3*\dy)    {\texttt{EXPLAIN}: baseline plan};
-\node[box]     (b5)  at (\xb,-4*\dy)    {extract join graph};
-\node[box]     (b6)  at (\xb,-5*\dy)    {\ding{182}\ generate candidates};
-\node[box]     (b7)  at (\xb,-6*\dy)    {plan each, no execution};
-\node[box]     (b8)  at (\xb,-7*\dy)    {\ding{183}\ featurize};
-\node[learned] (b9)  at (\xb,-8*\dy)    {rank candidates};
-\node[learned] (b10) at (\xb,-9*\dy)    {confidence gate};
-\node[box]     (b11) at (\xb,-10.4*\dy) {serve hinted or native plan};
+\node[box]     (b3)  at (\xb,-2.6*\dy)  {decision cache lookup};
+\node[box]     (b4)  at (\xb,-4.2*\dy)  {\texttt{EXPLAIN}: baseline plan};
+\node[box]     (b5)  at (\xb,-5.2*\dy)  {extract join graph};
+\node[box]     (b6)  at (\xb,-6.2*\dy)  {\ding{182}\ generate candidates};
+\node[box]     (b7)  at (\xb,-7.2*\dy)  {plan each, no execution};
+\node[box]     (b8)  at (\xb,-8.2*\dy)  {\ding{183}\ featurize};
+\node[learned] (b9)  at (\xb,-9.2*\dy)  {rank candidates};
+\node[learned] (b10) at (\xb,-10.2*\dy) {confidence gate};
+\node[box]     (b11) at (\xb,-11.6*\dy) {serve hinted or native plan};
 % flow within each path
 \foreach \u/\v in {a1/a2,a2/a3,a3/a4,a4/a5,a5/a6,a6/a7,a7/a8}
   \draw[arr] (\u) -- (\v);
@@ -482,7 +482,7 @@ largest of which joins seven tables, and hold out eight.
 Held-out queries are held out at the query level: no row from them is used to
 fit the ensemble or the ranker. They are not, however, an untouched test set.
 Gate calibration, the comparison of selection policies, champion/challenger
-promotion and the action-space sweep of Section~\ref{sec:q4} all score
+promotion and the action-space sweep of Sections~\ref{sec:q4}--\ref{sec:q5} all score
 on the synthetic model's 16 held-out queries, and the feature ablations of
 Section~\ref{sec:q2} use 16 other query-level splits. Results on held-out
 queries are therefore validation results. JOB uses the same kind of split, with
@@ -696,7 +696,7 @@ What Those Defects Cost}
   36 of 43 safety vetoes \\
 \cline{2-3}
 & benchmark's served arm deciding without the guard's caution factor &
-  saving of $-340$\,ms reported for $+190$\,ms \\
+  $-340$\,ms reported, $+190$\,ms actual \\
 \hline
 \makecell[l]{\textbf{Q3} Is this worth building,\\asked before building?} &
   three well-motivated features that changed 0 of 16 decisions &
@@ -851,7 +851,7 @@ model generalized reflected the narrow candidate set it was measured on
 \label{sec:corrections}
 
 Table~\ref{tab:corrections} lists the three previously reported figures that did not
-survive the audit. In all three cases the model itself was unchanged.
+survive the audit. None of the three changed because the model was improved.
 
 \begin{table}[t]
 \caption{Headline Results Before and After Correction}
@@ -873,34 +873,35 @@ Cross-schema transfer\textsuperscript{a} & 97.0\% & $-5.3$\% &
 \multicolumn{4}{p{0.94\columnwidth}}{\scriptsize \textsuperscript{a}Capture
 ratio of a model trained on the synthetic schema. \textsuperscript{b}Five
 independent runs with the served-arm fix: mean 190\,ms, 95\% CI [148, 233]
-(Table~\ref{tab:paired}). No model was retrained between the two columns.}
+(Table~\ref{tab:paired}).}
 \end{tabular}
 \end{table}
 
 \subsubsection{JOB Capture Ratio}
 Re-collecting all 30 JOB queries under the wider action space
-took 8\,h 22\,min. On the eight held-out queries the oracle's total latency fell
-from 696\,ms to 520\,ms, while the plans our model served went from 723\,ms to
-718\,ms (Fig.~\ref{fig:job}). The uncaptured gap
-$T_{\mathrm{srv}} - T_{\mathrm{orc}}$ therefore grew from 27\,ms to 198\,ms.
-The two totals come from separate collection runs, so the 176\,ms fall in the
-oracle mixes plans that only the wider space contains with differences in
-machine state, and this comparison cannot separate the two. The model's served
-total barely moved in either case. The capture ratio fell from 99.2\%
-to 91.0\%.
+took 8\,h 22\,min, and the JOB model was retrained on the new collection with
+the same model class and split seed. On the eight held-out queries the
+oracle's mean latency fell from 696\,ms to 520\,ms per query, while that of the
+plans our model served went from 723\,ms to 718\,ms (Fig.~\ref{fig:job}). The
+uncaptured gap, $(T_{\mathrm{srv}} - T_{\mathrm{orc}})/|Q|$, therefore grew
+from 27\,ms to 198\,ms per query. The two collections are separate runs, so
+the 176\,ms fall in the oracle mixes plans that only the wider space contains
+with differences in machine state, and this comparison cannot separate the
+two. The served latency barely moved. The capture ratio fell from 99.2\% to
+91.0\%.
 
-Not all of that drop is due to the action space. The native total for the same
-eight queries also changed between the two runs, from 3,960\,ms to 2,715\,ms, a
-31\% change with no change to the queries or the data. As a sensitivity
-calculation only, holding the native total fixed at either run's value, and
-computing from the reported millisecond totals, leaves between 4.9 and 7.7 of
-the 8.2 points associated with the change in served and oracle totals. This is
+Not all of that drop is due to the action space. The native mean for the same
+eight queries also changed between the two runs, from 3,960\,ms to 2,715\,ms per
+query, a 31\% change with no change to the queries or the data. As a
+sensitivity calculation only, holding the native mean fixed at either run's
+value leaves between 4.9 and 7.7 of the 8.2 points associated with the change
+in the served and oracle means. This is
 not an attribution, because the served and oracle totals were also timed in
 different runs and may have drifted too; the size of the action-space effect
 itself is unknown. A controlled comparison would time
 both action spaces within the same run. The drift is also why we compare arms
 only within a single run, and why we lean on the uncaptured gap, which does not
-involve the native total, though it is not immune to drift either.
+involve the native latency, though it is not immune to drift either.
 
 \begin{figure}[t]
 \centering
@@ -909,7 +910,7 @@ involve the native total, though it is not immune to drift either.
   ybar, bar width=16pt,
   width=0.95\columnwidth, height=4.4cm,
   ymin=0, ymax=860,
-  ylabel={Total latency (ms)},
+  ylabel={Mean latency per query (ms)},
   ylabel style={font=\footnotesize},
   symbolic x coords={narrow,wide},
   xtick=data,
@@ -920,7 +921,8 @@ involve the native total, though it is not immune to drift either.
   nodes near coords,
   nodes near coords style={font=\scriptsize},
   legend style={at={(0.5,1.03)}, anchor=south, legend columns=2,
-                font=\scriptsize, draw=none},
+                font=\scriptsize, draw=none, column sep=6pt},
+  legend image code/.code={\draw[#1] (0pt,-2.5pt) rectangle (7pt,4pt);},
   ymajorgrids, grid style={gray!25},
 ]
 \addplot[fill=gray!60, draw=black] coordinates {(narrow,723) (wide,718)};
@@ -928,12 +930,12 @@ involve the native total, though it is not immune to drift either.
 \legend{Served by the model, Oracle ceiling}
 \end{axis}
 \end{tikzpicture}
-\caption{Served and oracle totals on the eight held-out JOB queries under the
-narrow and wide action spaces, from two separate collection runs. The oracle
-fell by 176\,ms while the served plans changed by 5\,ms, so the uncaptured gap
-grew from 27\,ms to 198\,ms with no change to the model. Native totals (3,960\,ms and
-2,715\,ms) are omitted for scale. They differ because of between-run drift,
-which also affects $C$.}
+\caption{Served and oracle mean latency per query on the eight held-out JOB
+queries under the narrow and wide action spaces, from two separate collection
+runs. The oracle fell by 176\,ms while the served plans changed by 5\,ms, so
+the uncaptured gap grew from 27\,ms to 198\,ms per query. Native means
+(3,960\,ms and 2,715\,ms) are omitted for scale. They differ because of
+between-run drift, which also affects $C$.}
 \label{fig:job}
 \end{figure}
 
@@ -1031,8 +1033,9 @@ after the action space was widened.
 A change in the oracle alone cannot change the sign of $C$, and the sign did not
 change for that reason. It changed because the transferred model's own choices
 got worse: its served total went from 28.1\% of native to 104.0\%, i.e., 4\%
-slower than not deviating at all. No model was retrained; the set of candidates
-it chose from was wider. Random selection stayed at about the same ratio to
+slower than not deviating at all. The set of candidates it chose from was
+wider; the record does not say whether the synthetic model itself was retrained
+between the two evaluations. Random selection stayed at about the same ratio to
 native under both spaces (126.2\% and 125.8\%), so the average candidate did not
 get worse; the transferred model's choices did. We have not isolated which of
 the added candidates it misranks. The JOB-trained model, shown for reference,
@@ -1074,8 +1077,8 @@ JOB-trained model's figures include its own training queries.}
 On execution time alone, the synthetic result is small. The five independent
 runs of Table~\ref{tab:paired} put the mean saving at 190\,ms, 2.8\% of native,
 and none of it on held-out queries. On the eight held-out JOB
-queries, where the headroom is much larger, the served plans total 718\,ms
-against 2,715\,ms for native, but that figure comes from a logged collection
+queries, where the headroom is much larger, the served plans average 718\,ms
+per query against 2,715\,ms for native, but that figure comes from a logged collection
 run and was not timed under the \texttt{paired} protocol.
 
 Execution time also leaves out the cost of choosing. We therefore measured what
@@ -1094,7 +1097,11 @@ than PostgreSQL on its own. With a warm cache, choosing cost 2\,ms in total
 and the workload was 4.0\% faster than native. Most of that difference comes
 from the 22 queries on which a hint was served, which went from 3,436\,ms to
 3,068\,ms, and 216\,ms of it from a single query; on the other 43 queries the
-two paths were within 1.2\% of each other. The interval in
+two paths were within 1.2\% of each other. Measured against each query's own
+noise spread (Section~\ref{sec:noise}), 9 of the 22 served hints gained more
+than their noise, 424\,ms together; 5 lost more than theirs, 64\,ms together;
+and 8 were within it. The 6 held-out queries among the 22 saved 0.2\,ms in
+total. The interval in
 Table~\ref{tab:e2e} is a percentile bootstrap over queries (10,000 resamples)
 within one session. It shows how much the result depends on which queries are
 in the workload, not how much it would move between sessions; across the runs
@@ -1136,9 +1143,9 @@ We began intending to recommend that learned optimizers report the oracle
 ceiling, but three of the seven systems in Table~\ref{tab:compare} already do,
 so our recommendation is narrower. What is missing is the second half. A ceiling is a statement about an action
 space, and outside Kepler's notation that space is not reported in a form that
-allows comparison across papers. Our own 99.2\% and 91.0\% come from an
-identical model on an identical set of queries measured over different action
-spaces, though also in different runs, so we cannot say exactly how much of the
+allows comparison across papers. Our own 99.2\% and 91.0\% come from the same
+kind of model, trained the same way on the same queries, measured over
+different action spaces, though also in different runs, so we cannot say exactly how much of the
 difference the action space accounts for. Neo shows the same dependence from the opposite direction,
 approximating the best possible latency by ``the best query latency seen so far
 by the system''. A reference of that kind moves with the system being
@@ -1233,8 +1240,8 @@ We built a learned query optimizer, and it works about as well as a careful
 measurement says it does, which is less well than our first measurements
 suggested. On the synthetic workload, five independent runs put its effect on
 execution time at about 3\%, all of it on queries it was trained on, and end to
-end it helps only when its decisions are reused from the cache. None of the corrections came from
-retraining the model. Each came
+end it helps only when its decisions are reused from the cache. None of the
+corrections came from improving the model. Each came
 from a specific structural mistake that produced a plausible number, and each
 was found by asking a question rather than by observing a failure. We offer the six audit questions
 and the three reporting practices of Section~\ref{sec:discussion} in the hope that
@@ -1243,18 +1250,12 @@ we reported 99.2\%, and the number that replaced it came out of the same code.
 
 \section*{Artifact Availability}
 
-The implementation, the full defect log with per-defect measurements, and the
-measurement tools described in this paper are available at
-\url{https://github.com/parthkansal823/DB_QueryOptimizer}. The file
-\texttt{docs/WRITEUP.md} records more than ninety findings in the order in which
-they were made, including those that turned out to be our own errors. Query
-definitions are in \texttt{backend/app/workload.py} (synthetic) and
-\texttt{data/job/queries} (JOB), and every trained model bundle records the
-identifiers of its held-out queries. \texttt{paper/ARTIFACTS.md} gives the
-commands, seeds and file hashes behind every new measurement and the provenance
-of every historical one, \texttt{docs/DEFECTS.md} indexes the defects, and the
-raw results are in \texttt{backend/models}. The version described in this
-paper is tagged \texttt{paper-v2}.
+The code, measurement tools and raw results are at
+\url{https://github.com/parthkansal823/DB_QueryOptimizer} (tag
+\texttt{paper-v2}). \texttt{paper/ARTIFACTS.md} gives the commands, seeds and
+file hashes behind every new measurement and the provenance of every historical
+one; \texttt{docs/DEFECTS.md} indexes the defects, and \texttt{docs/WRITEUP.md}
+records each finding in the order it was made, including our own errors.
 
 %% For the camera-ready version, balance the last page's reference columns with
 %% \IEEEtriggeratref{N}, placed here, where N is the reference to break before.

@@ -176,8 +176,11 @@ This is the distinction between two kinds of being wrong:
   the same direction, so they *agree* while all being wrong.
 
 Ensemble spread measures variance only. This model's error is dominated by bias
-and by irreducible measurement noise — the same query timed twice on the same
-database differs by around 29%. Neither is visible in how much the members
+and by irreducible measurement noise — on PostgreSQL 18.6, seven executions of
+the same native plan spread by a median 9.6% of the query's latency once the
+cold first run is dropped, and by up to 50.7% on one query
+(`backend/models/noise_pg18.json`; the older 24-query `noise.json` measured
+29.1%). Neither is visible in how much the members
 argue, which is why no rearrangement of the ensemble ever helped and why sigma
 sat at a quarter of the real error.
 
