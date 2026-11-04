@@ -127,18 +127,30 @@ The database was restored from `backups/lqo_pg18_20260904-1345.dump` into a
 fresh PostgreSQL 18.6 container, then analyzed. Raw results are in
 `backend/models/`.
 
-- **Paired replication**: `python -m app.benchmark --protocol paired --repeat 5
-  --arm-order random --seed 100 --json-out models/paired_5runs_random.json`.
-  Mean saving 84 ms (1.4% of native), 95% *t*-interval [−226, +393] ms, so the
-  saving is **not distinguishable from zero**. Headroom is stable at 526 ms
-  [452, 599]. The guard blocked 0 queries in runs 1–3 and 11–12 in runs 4–5
-  (because the runs feed it), and runs 4–5 are where the savings came from.
-  The *t*-intervals in the paper were computed from the JSON; the script
-  itself prints bootstrap intervals, which are narrower at n = 5.
-- **End to end**: `python -m app.e2e_latency --reps 5 --seed 200 --json-out
-  models/e2e_latency.json`. Without the cache, +22.5% vs native [+2,544,
-  +3,585] ms; with a warm cache, −3.1% [−837, −48] ms. The interval
-  resamples queries, not sessions.
+Every run below starts from the same snapshot (execution log restored,
+PostgreSQL restarted); the exact driver is in `ARTIFACTS.md`.
+
+- **Five independent paired runs** (Table V, seeds 100–104,
+  `models/paired_served_run{0..4}.json`). Mean saving **190 ms, 2.8% of native,
+  95% *t*-interval [148, 233]**; captured 39.5% [32.8, 46.2]; headroom 482 ms
+  [413, 552]. Held-out queries: −23 ms [−48, +1], so the saving comes from
+  training queries. The gate kept native on the same 43 of 65 queries in every
+  run; the guard blocked nothing (the snapshot is older than its 30-day window).
+- **D47, found by these runs.** The benchmark's served arm called
+  `select_plan` on its own candidates, with no guard caution and no candidate
+  budget, unlike `planner.plan_query`. The same five runs before the fix
+  (`models/paired_snapshot_run*.json`) lost 340 ms [−747, +68]. Fixed in
+  `app/benchmark.py`; tests in `tests/test_paired_protocol.py`.
+- **Noise** (`models/noise_pg18.json`): 65 queries × 7 executions of the native
+  plan; median per-query (max − min)/median = 12.4%, 9.6% without the cold
+  first run, worst 50.7%.
+- **End to end** (`models/e2e_latency_snapshot.json`, seed 200): without the
+  cache +32.7% vs native [+3,310, +4,276] ms; with a warm cache −4.0%
+  [−1,000, −100] ms. Hint served on 22 of 65 queries. The interval is a
+  percentile bootstrap over queries, not sessions.
+- **Superseded, not in the paper:** `models/paired_5runs_random.json` (five
+  runs sharing one database, so the guard learned between them: 84 ms
+  [−226, +393]) and `models/e2e_latency.json` (same session).
 
 ### Remaining items from the external reviews
 
@@ -148,9 +160,9 @@ fresh PostgreSQL 18.6 container, then analyzed. Raw results are in
    summing every node.
 8. **Defect inventory.** Resolved by dropping "Thirty" from the title. The
    abstract still says "more than thirty", which `docs/WRITEUP.md` supports.
-9. **Independent replications.** The five paired runs share a guard that learns
-   between them. A cleaner design would reset or freeze the guard per run, or
-   run with `--no-guard` as a separate arm.
+9. **Independent replications: done.** Each run is restored to one snapshot
+   (see above). Not yet measured: the system after its guard has learned, which
+   the snapshot design deliberately excludes.
 
 ---
 

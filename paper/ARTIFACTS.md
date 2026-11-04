@@ -94,7 +94,7 @@ percentile bootstraps over queries of the paired per-query differences
 | Table II, JOB | `docs/JOB_RESULTS.md` (re-run 2026-09-05) | 18 | 8 held-out queries; logged collection |
 | JOB correction, Fig. 2 | WRITEUP §2.80 | 18 | 8 held-out queries; two collection runs (3 repetitions, median) |
 | Transfer, Table VI | WRITEUP §2.64, §2.86 | 18 | collected JOB queries; logged collection; narrow-space oracle reconstructed |
-| Table V, single runs | WRITEUP §2.85 | 18 | 65 queries; live; fixed arm order |
+| Table V, single runs | WRITEUP §2.85 | 18 | 65 queries; live; fixed arm order; served arm before the D47 fix |
 | Action-space sweep (Section VI-E) | WRITEUP §2.94 | 18 | 16 held-out queries; replay over logged rows |
 | Ensemble spread (Section III-B) | `docs/CONFIDENCE.md` §3 | not recorded | out-of-bag predictions on training rows |
 | Defect inventory | `docs/DEFECTS.md` | — | 47 entries |

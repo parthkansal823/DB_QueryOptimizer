@@ -45,9 +45,11 @@ something other than the deployed system. Three headline results did not
 survive. Capture on the Join Order Benchmark fell from 99.2\% to 91.0\% once the
 oracle covered the action space actually served. A cross-schema transfer result
 fell from 97.0\% to $-5.3$\%. The latency saved on a synthetic workload fell
-from 797\,ms to 215\,ms under alternated, repeated timing, and five further
-randomized runs put it at 84\,ms, with a 95\% confidence interval that includes
-zero. No model was retrained between the original and corrected figures. End
+from 797\,ms to 215\,ms under alternated, repeated timing. No model was
+retrained between the original and corrected figures. Five independent,
+randomized replications, run after we found that the benchmark's ``served''
+arm did not make the server's decision, put the saving at 190\,ms (2.8\% of
+native; 95\% confidence interval 148--233\,ms), none of it on held-out queries. End
 to end, choosing plans without a cache made the workload 32.7\% slower than
 PostgreSQL alone; with a warm decision cache it was 4.0\% faster. We group the
 failures under six audit questions and argue that a capture ratio should be
@@ -107,8 +109,8 @@ of this paper, which makes the following contributions:
   own system, organized by the six audit questions that exposed them, with
   the measured cost of representative examples (Section~\ref{sec:failures}).
   \item We report three corrected headline results, replicate the timing
-  correction with five randomized runs, and argue that the corrections are more
-  useful to other researchers than the original figures
+  correction with five independent randomized runs, and argue that the
+  corrections are more useful to other researchers than the original figures
   (Section~\ref{sec:corrections}).
   \item We measure end-to-end latency, planning included, with and without the
   decision cache, and find that the system helps only when its decisions are
@@ -692,6 +694,9 @@ What Those Defects Cost}
 \cline{2-3}
 & benchmark offering plans that the server discards &
   36 of 43 safety vetoes \\
+\cline{2-3}
+& benchmark's served arm deciding without the guard's caution factor &
+  saving of $-340$\,ms reported for $+190$\,ms \\
 \hline
 \makecell[l]{\textbf{Q3} Is this worth building,\\asked before building?} &
   three well-motivated features that changed 0 of 16 decisions &
@@ -737,6 +742,18 @@ run; and data collection that explored a wider candidate space than serving
 ever offered, so that 14.4\% of logged candidates were plans byte-identical to
 the native one. On 11 of the 65 queries, one of these duplicates had been
 recorded as the oracle.
+
+The latest instance was found while writing this paper. The benchmark's served
+arm called the model's selection function directly on the benchmark's own
+candidates. The server decides through a different function, which also
+applies the regression guard's caution factor ($\kappa = 2$ on a query with no
+recent history) and plans a differently constructed, budgeted candidate set.
+The benchmark was therefore timing a looser gate than the one deployed. We
+noticed only because two measurements of the same model disagreed in sign:
+five paired runs lost 340\,ms on average, while the end-to-end measurement,
+which does call the server's function, gained 468\,ms with a warm cache. With
+the served arm routed through the server's function, the same five runs saved
+190\,ms (Section~\ref{sec:replication}).
 
 A boolean feature recording whether a candidate carried any hint also belongs
 here. It was perfectly discriminative in training, because it separated the 65
@@ -855,8 +872,8 @@ Cross-schema transfer\textsuperscript{a} & 97.0\% & $-5.3$\% &
 \hline
 \multicolumn{4}{p{0.94\columnwidth}}{\scriptsize \textsuperscript{a}Capture
 ratio of a model trained on the synthetic schema. \textsuperscript{b}Five
-randomized runs: mean 84\,ms, 95\% CI [$-226$, 393] (Table~\ref{tab:paired}). No
-model was retrained between the two columns.}
+independent runs with the served-arm fix: mean 190\,ms, 95\% CI [148, 233]
+(Table~\ref{tab:paired}). No model was retrained between the two columns.}
 \end{tabular}
 \end{table}
 
@@ -928,9 +945,13 @@ protocol, which is consistent with warmer caches once each plan is executed
 repeatedly. The two protocols therefore also measure somewhat different cache
 regimes, and part of the difference between them may reflect cache state
 rather than noise alone. With that caveat, the measured headroom shrinks by
-66\% and the latency actually saved shrinks by 73\%. The capture ratio~\eqref{eq:capture} also falls, from
-61.1\% to 48.1\%, so
-the correction does not merely shift the flattery from one metric to another.
+66\% and the latency actually saved shrinks by 73\%. The capture
+ratio~\eqref{eq:capture} also falls, from 61.1\% to 48.1\%, so the correction
+does not merely shift the flattery from one metric to another. Both single runs
+took their served decision through the benchmark's own procedure, not the
+server's (Section~\ref{sec:q2}). That does not affect the comparison between
+them, which differ only in timing, but it means neither describes the deployed
+decision; the last column of the table does.
 
 \begin{table}[t]
 \caption{Timing Protocols on the 65-Query Synthetic Workload}
@@ -940,54 +961,65 @@ the correction does not merely shift the flattery from one metric to another.
 \setlength{\tabcolsep}{3pt}
 \begin{tabular}{|l|c|c|c|}
 \hline
- & \multicolumn{2}{c|}{\textbf{One run}} & \textbf{5 random runs} \\
+ & \multicolumn{2}{c|}{\textbf{One run}\textsuperscript{a}} &
+  \textbf{5 runs}\textsuperscript{b} \\
 \textbf{Quantity} & \texttt{deploy} & \texttt{paired} & \textbf{mean [95\% CI]} \\
 \hline
-Native (ms) & 7,426 & 5,680 & 6,120 [5,912, 6,328] \\
-Served (ms) & 6,629 & 5,464 & 6,036 [5,569, 6,503] \\
-Oracle (ms) & 6,122 & 5,232 & 5,594 [5,441, 5,748] \\
+Native (ms) & 7,426 & 5,680 & 6,706 [6,025, 7,388] \\
+Served (ms) & 6,629 & 5,464 & 6,516 [5,868, 7,164] \\
+Oracle (ms)\textsuperscript{c} & 6,122 & 5,232 & 6,224 [5,580, 6,868] \\
 \hline
-Headroom (ms) & 1,304 & 448 & 526 [452, 599] \\
-Saved (ms) & 797 & 215 & 84 [$-226$, 393] \\
-Saved (\% of native) & 10.7 & 3.8 & 1.4 [$-3.7$, 6.5] \\
-Captured, $C$ (\%) & 61.1 & 48.1 & 17.4 [$-41.7$, 76.6] \\
+Headroom (ms) & 1,304 & 448 & 482 [413, 552] \\
+Saved (ms) & 797 & 215 & 190 [148, 233] \\
+Saved (\% of native) & 10.7 & 3.8 & 2.8 [2.4, 3.3] \\
+Captured, $C$ (\%) & 61.1 & 48.1 & 39.5 [32.8, 46.2] \\
 \hline
-Held-out saved (ms) & 85 & 12 & $-13$ [$-45$, 19] \\
-Held-out $C$ (\%) & 40.0 & 18.4 & $-19.4$ [$-72.8$, 34.0] \\
+Held-out saved (ms) & 85 & 12 & $-23$ [$-48$, 1] \\
+Held-out $C$ (\%) & 40.0 & 18.4 & $-45.6$ [$-99.1$, 7.8] \\
 \hline
-\multicolumn{4}{p{0.94\columnwidth}}{\scriptsize The single runs used a fixed
-arm order; the five runs randomized it and used a database restored from a
-4~September 2026 backup. Intervals use Student's $t$ with four degrees of
-freedom. Derived rows use unrounded totals, so they can differ by 1\,ms from
-differences of the rounded rows.}
+\multicolumn{4}{p{0.94\columnwidth}}{\scriptsize \textsuperscript{a}Fixed arm
+order, identical arms timed separately, served decision taken outside the
+server's decision function. \textsuperscript{b}Independent runs from one
+database snapshot, randomized arm order, served decision taken by the server's
+function; Student's $t$ with four degrees of freedom; $C$ is the mean of the
+per-run ratios. \textsuperscript{c}$T_{\mathrm{orc}}$ under \texttt{deploy},
+$\widehat{T}_{\mathrm{orc}}$ under \texttt{paired}. Derived rows use unrounded
+totals, so they can differ by 1\,ms from differences of the rounded rows.}
 \end{tabular}
 \end{table}
 
-\subsubsection{Replication With Randomized Arm Order}
-The single \texttt{paired} run used a fixed arm order. To see how stable it is,
-we repeated the \texttt{paired} protocol five times with the arm order
-randomized (Algorithm~\ref{alg:paired}) and a different seed for each run,
-using the current model and gate on PostgreSQL~18.6, with the database restored
-from a backup taken on 4~September 2026. The last column of
-Table~\ref{tab:paired} gives the mean of each quantity and a 95\% confidence
-interval from Student's $t$ distribution with four degrees of freedom.
+\subsubsection{Independent Replication}
+\label{sec:replication}
+A single paired run is one draw. To see how stable it is, we ran the
+\texttt{paired} protocol five more times on PostgreSQL~18.6 with the current
+model and gate, randomizing the arm order (Algorithm~\ref{alg:paired}) with a
+different seed for each run. Before each run we restored the execution log
+from a snapshot taken on 4~September 2026 and restarted PostgreSQL, so every
+run began with empty shared buffers and the same history. That history is
+older than the regression guard's 30-day evidence window, so in every run the
+guard blocked no query and applied its full caution, $\kappa = 2$, to all of
+them. The gate kept the native plan on the same 43 of 65 queries in every run,
+so the runs differ in timing, not in decisions. The last column of
+Table~\ref{tab:paired} gives each quantity's mean with a 95\% interval; the
+mean of the per-run capture ratios equals the ratio of the mean saving to the
+mean headroom to one decimal place.
 
-The headroom is stable: 526\,ms on average, with an interval from 452 to
-599\,ms, close to the 448\,ms of the single paired run. The saving is not. Its
-mean is 84\,ms, 1.4\% of native, and its interval runs from $-226$ to
-$+393$\,ms, so these five runs cannot distinguish the system's effect on this
-workload from zero. Captured headroom ranged from $-37.2$\% to $64.3$\% across
-the runs. On the 16 held-out queries the mean saving was $-13$\,ms, with an
-interval from $-45$ to $+19$\,ms.
+The result is stable. The mean saving was 190\,ms, 2.8\% of native, with an
+interval from 148 to 233\,ms, and each run saved between 144 and 231\,ms. The
+system captured 39.5\% of the headroom, with an interval from 32.8\% to
+46.2\%. None of the saving comes from queries the model did not train on: on
+the 16 held-out queries the mean saving was $-23$\,ms, with an interval from
+$-48$ to $+1$\,ms. On this workload, the execution-time benefit is real but
+small, and it comes from the model's own training queries.
 
-The runs are also not independent. Each run logs its executions and the
-regression guard reads that log, so the guard blocked no queries in the first
-three runs and 11 and 12 queries in the last two, once the earlier runs had
-recorded regressions. The first three runs lost 69\,ms on average and the last
-two saved 312\,ms. Five runs cannot separate that from run-to-run noise, but the
-pattern suggests that much of whatever benefit the system delivers here comes
-from the guard declining to deviate on queries where deviation has already
-failed, rather than from better choices.
+Two earlier sets of five runs are not in the table. In the first, the runs
+shared one database, so the guard learned from each run and blocked 11 and 12
+queries in the last two; those runs were not independent. In the second, the
+runs were independent but used the benchmark's own decision procedure
+(Section~\ref{sec:q2}), and they lost 340\,ms on average, with an interval from
+$-747$ to $+68$\,ms. The two independent sets used the same snapshot and seeds
+and differ, apart from session-to-session variation, only in how the served
+decision was made; their intervals do not overlap.
 
 \subsubsection{Cross-Schema Transfer}
 This was our strongest claim to external validity. A model
@@ -1039,10 +1071,9 @@ JOB-trained model's figures include its own training queries.}
 \subsection{What Survives, End to End}
 \label{sec:survives}
 
-On execution time alone, the synthetic result is small and uncertain. The
-single paired run of Table~\ref{tab:paired} saved 215\,ms, 3.8\% of native, and
-the five randomized runs in the same table put the mean saving at
-84\,ms, 1.4\%, with an interval that includes zero. On the eight held-out JOB
+On execution time alone, the synthetic result is small. The five independent
+runs of Table~\ref{tab:paired} put the mean saving at 190\,ms, 2.8\% of native,
+and none of it on held-out queries. On the eight held-out JOB
 queries, where the headroom is much larger, the served plans total 718\,ms
 against 2,715\,ms for native, but that figure comes from a logged collection
 run and was not timed under the \texttt{paired} protocol.
@@ -1066,9 +1097,10 @@ from the 22 queries on which a hint was served, which went from 3,436\,ms to
 two paths were within 1.2\% of each other. The interval in
 Table~\ref{tab:e2e} is a percentile bootstrap over queries (10,000 resamples)
 within one session. It shows how much the result depends on which queries are
-in the workload, not how much it would move between sessions, which
-Table~\ref{tab:paired} shows can be a lot. The two measurements together
-support a modest claim. On repeat traffic served from the cache, the system
+in the workload, not how much it would move between sessions; across the runs
+of Table~\ref{tab:paired}, the native total moved by 1.2\,s while the saving
+moved by less than 90\,ms. The two measurements together support a modest
+claim. On repeat traffic served from the cache, the system
 may save a few percent. On the first sight of a query, it costs about a third.
 
 \begin{table}[t]
@@ -1132,9 +1164,10 @@ meets the second only in part, since it still takes a minimum over three
 medians. Third, repeat the timing with randomized order and report intervals
 across runs. Without the first, a capture ratio cannot be compared across
 systems; without the second, it is not stable even within one; and without the
-third, a single favorable run can pass for a result. Our own corrected run said
-the system saved 215\,ms, and five randomized runs could not distinguish its
-saving from zero.
+third, a single favorable run can pass for a result. Repetition is not a
+substitute for Q2, however. Our first five independent runs were timed with
+care and still measured a decision the server does not make; they reported a
+loss of 340\,ms where the deployed decision saved 190\,ms.
 
 \subsection{Making the Audit Questions Executable}
 
@@ -1166,15 +1199,15 @@ optimizer has never planned a query we measured. All of our conclusions concern
 the dynamic-programming planner.
 
 \subsubsection{Measurement Resolution}
-The single runs in Table~\ref{tab:paired} used a fixed arm
-order. The five randomized runs that replicate them are few, and they are not
-independent, because the regression guard learns from each run's executions.
-Their intervals are correspondingly wide, and they used a database restored
-from an earlier backup, so they are not an exact repeat of the single runs'
-conditions. On one
-earlier occasion, two independent three-run benchmarks of an identical
-configuration landed 8 points apart; we take that as a warning about the
-instrument's resolution, not as a calibrated bound.
+The single runs in Table~\ref{tab:paired} used a fixed arm order and the
+benchmark's own decision procedure. The five independent runs that replace them
+are few, and all of them start from one snapshot with a guard that has no
+recent history, so they describe the system on queries it has not recently
+served, not after its guard has learned. The paired oracle is an estimate
+biased in both directions (Section~\ref{sec:timing}). On one earlier occasion,
+two three-run benchmarks of an identical configuration landed 8 points apart;
+we take that as a warning about the instrument's resolution, not as a
+calibrated bound.
 
 \subsubsection{Environment and End-to-End Latency}
 All measurements are on one machine, with one client at a time on the same
@@ -1198,9 +1231,9 @@ treated as a lower bound.
 
 We built a learned query optimizer, and it works about as well as a careful
 measurement says it does, which is less well than our first measurements
-suggested. On the synthetic workload, five randomized runs cannot distinguish
-its effect on execution time from zero, and end to end it helps only when its
-decisions are reused from the cache. None of the corrections came from
+suggested. On the synthetic workload, five independent runs put its effect on
+execution time at about 3\%, all of it on queries it was trained on, and end to
+end it helps only when its decisions are reused from the cache. None of the corrections came from
 retraining the model. Each came
 from a specific structural mistake that produced a plausible number, and each
 was found by asking a question rather than by observing a failure. We offer the six audit questions
